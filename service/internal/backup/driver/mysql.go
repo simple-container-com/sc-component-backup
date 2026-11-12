@@ -22,3 +22,19 @@ func (MySQLDriver) Dump(_ context.Context, _ ConnectionSpec, _ io.Writer) error 
 func (MySQLDriver) Restore(_ context.Context, _ ConnectionSpec, _ io.Reader) error {
 	return ErrDriverUnsupported
 }
+
+func (MySQLDriver) ListDatabases(_ context.Context, _ ConnectionSpec) ([]string, error) {
+	return nil, ErrDriverUnsupported
+}
+
+func (MySQLDriver) Inventory(_ context.Context, _ ConnectionSpec, _ string) ([]CollectionStat, error) {
+	return nil, ErrDriverUnsupported
+}
+
+func (MySQLDriver) Test(_ context.Context, _ ConnectionSpec) (TestResult, error) {
+	return TestResult{Error: ErrDriverUnsupported.Error()}, nil
+}
+
+func (MySQLDriver) RestoreCommand() string {
+	return `{cat} | mysql --host=<host> --user=<user> --password=<pw> <database>`
+}

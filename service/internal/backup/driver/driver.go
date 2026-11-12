@@ -37,14 +37,51 @@ type ConnectionSpec struct {
 	TLSCAPem string
 }
 
+// CollectionStat is one row of an engine's Inventory — per-collection
+// (Mongo) / per-table (SQL) size breakdown read from the server
+// catalog. Recorded alongside each dump so the SPA can show "what's in
+// this archive".
+//
+// Zero values mean "not collected" — not "zero docs/bytes" — because
+// the native catalogs differ on which columns are populated.
+type CollectionStat struct {
+	Name         string `json:"name"`
+	Kind         string `json:"kind"`                   // "collection" or "table"
+	Docs         int64  `json:"docs,omitempty"`         // document/row count
+	Bytes        int64  `json:"bytes,omitempty"`        // uncompressed data size
+	StorageBytes int64  `json:"storageBytes,omitempty"` // on-disk size (no indexes)
+	IndexBytes   int64  `json:"indexBytes,omitempty"`   // total index size
+}
+
+// TestResult is the shape every engine's Test() returns — the SPA
+// renders it on the "connection test" tab. Error carries the
+// redacted-and-truncated backend error for failed tests.
+type TestResult struct {
+	OK            bool     `json:"ok"`
+	ServerVersion string   `json:"serverVersion,omitempty"`
+	ClientVersion string   `json:"clientVersion,omitempty"`
+	Databases     []string `json:"databases,omitempty"`
+	Warnings      []string `json:"warnings,omitempty"`
+	Error         string   `json:"error,omitempty"`
+}
+
 // Driver streams a full logical dump of a DB to an io.Writer and
 // restores from an io.Reader. Both calls honour the context for
 // cancellation — a SIGTERM during an in-flight dump kills the shelled
 // subprocess cleanly.
+//
+// ListDatabases + Inventory + Test are the SPA-facing surface: what
+// databases exist, what's in one, and is the connection healthy.
+// RestoreCommand is the human-readable one-liner the SPA shows the
+// operator when they click "restore" on an archive.
 type Driver interface {
 	Name() string
 	Dump(ctx context.Context, conn ConnectionSpec, out io.Writer) error
 	Restore(ctx context.Context, conn ConnectionSpec, in io.Reader) error
+	ListDatabases(ctx context.Context, conn ConnectionSpec) ([]string, error)
+	Inventory(ctx context.Context, conn ConnectionSpec, db string) ([]CollectionStat, error)
+	Test(ctx context.Context, conn ConnectionSpec) (TestResult, error)
+	RestoreCommand() string
 }
 
 // ErrDriverUnsupported is returned by stub drivers that declare a

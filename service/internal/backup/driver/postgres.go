@@ -23,3 +23,19 @@ func (PostgresDriver) Dump(_ context.Context, _ ConnectionSpec, _ io.Writer) err
 func (PostgresDriver) Restore(_ context.Context, _ ConnectionSpec, _ io.Reader) error {
 	return ErrDriverUnsupported
 }
+
+func (PostgresDriver) ListDatabases(_ context.Context, _ ConnectionSpec) ([]string, error) {
+	return nil, ErrDriverUnsupported
+}
+
+func (PostgresDriver) Inventory(_ context.Context, _ ConnectionSpec, _ string) ([]CollectionStat, error) {
+	return nil, ErrDriverUnsupported
+}
+
+func (PostgresDriver) Test(_ context.Context, _ ConnectionSpec) (TestResult, error) {
+	return TestResult{Error: ErrDriverUnsupported.Error()}, nil
+}
+
+func (PostgresDriver) RestoreCommand() string {
+	return `{cat} | pg_restore --clean --if-exists --dbname "<target>"`
+}
