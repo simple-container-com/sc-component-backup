@@ -133,6 +133,13 @@ func main() {
 		r.Post("/api/v1/tenants/{stack}/backup-now", api.NewBackupNowHandler(sch, store).ServeHTTP)
 		r.Post("/api/v1/tenants/{stack}/restore", api.NewRestoreHandler(sch, runs).ServeHTTP)
 		r.Get("/api/v1/restores/{id}", api.NewRestoreStatusHandler(runs).ServeHTTP)
+		// Scheduler tick — EventBridge fires this every minute when
+		// deployTo: lambda (design doc §5.3). Walks tenants, fires ECS
+		// Fargate one-shot tasks per due tenant. ?force=true on an
+		// operator-driven call runs every tenant regardless of
+		// schedule. Nil Ecs here → handler builds its own client from
+		// the AWS SDK default config chain at first-tick time.
+		r.Post("/api/v1/scheduler/tick", api.NewSchedulerTickHandler(api.SchedulerTickConfig{Tenants: store}).ServeHTTP)
 	})
 
 	// Embedded SPA.
