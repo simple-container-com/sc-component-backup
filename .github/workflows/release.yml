@@ -82,11 +82,11 @@ jobs:
           GOMAXPROCS: '1'
           GOMEMLIMIT: '6GiB'
         run: |
-          out=sc-plugin-backup-${GOOS}-${GOARCH}
+          out=sc-component-backup-${GOOS}-${GOARCH}
           go build -trimpath -buildvcs=false -p 1 \
             -ldflags "-s -w -X main.version=${VERSION}" \
             -o "../${out}" \
-            ./cmd/sc-plugin-backup
+            ./cmd/sc-component-backup
           sha256sum "../${out}" > "../${out}.sha256"
           tar -czf "../${out}.tar.gz" "../${out}"
           sha256sum "../${out}.tar.gz" >> "../${out}.sha256"
@@ -95,7 +95,7 @@ jobs:
         with:
           name: binaries-${{ matrix.goos }}-${{ matrix.goarch }}
           path: |
-            sc-plugin-backup-${{ matrix.goos }}-${{ matrix.goarch }}*
+            sc-component-backup-${{ matrix.goos }}-${{ matrix.goarch }}*
 
   release:
     name: Publish Release
@@ -116,8 +116,8 @@ jobs:
       - name: Build consolidated sha256sums.txt
         working-directory: dist
         run: |
-          cat sc-plugin-backup-*.sha256 > sha256sums.txt
-          rm sc-plugin-backup-*.sha256
+          cat sc-component-backup-*.sha256 > sha256sums.txt
+          rm sc-component-backup-*.sha256
           cat sha256sums.txt
 
       - name: Tag commit if from main

@@ -18,7 +18,7 @@ help:
 	@echo "  clean          Remove built binaries + dist dirs"
 
 build:
-	cd plugin && go build -o ../sc-plugin-backup -ldflags "-s -w" ./cmd/sc-plugin-backup
+	cd plugin && go build -o ../sc-component-backup -ldflags "-s -w" ./cmd/sc-component-backup
 	cd service && $(MAKE) build
 
 test:
@@ -50,5 +50,5 @@ docker-service:
 	cd service && $(MAKE) docker
 
 clean:
-	rm -f sc-plugin-backup service/backup
+	rm -f sc-component-backup service/backup
 	rm -rf dist/ service/internal/ui/dist/
