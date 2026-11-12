@@ -33,7 +33,17 @@ func (m *MongoDBDriver) Dump(ctx context.Context, conn ConnectionSpec, out io.Wr
 	if err := requireCmd("mongodump"); err != nil {
 		return err
 	}
-	cmd := exec.CommandContext(ctx, "mongodump", "--uri="+uri, "--archive", "--gzip", "--quiet")
+	// Scope the dump to the specified database when the tenant declares
+	// one. Without --db mongodump enumerates every DB on the server
+	// and tries to read admin.system.roles — that requires clusterAdmin,
+	// which tenant-scoped users (readWriteAnyDatabase or lower) don't
+	// have. A tenant that wants to back up the whole cluster explicitly
+	// leaves conn.Database blank AND provisions a cluster-admin creds.
+	args := []string{"--uri=" + uri, "--archive", "--gzip", "--quiet"}
+	if db := conn.Database; db != "" {
+		args = append(args, "--db="+db)
+	}
+	cmd := exec.CommandContext(ctx, "mongodump", args...)
 	var stderr bytes.Buffer
 	cmd.Stdout = out
 	cmd.Stderr = &stderr
@@ -53,7 +63,13 @@ func (m *MongoDBDriver) Restore(ctx context.Context, conn ConnectionSpec, in io.
 	if err := requireCmd("mongorestore"); err != nil {
 		return err
 	}
-	cmd := exec.CommandContext(ctx, "mongorestore", "--uri="+uri, "--archive", "--gzip", "--drop", "--quiet")
+	// Scope restore to --db + --nsFrom/--nsTo when the tenant declares
+	// one; see Dump above for why.
+	rargs := []string{"--uri=" + uri, "--archive", "--gzip", "--drop", "--quiet"}
+	if db := conn.Database; db != "" {
+		rargs = append(rargs, "--nsInclude="+db+".*")
+	}
+	cmd := exec.CommandContext(ctx, "mongorestore", rargs...)
 	var stderr bytes.Buffer
 	cmd.Stdin = in
 	cmd.Stderr = &stderr
