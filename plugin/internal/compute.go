@@ -101,6 +101,28 @@ func (p *Processor) Process(ctx *sdk.Context, _ api.Stack, input api.ResourceInp
 		Resources: readConsumerResources(input),
 	}
 
+	// Slice 1d scoped-user provisioning (sc-components-platform design doc §5.2).
+	// If the Component config declares `databases:` + `atlasAdmin:` AND the
+	// consumer's dependency_outputs_json shows a usage of one of those DB
+	// resources, mint a readWrite-scoped Atlas user, embed its creds in
+	// the tenant record's Resources list, so the service dumps the
+	// consumer's own DB with its own credential.
+	//
+	// Pre-slice-1d (no databases: configured): no scoped user is minted,
+	// the Resources list stays empty, and the service dumps nothing until
+	// an operator registers a tenant explicitly via the on-demand API.
+	// This keeps backward compat with today's smoke shape.
+	if raw, ok := extractConfigRaw(input.Descriptor); ok {
+		if scopedRes, err := p.maybeProvisionScopedUser(ctx.Context(), raw, stackName, input); err != nil {
+			return nil, errors.Wrapf(err, "component %q scoped-user provisioning", resName)
+		} else if scopedRes != nil {
+			record.Resources = append(record.Resources, *scopedRes)
+			if p.cfg.Progress != nil {
+				p.cfg.Progress.Info("compute-process", fmt.Sprintf("scoped user minted for tenant %q on database %q", stackName, scopedRes.Connection["database"]))
+			}
+		}
+	}
+
 	if err := p.pushRegister(ctx.Context(), serviceURL, tenantToken, record); err != nil {
 		// The consumer's deploy fails, with a diagnosable error naming
 		// the component as the blocker (per §P3 non-silent-skip rule).
@@ -218,6 +240,126 @@ func truncate(s string, limit int) string {
 		return s
 	}
 	return s[:limit] + "…"
+}
+
+// maybeProvisionScopedUser is the slice-1d hook: if the Component config
+// declares `databases:` + `atlasAdmin:` AND the consumer's dependency
+// outputs match one of those DB resources, mint a readWrite-scoped Atlas
+// user and return a TenantResource ready to embed in the push-register
+// payload. Returns (nil, nil) when nothing should happen (backward-compat
+// path).
+func (p *Processor) maybeProvisionScopedUser(
+	ctx context.Context, raw map[string]any, consumerStack string, input api.ResourceInput,
+) (*TenantResource, error) {
+	dbs, admin, err := populateDatabasesFromRaw(raw)
+	if err != nil {
+		return nil, errors.Wrap(err, "parse databases/atlasAdmin config")
+	}
+	if len(dbs) == 0 {
+		return nil, nil
+	}
+
+	// Find the consumer's dependency outputs blob — SC core populates
+	// this at ComputeProcess time with sibling resource outputs the
+	// consumer `uses:`. We parse it to look for a resource name that
+	// matches one of our `databases:` entries.
+	depOutputs := readDependencyOutputs(input)
+	resourceName, dbName, matched, err := MatchConsumerToDatabase(depOutputs, dbs)
+	if err != nil {
+		return nil, errors.Wrap(err, "match consumer to backup-component databases:")
+	}
+	if matched == nil {
+		return nil, nil
+	}
+
+	// Only mongodb is wired in slice 1d; postgres/mysql follow-ups add
+	// their own scoped-user mint paths.
+	if matched.Driver != "mongodb" {
+		return nil, nil
+	}
+	if admin == nil {
+		return nil, errors.Errorf("databases[%q].driver = mongodb but atlasAdmin not configured", resourceName)
+	}
+
+	username := ScopedUsername(consumerStack)
+	password, err := ProvisionScopedMongoUser(ctx, ScopedUserPolicy{
+		Username:   username,
+		Database:   dbName,
+		AtlasAdmin: *admin,
+	})
+	if err != nil {
+		return nil, errors.Wrapf(err, "provision scoped Atlas user %q for consumer %q on database %q", username, consumerStack, dbName)
+	}
+
+	// Build the tenant-resource entry that the backup service will see.
+	// The service's mongodb driver reads connection.uri + .database at
+	// backup-now time. We synthesise a connection string with the
+	// just-minted scoped user's creds. The URI host part is whatever the
+	// consumer's dependency output already carries (so this works
+	// regardless of srv vs standard mongodb:// shapes).
+	uri, err := scopedMongoURI(depOutputs, resourceName, username, password)
+	if err != nil {
+		return nil, errors.Wrapf(err, "build scoped mongodb URI for consumer %q", consumerStack)
+	}
+
+	return &TenantResource{
+		Type: "mongodb",
+		Name: resourceName,
+		Connection: map[string]string{
+			"driver":   "mongodb",
+			"uri":      uri,
+			"database": dbName,
+		},
+	}, nil
+}
+
+// readDependencyOutputs extracts the consumer's sibling-resource outputs
+// JSON blob off the ResourceInput. Pre-slice-1a's wire-in, there's no
+// SC-core field for this — we read a test override from Config.Raw.
+func readDependencyOutputs(input api.ResourceInput) []byte {
+	if raw, ok := extractConfigRaw(input.Descriptor); ok {
+		if s, ok := raw["_test_dependency_outputs"].(string); ok && s != "" {
+			return []byte(s)
+		}
+	}
+	return nil
+}
+
+// scopedMongoURI synthesises a mongodb:// URI that embeds the just-minted
+// scoped user's creds. Reads the host+query part from the consumer's own
+// dependency output (deps[resourceName]["mongo-uri"] or "uri").
+func scopedMongoURI(depOutputs []byte, resourceName, username, password string) (string, error) {
+	if len(depOutputs) == 0 {
+		return "", errors.New("no dependency outputs to build URI from")
+	}
+	var deps map[string]any
+	if err := json.Unmarshal(depOutputs, &deps); err != nil {
+		return "", err
+	}
+	m, _ := deps[resourceName].(map[string]any)
+	var baseURI string
+	for _, key := range []string{"mongo-uri", "uri", "mongo-uri-options"} {
+		if v, ok := m[key].(string); ok && v != "" {
+			baseURI = v
+			break
+		}
+	}
+	if baseURI == "" {
+		return "", errors.Errorf("no mongo-uri key on dependency output %q", resourceName)
+	}
+	// Insert user:password@ after mongodb:// or mongodb+srv://. If the
+	// base URI already has creds, replace them.
+	u, p := username, password
+	for _, prefix := range []string{"mongodb+srv://", "mongodb://"} {
+		if strings.HasPrefix(baseURI, prefix) {
+			rest := strings.TrimPrefix(baseURI, prefix)
+			if idx := strings.Index(rest, "@"); idx >= 0 {
+				rest = rest[idx+1:]
+			}
+			return prefix + u + ":" + p + "@" + rest, nil
+		}
+	}
+	return "", errors.Errorf("unexpected mongo URI shape: %q", baseURI)
 }
 
 // readServiceURL reads the deployed service URL. In slice 1a's Path A,

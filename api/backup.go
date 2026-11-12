@@ -61,10 +61,69 @@ type BackupConfig struct {
 	// parent's resources.registrars:).
 	Ingress *BackupIngress `json:"ingress,omitempty" yaml:"ingress,omitempty"`
 
+	// Databases declares which operator-side DB resources this backup
+	// component is authorised to back up. When a consumer `uses:` BOTH
+	// this backup component AND one of the listed DB resources, the
+	// plugin's ComputeProcess mints a scoped DB user on the fly (via
+	// AtlasAdmin creds below for mongodb), push-registers the scoped
+	// creds to the service, and the service dumps the consumer's DB
+	// using that scoped user.
+	//
+	// Slice 1d expansion of the Component class (sc-components-platform
+	// design doc §5.2). Each entry names the SC resource name + its
+	// driver; driver determines which admin-REST backend the plugin
+	// calls (atlas-admin REST for mongodb; aws-rds for rds-*; etc.).
+	Databases []BackupDatabase `json:"databases,omitempty" yaml:"databases,omitempty"`
+
+	// AtlasAdmin is the operator-side admin credential sc-plugin-backup
+	// uses to call Atlas REST (CreateDatabaseUser / Delete) when
+	// provisioning scoped users for Mongo-backed Databases entries.
+	// Required iff any Databases entry has driver == "mongodb".
+	//
+	// These are PRIVILEGED creds — the plugin stores them in the Lambda
+	// env under BACKUP_ATLAS_ADMIN_PRIVATE_KEY + _PUBLIC_KEY and only
+	// uses them during the Component's own provision + each consumer's
+	// ComputeProcess. The scoped users the plugin mints have
+	// `readWrite` on the consumer's specific DB only — the admin cred
+	// itself never leaves the backup Lambda's env.
+	AtlasAdmin *BackupAtlasAdmin `json:"atlasAdmin,omitempty" yaml:"atlasAdmin,omitempty"`
+
 	// api.Credentials embedded inline so a resource can optionally carry
 	// a `${auth:...}` reference. Rarely needed for a component (templates
 	// carry their own credentials); kept for forward-compat.
 	api.Credentials `json:",inline" yaml:",inline"`
+}
+
+// BackupDatabase names an operator-declared DB resource this backup component
+// is authorised to back up. The plugin's ComputeProcess matches the consumer's
+// `uses:` list against the list of declared `Resource` names and mints a
+// scoped user for each match.
+type BackupDatabase struct {
+	// Resource is the SC resource name as declared under the parent
+	// server.yaml's resources.resources.<env>.resources block (e.g. "mongodb"
+	// for the main cluster). Required.
+	Resource string `json:"resource" yaml:"resource"`
+
+	// Driver is the DB flavour: "mongodb" | "postgres" | "mysql". Required.
+	// Determines which admin-REST client sc-plugin-backup uses to mint the
+	// scoped user.
+	Driver string `json:"driver" yaml:"driver"`
+}
+
+// BackupAtlasAdmin carries operator-provided Atlas admin API-key ids. Both
+// fields are expected to be `${secret:...}` references.
+type BackupAtlasAdmin struct {
+	// PrivateKey is a `${secret:...}` reference to the Atlas API-key
+	// private secret.
+	PrivateKey string `json:"privateKey" yaml:"privateKey"`
+
+	// PublicKey is a `${secret:...}` reference to the Atlas API-key
+	// public id.
+	PublicKey string `json:"publicKey" yaml:"publicKey"`
+
+	// ProjectID is the Atlas project (group) ID the admin cred belongs
+	// to. Used to scope CreateDatabaseUser calls. Required.
+	ProjectID string `json:"projectId" yaml:"projectId"`
 }
 
 // BackupIngress models the component's public entry point. Optional — a
@@ -96,6 +155,28 @@ func (c *BackupConfig) Validate() error {
 	}
 	if c.SigningKey == "" {
 		return errors.Errorf("`signingKey` is required for %q (${secret:...} reference to a 32+-byte HS256 key)", ResourceType)
+	}
+	// If any configured Database is mongodb, atlasAdmin must be supplied —
+	// without it ComputeProcess can't mint a scoped user on the fly.
+	needsAtlasAdmin := false
+	for _, db := range c.Databases {
+		if db.Resource == "" {
+			return errors.Errorf("`databases[].resource` is required for %q (SC resource name of the DB to back up)", ResourceType)
+		}
+		if db.Driver == "" {
+			return errors.Errorf("`databases[].driver` is required for %q resource %q (one of mongodb|postgres|mysql)", ResourceType, db.Resource)
+		}
+		if db.Driver == "mongodb" {
+			needsAtlasAdmin = true
+		}
+	}
+	if needsAtlasAdmin {
+		if c.AtlasAdmin == nil {
+			return errors.Errorf("`atlasAdmin` is required for %q when any `databases[].driver` is \"mongodb\" (Atlas admin REST needs the private/public key pair + projectId)", ResourceType)
+		}
+		if c.AtlasAdmin.PrivateKey == "" || c.AtlasAdmin.PublicKey == "" || c.AtlasAdmin.ProjectID == "" {
+			return errors.Errorf("`atlasAdmin.{privateKey,publicKey,projectId}` are all required when any `databases[].driver` is \"mongodb\"")
+		}
 	}
 	return nil
 }
