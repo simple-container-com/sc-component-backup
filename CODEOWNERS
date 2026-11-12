@@ -1,0 +1,5 @@
+# Default reviewer for every change in this template-and-dummy repo.
+# The @simple-container-com/component-authors team may not exist yet —
+# the sc-components-platform milestone's slice 1b bring-up step creates
+# it. Until then, PRs land via operator review on the GitHub org.
+* @simple-container-com/component-authors

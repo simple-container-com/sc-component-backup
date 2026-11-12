@@ -1,0 +1,76 @@
+# Local isolated smoke for the Backup service.
+#
+# Brings up: SeaweedFS (S3-compatible — minio/minio pull was blocked
+# on this workstation, seaweedfs pulls from docker.io fine and it's
+# also what sc-ru-clouds's fleet work uses), MongoDB (the tenant's
+# DB), and the backup service built from the repo's Dockerfile. No
+# slice 1a dependency; this tests the SERVICE in isolation.
+#
+# `dev/smoke.sh` is the end-to-end driver — register tenant, seed
+# mongo, backup, delete data, restore, verify, teardown.
+
+services:
+  seaweed:
+    image: chrislusf/seaweedfs:4.50
+    hostname: seaweed
+    command: >
+      server
+      -s3
+      -s3.config=/etc/s3/s3-config.json
+      -dir=/data
+    volumes:
+      - ./s3-config.json:/etc/s3/s3-config.json:ro
+    ports:
+      - "127.0.0.1:8333:8333"
+    # seaweed takes ~3-5s to bind its S3 API listener. Healthcheck
+    # polls until the TCP port answers.
+    healthcheck:
+      # Seaweedfs S3 doesn't answer GET / with an HTTP response and
+      # its container ships only `weed` + plain sh. The S3 subservice
+      # opens a unix socket at /tmp/seaweedfs-s3-grpc-18333.sock once
+      # it's listening on 8333; use that as the readiness signal.
+      test: ["CMD-SHELL", "test -S /tmp/seaweedfs-s3-grpc-18333.sock"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+
+  mongo-tenant:
+    image: mongo:7
+    ports:
+      - "127.0.0.1:27018:27017"
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.runCommand({ ping: 1 }).ok"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+
+  backup:
+    image: sc-component-backup:smoke-local
+    build:
+      context: ..
+      dockerfile: service/Dockerfile.smoke
+      args:
+        VERSION: smoke-local
+    depends_on:
+      seaweed:
+        condition: service_healthy
+      mongo-tenant:
+        condition: service_healthy
+    environment:
+      SERVICE_JWT_SECRET: "smoke-signing-key-must-be-at-least-32-bytes-long"
+      MONGO_URI: "mongodb://mongo-tenant:27017"
+      PORT: "8080"
+      S3_BUCKET: "sc-backup-smoke"
+      S3_REGION: "us-east-1"
+      S3_ENDPOINT_URL: "http://seaweed:8333"
+      S3_ACCESS_KEY: "smokeadmin"
+      S3_SECRET_KEY: "smokeadminpw"
+      S3_USE_PATH_STYLE: "1"
+      S3_ENSURE_BUCKET: "1"
+    ports:
+      - "127.0.0.1:8080:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:8080/healthz || exit 1"]
+      interval: 3s
+      timeout: 2s
+      retries: 30

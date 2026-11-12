@@ -1,0 +1,218 @@
+name: Release
+
+# Cuts cross-platform PLUGIN binaries + sha256sums for every release.
+# Service image is NOT pushed from this workflow — see root CLAUDE.md
+# "no Dockerhub publish without operator yes". The service image is
+# built locally at smoke time (`make docker` in service/) or via a
+# local `docker build` on the target VPS.
+#
+# Two triggers:
+#   - push to main → auto-release with CalVer "vYYYY.MM.DD-<short-sha>".
+#   - manually-pushed "v*" tag → named release for pinning / rollback.
+#
+# Both paths produce the same artifact set: three PLUGIN binaries
+# (linux/amd64, linux/arm64, darwin/arm64), a sha256sums.txt, and a
+# GitHub Release.
+#
+# OOM pins (GOMAXPROCS=1, GOMEMLIMIT=6GiB, `go build -p 1`) — kept
+# verbatim from sc-plugin-echo even though sc-component-backup's plugin
+# imports no large Pulumi SDK today. Four of six existing SC plugin
+# repos learned this lesson the hard way; a derived component plugin
+# that adds a cloud SDK later will need these pins and the workflow
+# shouldn't gate on knowing in advance.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  version:
+    name: Compute version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.compute.outputs.version }}
+      is_tag:  ${{ steps.compute.outputs.is_tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: compute
+        name: Resolve version string
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            echo "is_tag=true"               >> "$GITHUB_OUTPUT"
+          else
+            ver="v$(date -u +%Y.%m.%d)-$(git rev-parse --short=7 HEAD)"
+            echo "version=${ver}"            >> "$GITHUB_OUTPUT"
+            echo "is_tag=false"              >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build ${{ matrix.goos }}-${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    needs: version
+    strategy:
+      matrix:
+        include:
+          - { goos: linux,  goarch: amd64 }
+          - { goos: linux,  goarch: arm64 }
+          - { goos: darwin, goarch: arm64 }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache-dependency-path: plugin/go.sum
+
+      - name: Build plugin binary
+        working-directory: plugin
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'
+          VERSION: ${{ needs.version.outputs.version }}
+          # OOM-safe pins — see workflow file-level comment.
+          GOMAXPROCS: '1'
+          GOMEMLIMIT: '6GiB'
+        run: |
+          out=sc-plugin-backup-${GOOS}-${GOARCH}
+          go build -trimpath -buildvcs=false -p 1 \
+            -ldflags "-s -w -X main.version=${VERSION}" \
+            -o "../${out}" \
+            ./cmd/sc-plugin-backup
+          sha256sum "../${out}" > "../${out}.sha256"
+          tar -czf "../${out}.tar.gz" "../${out}"
+          sha256sum "../${out}.tar.gz" >> "../${out}.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: |
+            sc-plugin-backup-${{ matrix.goos }}-${{ matrix.goarch }}*
+
+  release:
+    name: Publish Release
+    runs-on: ubuntu-latest
+    needs: [version, build]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Build consolidated sha256sums.txt
+        working-directory: dist
+        run: |
+          cat sc-plugin-backup-*.sha256 > sha256sums.txt
+          rm sc-plugin-backup-*.sha256
+          cat sha256sums.txt
+
+      - name: Tag commit if from main
+        if: needs.version.outputs.is_tag == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          git tag "${VERSION}"
+          git push origin "${VERSION}"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          gh release create "${VERSION}" \
+            --title "${VERSION}" \
+            --generate-notes \
+            dist/*
+
+  # Dockerhub publish — enabled 2026-11-12 per operator decision Q3 on
+  # sc-component-backup-refactor design doc §5. Gated on:
+  #   - Tag push only (so `main` pushes still cut a plugin release but
+  #     do not re-publish the image on every merge).
+  #   - DOCKERHUB_USERNAME + DOCKERHUB_TOKEN org secrets present (so a
+  #     first-tag push before the operator wires the secrets fails
+  #     cleanly at the login step rather than publishing a half-tagged
+  #     image to a wrong account).
+  #
+  # Image name: simplecontainer/sc-component-backup:<version> (plus :latest
+  # when the tag is a release). Builds from the `service/` module; passes
+  # VERSION as a build arg so `-X main.version=<ver>` in the Go link flags
+  # resolves (matches the fleet "SC ALWAYS injects VERSION" convention in
+  # root CLAUDE.md "How SC builds images").
+  docker:
+    name: Push Docker image to Dockerhub
+    runs-on: ubuntu-latest
+    needs: [version, release]
+    if: startsWith(github.ref, 'refs/tags/v') || needs.version.outputs.is_tag == 'false'
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check Dockerhub credentials
+        id: creds
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [ -z "$DOCKERHUB_USERNAME" ] || [ -z "$DOCKERHUB_TOKEN" ]; then
+            echo "::warning title=Dockerhub creds missing::skipping image push — set DOCKERHUB_USERNAME + DOCKERHUB_TOKEN as org secrets to enable"
+            echo "have=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "have=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: docker/setup-buildx-action@v3
+        if: steps.creds.outputs.have == 'true'
+
+      - uses: docker/login-action@v3
+        if: steps.creds.outputs.have == 'true'
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build + push image
+        if: steps.creds.outputs.have == 'true'
+        uses: docker/build-push-action@v5
+        with:
+          context: service
+          file: service/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            VERSION=${{ needs.version.outputs.version }}
+            COMMIT=${{ github.sha }}
+            REVISION=${{ github.sha }}
+          tags: |
+            simplecontainer/sc-component-backup:${{ needs.version.outputs.version }}
+            simplecontainer/sc-component-backup:latest
+
+# NOTE on the no-publish fallback.
+#
+# The `docker` job above only publishes when the two Dockerhub secrets
+# are present. In the absence of the secrets (an un-configured fork,
+# or any state before the operator wires `DOCKERHUB_USERNAME` +
+# `DOCKERHUB_TOKEN` at the simple-container-com org level), the job
+# emits a GitHub Actions `::warning` and no-ops. The plugin binaries
+# still release via the `release` job. This matches fleet CLAUDE.md
+# "package publishing, registries or release pipelines" — publishing
+# into `simplecontainer/*` requires explicit operator yes, which is
+# captured here as the presence of the credentials.
+#
+# Local developer workflow continues to be: `make docker` in service/
+# builds the image, `docker save` + `scp` + `docker load` to a test
+# host when developing without a Dockerhub pull.

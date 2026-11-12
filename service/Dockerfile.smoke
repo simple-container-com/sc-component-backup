@@ -1,0 +1,32 @@
+# Isolated-smoke-only Dockerfile for the sc-component-backup service.
+# The production Dockerfile targets AWS Lambda; this one targets a
+# normal Linux container so docker-compose can run it. Also carries
+# mongodump/mongorestore so the mongodb driver's shell-outs work.
+#
+# NOT published. Lives next to Dockerfile for the smoke rig only.
+
+ARG GO_VERSION=1.26
+
+FROM golang:${GO_VERSION}-alpine AS builder
+WORKDIR /src
+# Copy the api/ sibling in too — the service module has an indirect
+# via the repo's go.work on the dev machine, but the container build
+# only needs the service module itself.
+COPY service/go.mod service/go.sum ./service/
+WORKDIR /src/service
+RUN go mod download
+WORKDIR /src
+COPY service/ ./service/
+WORKDIR /src/service
+ARG VERSION=smoke
+ARG COMMIT=smoke
+ARG REVISION=smoke
+RUN CGO_ENABLED=0 go build \
+    -ldflags "-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.revision=${REVISION}" \
+    -o /out/backup ./cmd/backup
+
+FROM alpine:3.20
+RUN apk add --no-cache ca-certificates mongodb-tools wget
+COPY --from=builder /out/backup /usr/local/bin/backup
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/backup"]

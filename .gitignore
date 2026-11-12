@@ -1,0 +1,31 @@
+# Compiled binaries
+/sc-plugin-backup
+/plugin/sc-plugin-backup
+/service/backup
+/dist/
+/bin/
+
+# Local SC state + secrets (gitignored per fleet CLAUDE.md — only encrypted
+# .sc/secrets.yaml registries are committed).
+/.sc/state/
+/.sc/stacks/*/secrets.yaml
+/.sc/cfg.github.yaml
+
+# Go
+/plugin/vendor/
+/api/vendor/
+/service/vendor/
+
+# Node
+/service/internal/ui/node_modules/
+/service/internal/ui/dist/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

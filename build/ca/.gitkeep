@@ -1,0 +1,8 @@
+# Real-component CA carry-over placeholder.
+#
+# forge-notifier and other services that talk to Russian endpoints
+# (api.giga.chat, ngw.devices.sberbank.ru) drop their .crt files here and
+# the Dockerfile picks them up via `COPY build/ca/ /etc/pki/ca-trust/source/anchors/`
+# + `update-ca-trust extract` in the final stage. The dummy doesn't talk
+# to those endpoints, but the layout + Dockerfile step are in place so a
+# real component can add certs without touching the build.
