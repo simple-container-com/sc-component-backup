@@ -21,7 +21,13 @@
 
 ARG GOLANG_VERSION=1.26-alpine
 ARG NODE_VERSION=20-alpine
-ARG RUNTIME_BASE=public.ecr.aws/lambda/provided:al2023
+# Plain amazonlinux:2023 (NOT lambda/provided:al2023) so the container's
+# own ENTRYPOINT runs directly without lambda-entrypoint.sh demanding a
+# handler-arg on container start. go-aws-lambda-sdk detects Lambda from
+# AWS_LAMBDA_FUNCTION_NAME env and switches to the Lambda runtime API
+# itself; outside Lambda the binary serves plain HTTP on $PORT. Same
+# shape every forge-* service uses (see forge-notifier/Dockerfile).
+ARG RUNTIME_BASE=public.ecr.aws/amazonlinux/amazonlinux:2023
 
 # -----------------------------
 # Stage 1 — Build the SPA
@@ -103,13 +109,18 @@ RUN mongodump --version | head -1 \
     && pg_dump --version | head -1 \
     && mariadb-dump --version | head -1
 
-# The lambda base image's default WORKDIR is /var/task.
-COPY --from=go-builder /out/backup /var/task/bootstrap
+# The lambda base image's default WORKDIR would be /var/task; on plain
+# amazonlinux we just drop the binary under /app and ENTRYPOINT it.
+WORKDIR /app
+COPY --from=go-builder /out/backup /app/backup
+RUN chmod 555 /app/backup
 
-# For plain-HTTP mode (non-Lambda), run directly:
+# For plain-HTTP mode (non-Lambda), $PORT is honoured by the service.
 ENV PORT=8080
 EXPOSE 8080
 
-# Lambda runtime detects provided.al2023 and invokes /var/task/bootstrap.
-# For VM/compose deploys, override with CMD ["/var/task/bootstrap"] in
-# the deploy template's compose file.
+# Lambda invokes this entrypoint directly; go-aws-lambda-sdk's sdkservice
+# detects the Lambda runtime from AWS_LAMBDA_FUNCTION_NAME + joins the
+# Lambda runtime API itself (no lambda-entrypoint.sh wrapper needed).
+# Outside Lambda the same binary serves HTTP on $PORT.
+ENTRYPOINT ["/app/backup"]
