@@ -1,0 +1,4 @@
+# SPA — vite + tsc output is committed (dist/ IS tracked for go:embed);
+# only the npm install artefacts and dev caches are ignored.
+node_modules/
+.vite/

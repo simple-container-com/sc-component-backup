@@ -1,22 +1,22 @@
-import { defineConfig } from 'vite'
-import react from '@vitejs/plugin-react'
+import { defineConfig, type PluginOption } from "vite";
+import react from "@vitejs/plugin-react";
+import { fileURLToPath, URL } from "node:url";
+import { mockApi } from "./mock/plugin";
 
-// Dev proxy target: the local dummy backend. Override for remote-dev
-// against a deployed smoke stand by setting VITE_DEV_PROXY_TARGET.
-const DEFAULT_DEV_PROXY_TARGET = 'http://localhost:8080'
-const proxyTarget = process.env.VITE_DEV_PROXY_TARGET ?? DEFAULT_DEV_PROXY_TARGET
-
-export default defineConfig({
-  plugins: [react()],
-  build: {
-    outDir: 'dist',
-    emptyOutDir: true,
-  },
-  server: {
-    port: 5173,
-    proxy: {
-      '/api': { target: proxyTarget, changeOrigin: true },
-      '/healthz': { target: proxyTarget, changeOrigin: true },
+export default defineConfig(({ mode }) => {
+  const plugins: PluginOption[] = [react()];
+  if (mode === "mock") plugins.push(mockApi());
+  return {
+    base: "/",
+    plugins,
+    resolve: { alias: { "@": fileURLToPath(new URL("./src", import.meta.url)) } },
+    server: {
+      port: 5173,
+      proxy:
+        mode === "mock"
+          ? undefined
+          : { "/api": { target: "http://127.0.0.1:8080", changeOrigin: false } },
     },
-  },
-})
+    build: { outDir: "dist", emptyOutDir: true, sourcemap: false },
+  };
+});

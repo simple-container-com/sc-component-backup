@@ -1,0 +1,103 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg: 246 247 249;
+  --surface: 255 255 255;
+  --sunken: 239 241 244;
+  --line: 226 229 234;
+  --line-strong: 205 210 218;
+  --fg: 22 26 33;
+  --muted: 89 97 111;
+  --faint: 136 144 158;
+  --accent: 14 106 115;
+  --accent-fg: 255 255 255;
+  --accent-soft: 226 241 242;
+  --ok: 27 128 70;
+  --ok-soft: 225 243 232;
+  --warn: 166 104 16;
+  --warn-soft: 251 239 216;
+  --danger: 196 50 40;
+  --danger-soft: 252 230 227;
+  --idle: 107 103 135;
+  --idle-soft: 236 235 243;
+  --shadow: 20 30 45;
+  /* Chart series, fixed order (validated for colour-blind separation on --surface); status colours stay reserved. */
+  --viz-1: 42 120 214;
+  --viz-2: 235 104 52;
+  --viz-3: 27 175 122;
+  --viz-4: 237 161 0;
+  --viz-5: 232 123 164;
+  --viz-6: 0 131 0;
+  --viz-7: 98 80 214;
+  --viz-8: 227 73 72;
+  color-scheme: light;
+}
+.dark {
+  --bg: 14 17 20;
+  --surface: 21 25 30;
+  --sunken: 17 20 24;
+  --line: 40 46 55;
+  --line-strong: 58 66 78;
+  --fg: 229 233 238;
+  --muted: 154 163 176;
+  --faint: 108 117 130;
+  --accent: 72 184 194;
+  --accent-fg: 8 28 31;
+  --accent-soft: 18 48 52;
+  --ok: 80 196 128;
+  --ok-soft: 19 46 31;
+  --warn: 226 170 76;
+  --warn-soft: 54 40 16;
+  --danger: 240 118 98;
+  --danger-soft: 60 24 21;
+  --idle: 166 160 196;
+  --idle-soft: 38 36 52;
+  --shadow: 0 0 0;
+  --viz-1: 57 135 229;
+  --viz-2: 217 89 38;
+  --viz-3: 25 158 112;
+  --viz-4: 201 133 0;
+  --viz-5: 213 81 129;
+  --viz-6: 0 131 0;
+  --viz-7: 144 133 233;
+  --viz-8: 230 103 103;
+  color-scheme: dark;
+}
+
+@layer base {
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    @apply bg-bg text-fg font-sans text-base antialiased;
+    font-feature-settings: "tnum" 0, "cv11" 1;
+  }
+  ::selection { background: rgb(var(--accent) / 0.22); }
+  :focus-visible { outline: 2px solid rgb(var(--accent)); outline-offset: 2px; border-radius: 4px; }
+  input, textarea, button { font: inherit; color: inherit; }
+  code, kbd, .mono { @apply font-mono; font-size: 0.92em; }
+}
+
+@layer components {
+  .tnum { font-variant-numeric: tabular-nums; }
+  .card { @apply bg-surface border border-line rounded-md; }
+  .field {
+    @apply h-9 w-full rounded border border-line-strong/80 bg-surface px-3 text-sm text-fg placeholder:text-faint
+      transition-[border-color,box-shadow] duration-100
+      hover:border-line-strong focus:outline-none focus:border-accent focus:ring-[3px] focus:ring-accent/15;
+  }
+  .field[aria-invalid="true"] { @apply border-danger focus:ring-danger/15; }
+  .skeleton {
+    background: linear-gradient(90deg, rgb(var(--sunken)) 0%, rgb(var(--line) / 0.7) 50%, rgb(var(--sunken)) 100%);
+    background-size: 200% 100%;
+    @apply animate-shimmer rounded;
+  }
+  .stripes {
+    background-image: repeating-linear-gradient(-45deg, rgb(255 255 255 / 0.22) 0 4px, transparent 4px 8px);
+    background-size: 16px 16px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
+}
