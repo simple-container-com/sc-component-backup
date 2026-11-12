@@ -8,6 +8,7 @@ require (
 	github.com/hashicorp/go-plugin v1.6.3
 	github.com/onsi/gomega v1.44.0
 	github.com/pkg/errors v0.9.1
+	github.com/pulumi/pulumi-aws/sdk/v6 v6.83.4
 	github.com/pulumi/pulumi/sdk/v3 v3.245.0
 	github.com/simple-container-com/api v0.0.0-20261112103502-f172da4c723f
 	github.com/simple-container-com/sc-component-backup/api v0.0.0

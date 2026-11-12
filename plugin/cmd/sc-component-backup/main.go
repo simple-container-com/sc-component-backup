@@ -57,6 +57,7 @@ import (
 	hclog "github.com/hashicorp/go-hclog"
 	hplugin "github.com/hashicorp/go-plugin"
 	"github.com/pkg/errors"
+	awsprov "github.com/pulumi/pulumi-aws/sdk/v6/go/aws"
 	sdk "github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 	"github.com/simple-container-com/api/pkg/api"
 	"github.com/simple-container-com/api/pkg/api/logger"
@@ -156,6 +157,53 @@ func (p *backupPlugin) Provision(stdctx context.Context, req *scpluginv1.Provisi
 	}
 
 	rctx.Pulumi.Export(fmt.Sprintf("%s-service-url", req.GetResourceName()), sdk.String(serviceURL))
+
+	// Slice 1c expansion — template-aware compute backend provisioning
+	// (design doc §5.3). When deployTo: lambda, the Lambda's 15-min cap
+	// can't fit a real mongodump — the actual dump runs in an ECS Fargate
+	// one-shot task. The plugin provisions the Fargate cluster + task
+	// definition + IAM alongside (pulumi-managed per operator decision
+	// α.1 + β.2). For other deployTo values this is a no-op.
+	componentRaw, crErr := backupInternal.ComponentRawFromProvisionRequestLocal(req)
+	if crErr != nil {
+		return nil, errors.Wrap(crErr, "decode ComponentRaw")
+	}
+	ecsIn, ecsErr := backupInternal.EcsProvisionInputFromRaw(
+		req.GetResourceName(), componentRaw,
+		"", // defaultImage — operator declares image on BackupConfig
+		"eu-central-1",
+	)
+	if ecsErr != nil {
+		return nil, errors.Wrapf(ecsErr, "backup %q EcsProvisionInputFromRaw", req.GetResourceName())
+	}
+	if ecsIn != nil {
+		// Build an aws provider in the plugin's pctx. Credentials fall
+		// through the AWS SDK default chain (env, shared creds file,
+		// IMDS). SC core resolved ${auth:aws} on BackupConfig and
+		// exposes it via env to the plugin process — the pulumi-aws
+		// provider picks it up without explicit wiring.
+		awsProv, perr := awsprov.NewProvider(rctx.Pulumi, fmt.Sprintf("sc-backup-%s-aws", req.GetResourceName()), &awsprov.ProviderArgs{
+			Region: sdk.String(ecsIn.Region),
+		})
+		if perr != nil {
+			return nil, errors.Wrap(perr, "build aws provider for ECS extras")
+		}
+		ecsIn.AwsProvider = awsProv
+		ecsOut, provErr := backupInternal.ProvisionEcsWorker(rctx.Pulumi, *ecsIn)
+		if provErr != nil {
+			return nil, errors.Wrapf(provErr, "backup %q ProvisionEcsWorker", req.GetResourceName())
+		}
+		// Export cluster + task family so `sc stack outputs` shows them
+		// and operators can wire-check the Lambda env matches.
+		resName := req.GetResourceName()
+		rctx.Pulumi.Export(resName+"-ecs-cluster-name", ecsOut.ClusterName)
+		rctx.Pulumi.Export(resName+"-ecs-cluster-arn", ecsOut.ClusterArn)
+		rctx.Pulumi.Export(resName+"-ecs-task-family", ecsOut.TaskFamily)
+		rctx.Pulumi.Export(resName+"-ecs-task-def-arn", ecsOut.TaskDefinition)
+		rctx.Pulumi.Export(resName+"-ecs-execution-role-arn", ecsOut.ExecutionRole)
+		rctx.Pulumi.Export(resName+"-ecs-task-role-arn", ecsOut.TaskRoleArn)
+		p.progress.Info("provision", fmt.Sprintf("backup %q ECS worker extras: cluster=sc-backup-%s-cluster, task family=sc-backup-%s-worker", resName, resName, resName))
+	}
 
 	outputs, herr := runtime.HarvestExports(stdctx, rctx.Pulumi)
 	if herr != nil {
