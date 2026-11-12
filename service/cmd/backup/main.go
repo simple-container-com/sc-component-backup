@@ -30,6 +30,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -53,6 +54,17 @@ var (
 )
 
 func main() {
+	// One-shot worker mode — design doc §5.3. When the Lambda's
+	// scheduler tick calls ecs.RunTask, it sets BACKUP_MODE=worker +
+	// the per-tenant env below. The container runs dump → S3 → exits.
+	// Otherwise (default) runs the long-lived HTTP service + Lambda
+	// bridge below.
+	if mode := strings.ToLower(os.Getenv("BACKUP_MODE")); mode == "worker" {
+		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer cancel()
+		os.Exit(runWorker(ctx))
+	}
+
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
 
