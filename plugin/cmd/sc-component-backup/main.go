@@ -115,7 +115,16 @@ func (p *backupPlugin) Schema(_ context.Context, _ *scpluginv1.SchemaRequest) (*
 		// Slice 1a (SC Components Platform) — Path A dispatch.
 		ComponentResourceTypes: []string{backupApi.ResourceType},
 		ComponentAllowedOverrides: map[string]*scpluginv1.StringList{
-			backupApi.ResourceType: {Values: []string{"image", "env", "ingressRoutes", "imagePullSecretRef"}},
+			// cloudExtras added for slice 1c expansion (design doc §5.3):
+			// the backup Component overlays lambdaRoutingType=function-url
+			// (fixes the APIGW stage-prefix doubling that bit slice 1c's
+			// smoke), lambdaSchedules (1-min scheduler tick → ecs.RunTask),
+			// and awsRoles (ecs:RunTask + iam:PassRole + ec2:Describe* so
+			// the Lambda can fire Fargate one-shot backup tasks).
+			//
+			// Needs sc-plugin-aws ≥ v2026.11.12-90d5f1b (the overlay-side
+			// cloudExtras pass-through from sc-plugin-aws#19).
+			backupApi.ResourceType: {Values: []string{"image", "env", "ingressRoutes", "imagePullSecretRef", "cloudExtras"}},
 		},
 	}, nil
 }

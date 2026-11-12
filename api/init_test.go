@@ -46,10 +46,43 @@ func TestBackupConfigValidate(t *testing.T) {
 	Expect(err).To(HaveOccurred())
 	Expect(err.Error()).To(ContainSubstring("`signingKey` is required"))
 
+	// lambda deploy requires Worker (slice 1c design doc §5.3).
+	err = (&BackupConfig{
+		DeployTo:   "lambda",
+		Image:      "simplecontainer/sc-component-backup:latest",
+		SigningKey: "${secret:backup-service-jwt-key}",
+	}).Validate()
+	Expect(err).To(HaveOccurred())
+	Expect(err.Error()).To(ContainSubstring("`worker` is required"))
+
+	// lambda deploy with Worker but missing cluster.
+	err = (&BackupConfig{
+		DeployTo:   "lambda",
+		Image:      "simplecontainer/sc-component-backup:latest",
+		SigningKey: "${secret:backup-service-jwt-key}",
+		Worker:     &BackupWorker{},
+	}).Validate()
+	Expect(err).To(HaveOccurred())
+	Expect(err.Error()).To(ContainSubstring("`worker.cluster` is required"))
+
+	// lambda deploy with complete Worker — succeeds.
 	ok := &BackupConfig{
 		DeployTo:   "lambda",
 		Image:      "simplecontainer/sc-component-backup:latest",
 		SigningKey: "${secret:backup-service-jwt-key}",
+		Worker: &BackupWorker{
+			Cluster:          "forge-backup-cluster",
+			SubnetIds:        []string{"subnet-abc"},
+			SecurityGroupIds: []string{"sg-xyz"},
+		},
 	}
 	Expect(ok.Validate()).To(Succeed())
+
+	// Non-lambda deploy doesn't require Worker.
+	fargate := &BackupConfig{
+		DeployTo:   "ecs-fargate",
+		Image:      "simplecontainer/sc-component-backup:latest",
+		SigningKey: "${secret:backup-service-jwt-key}",
+	}
+	Expect(fargate.Validate()).To(Succeed())
 }

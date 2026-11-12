@@ -88,6 +88,17 @@ type BackupConfig struct {
 	// itself never leaves the backup Lambda's env.
 	AtlasAdmin *BackupAtlasAdmin `json:"atlasAdmin,omitempty" yaml:"atlasAdmin,omitempty"`
 
+	// Worker shapes the ECS Fargate one-shot task that runs the actual
+	// mongodump/pg_dump when the Component is deployed to aws-lambda.
+	// Per design doc §5.3 — Lambda's 15-min cap means long-running dumps
+	// can't live in the Lambda itself; they run in a Fargate task fired
+	// by the Lambda's scheduler tick via `ecs.RunTask`.
+	//
+	// ONLY consulted when `deployTo: lambda`. Ignored for ecs-fargate /
+	// vm-compose / k8s deploys — those run long-lived and dump in-process,
+	// and the Worker block has no effect there.
+	Worker *BackupWorker `json:"worker,omitempty" yaml:"worker,omitempty"`
+
 	// api.Credentials embedded inline so a resource can optionally carry
 	// a `${auth:...}` reference. Rarely needed for a component (templates
 	// carry their own credentials); kept for forward-compat.
@@ -108,6 +119,54 @@ type BackupDatabase struct {
 	// Determines which admin-REST client sc-plugin-backup uses to mint the
 	// scoped user.
 	Driver string `json:"driver" yaml:"driver"`
+}
+
+// BackupWorker shapes the ECS Fargate one-shot task that runs the actual
+// mongodump / pg_dump / mariadb-dump when this Component is deployed to
+// aws-lambda. Per design doc §5.3.
+//
+// All fields are operator-declared. The plugin's Provision provisions an
+// `aws:ecs/taskDefinition:TaskDefinition` using these knobs (image is the
+// same as the Lambda's — one Dockerhub image, mode flag at entry).
+// The cluster + subnets + security groups are operator-declared (not
+// provisioned by this plugin) so the operator keeps full control over the
+// VPC + routing posture for the backup worker. Inside the Fargate task, the
+// backup service entrypoint reads `BACKUP_MODE=worker` + the per-tenant env
+// the Lambda injected via `ecs.RunTask` and dumps to S3.
+type BackupWorker struct {
+	// CPU is the Fargate vCPU allocation in millicpu steps (256, 512, 1024,
+	// 2048, 4096). Must pair with MemoryMB per the Fargate matrix.
+	// Default: 512 (0.5 vCPU) — enough for mongodump streaming without
+	// paying for compute it won't use.
+	CPU int `json:"cpu,omitempty" yaml:"cpu,omitempty"`
+
+	// MemoryMB is the Fargate memory allocation in MB. Default 2048 (2 GB).
+	// Oversized dumps use the ephemeral storage for buffering, not RAM.
+	MemoryMB int `json:"memoryMB,omitempty" yaml:"memoryMB,omitempty"`
+
+	// EphemeralStorageGB is the task's /tmp allocation (Fargate default 20
+	// GB, max 200). Default 50 — matches local-db-backup's observed
+	// mongodump spool peak of 2× uncompressed DB size.
+	EphemeralStorageGB int `json:"ephemeralStorageGB,omitempty" yaml:"ephemeralStorageGB,omitempty"`
+
+	// Cluster is the ECS cluster ARN (or name) the Fargate task runs on.
+	// Operator-declared; this plugin does NOT create ECS clusters —
+	// clusters are a shared operator resource (think `forge-fleet-tasks`)
+	// that backup tasks join alongside other short-lived jobs.
+	// Required for deployTo: lambda.
+	Cluster string `json:"cluster" yaml:"cluster"`
+
+	// SubnetIds is the VPC subnet list the Fargate task attaches to.
+	// Must have outbound reachability to Atlas / RDS hosts AND to S3 (via
+	// a VPC endpoint OR via NAT gateway).
+	// Required for deployTo: lambda.
+	SubnetIds []string `json:"subnetIds" yaml:"subnetIds"`
+
+	// SecurityGroupIds is the security-group list applied to the task's
+	// ENI. Must allow outbound 27017 (Mongo) / 5432 (Postgres) / 3306
+	// (MySQL) + 443 (S3 + Atlas REST).
+	// Required for deployTo: lambda.
+	SecurityGroupIds []string `json:"securityGroupIds" yaml:"securityGroupIds"`
 }
 
 // BackupAtlasAdmin carries operator-provided Atlas admin API-key ids. Both
@@ -176,6 +235,23 @@ func (c *BackupConfig) Validate() error {
 		}
 		if c.AtlasAdmin.PrivateKey == "" || c.AtlasAdmin.PublicKey == "" || c.AtlasAdmin.ProjectID == "" {
 			return errors.Errorf("`atlasAdmin.{privateKey,publicKey,projectId}` are all required when any `databases[].driver` is \"mongodb\"")
+		}
+	}
+	// Worker is required when deployTo: lambda (§5.3). For other
+	// deployTo values (ecs-fargate / vm-compose / k8s) Worker is ignored
+	// and may be absent.
+	if c.DeployTo == "lambda" {
+		if c.Worker == nil {
+			return errors.Errorf("`worker` is required for %q when `deployTo: lambda` — Fargate one-shot task shape (cluster + subnets + securityGroups). See design doc §5.3.", ResourceType)
+		}
+		if c.Worker.Cluster == "" {
+			return errors.Errorf("`worker.cluster` is required (ECS cluster ARN or name the Fargate task runs on)")
+		}
+		if len(c.Worker.SubnetIds) == 0 {
+			return errors.Errorf("`worker.subnetIds` is required (at least one subnet)")
+		}
+		if len(c.Worker.SecurityGroupIds) == 0 {
+			return errors.Errorf("`worker.securityGroupIds` is required (at least one security group)")
 		}
 	}
 	return nil
