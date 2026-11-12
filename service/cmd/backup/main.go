@@ -24,7 +24,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io/fs"
 	"log/slog"
@@ -36,6 +35,8 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+
+	sdkservice "github.com/simple-container-com/go-aws-lambda-sdk/pkg/service"
 
 	"github.com/simple-container-com/sc-component-backup/service/internal/api"
 	"github.com/simple-container-com/sc-component-backup/service/internal/backup/scheduler"
@@ -130,29 +131,21 @@ func main() {
 		router.Handle("/*", http.FileServer(http.FS(spaFS)))
 	}
 
-	srv := &http.Server{
-		Addr:              ":" + port,
-		Handler:           router,
-		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      30 * time.Second,
-		IdleTimeout:       120 * time.Second,
+	// Bridge via go-aws-lambda-sdk's sdkservice. Under Lambda
+	// (AWS_LAMBDA_FUNCTION_NAME env set), it joins the Lambda runtime API
+	// and routes events through its-felix/aws-lambda-go-url-adapter
+	// (the vanilla handler path). Outside Lambda — LOCAL_DEBUG=true or
+	// just missing the env — it falls back to net/http on :PORT. Same
+	// shape every forge-* service uses; see forge-notifier/cmd/notifier/main.go.
+	slog.Info("starting service (sdkservice bridge)", "port", port)
+	svc, err := sdkservice.New(ctx, sdkservice.WithVanillaHandler(router))
+	if err != nil {
+		slog.Error("sdkservice init failed", "err", fmt.Sprintf("%v", err))
+		os.Exit(1)
 	}
-
-	go func() {
-		slog.Info("listening", "addr", srv.Addr)
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			slog.Error("listen failed", "err", err)
-			os.Exit(1)
-		}
-	}()
-
-	<-ctx.Done()
-	slog.Info("shutdown requested")
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer shutdownCancel()
-	if err := srv.Shutdown(shutdownCtx); err != nil {
-		slog.Error("shutdown error", "err", err)
+	if err := svc.Start(); err != nil {
+		slog.Error("sdkservice exited", "err", fmt.Sprintf("%v", err))
+		os.Exit(1)
 	}
 	slog.Info("exited cleanly")
 }
