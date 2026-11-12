@@ -75,6 +75,34 @@ LABEL org.opencontainers.image.licenses="MIT"
 # add the .crt files here + an update-ca-trust step.
 COPY build/ca/ /etc/pki/ca-trust/source/anchors/
 
+# Database CLI tools — the drivers shell out to mongodump / mongorestore,
+# pg_dump / pg_restore, mariadb-dump / mariadb. Lambda's provided:al2023
+# base has yum/dnf but no DB clients; install:
+#   - mongodb-database-tools (prebuilt tarball from MongoDB)
+#   - postgresql15 client (al2023 default repo)
+#   - mariadb client (al2023 default repo)
+#
+# Image size cost: ~90 MB (dominated by mongodb-database-tools). mongodump
+# is shipped as a standalone binary — no gpg verification step here;
+# prod should wire checksum verification once the bundle flips to a
+# vendored artefact under build/tools/.
+ARG MONGO_TOOLS_VERSION=100.10.0
+RUN dnf install -y tar gzip postgresql15 mariadb105 \
+    && dnf clean all && rm -rf /var/cache/dnf \
+    && curl -fsSL -o /tmp/mdbt.tgz \
+         "https://fastdl.mongodb.org/tools/db/mongodb-database-tools-amazon2023-x86_64-${MONGO_TOOLS_VERSION}.tgz" \
+    && tar -xzf /tmp/mdbt.tgz -C /tmp \
+    && mv /tmp/mongodb-database-tools-*/bin/mongodump /usr/local/bin/ \
+    && mv /tmp/mongodb-database-tools-*/bin/mongorestore /usr/local/bin/ \
+    && rm -rf /tmp/mdbt.tgz /tmp/mongodb-database-tools-*
+
+# Verify the tools landed. Fail the build early if any is missing —
+# the smoke's backup-now call would otherwise 500 at runtime with
+# "mongodump: not found".
+RUN mongodump --version | head -1 \
+    && pg_dump --version | head -1 \
+    && mariadb-dump --version | head -1
+
 # The lambda base image's default WORKDIR is /var/task.
 COPY --from=go-builder /out/backup /var/task/bootstrap
 
