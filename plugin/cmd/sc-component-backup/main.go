@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) Simple Container
 
-// sc-plugin-backup is the TEMPLATE every SC component clones from, AND
+// sc-component-backup is the TEMPLATE every SC component clones from, AND
 // the throwaway smoke subject of sc-components-platform slice 1a.
 //
 // The plugin DOES NOT register any Pulumi resource in its Provision RPC.
@@ -251,7 +251,7 @@ func main() {
 	scPlugin.Serve(scPlugin.ServerConfig{
 		Impl: impl,
 		Logger: hclog.New(&hclog.LoggerOptions{
-			Name:   "sc-plugin-backup",
+			Name:   "sc-component-backup",
 			Level:  hclog.Warn,
 			Output: os.Stderr,
 		}),

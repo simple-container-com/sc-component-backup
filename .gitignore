@@ -1,6 +1,6 @@
 # Compiled binaries
-/sc-plugin-backup
-/plugin/sc-plugin-backup
+/sc-component-backup
+/plugin/sc-component-backup
 /service/backup
 /dist/
 /bin/

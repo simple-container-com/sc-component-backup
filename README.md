@@ -85,7 +85,7 @@ pg_dump / mariadb-dump are stubbed when unavailable).
 ## Release
 
 Push to `main` → the release workflow:
-1. Builds `sc-plugin-backup-{linux,darwin}-{amd64,arm64}`
+1. Builds `sc-component-backup-{linux,darwin}-{amd64,arm64}`
    binaries (OOM-pinned per the `sc-plugin-echo` template).
 2. Cuts a `v<CalVer>-<sha>` tag + GitHub Release with the binaries.
 3. Builds + pushes `simplecontainer/sc-component-backup:<version>`

@@ -32,7 +32,7 @@ const (
 	maxAttempts        = 3
 	attemptTimeout     = 10 * time.Second
 	jwtLifetime        = 60 * time.Second
-	userAgent          = "sc-plugin-backup/0.0.1 (+https://github.com/simple-container-com/sc-component-backup)"
+	userAgent          = "sc-component-backup/0.0.1 (+https://github.com/simple-container-com/sc-component-backup)"
 	signingKeyEnvVar   = "BACKUP_SIGNING_KEY" // on plugin side, from Provision inputs
 	backupAgentURLVar  = "BACKUP_AGENT_URL"   // injected into consumer's env (plain)
 	backupTokenVar     = "BACKUP_TOKEN"       // injected into consumer's env (secret, per-consumer)
