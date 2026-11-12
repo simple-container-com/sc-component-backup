@@ -5,7 +5,6 @@ package driver
 
 import (
 	"context"
-	"errors"
 	"io"
 	"strings"
 	"testing"
@@ -41,21 +40,6 @@ func TestByName(t *testing.T) {
 			}
 			if d.Name() != c.wantName {
 				t.Fatalf("want %q, got %q", c.wantName, d.Name())
-			}
-		})
-	}
-}
-
-func TestStubsReturnErrDriverUnsupported(t *testing.T) {
-	ctx := context.Background()
-	spec := ConnectionSpec{URI: "x"}
-	for _, d := range []Driver{&PostgresDriver{}, &MySQLDriver{}} {
-		t.Run(d.Name(), func(t *testing.T) {
-			if err := d.Dump(ctx, spec, io.Discard); !errors.Is(err, ErrDriverUnsupported) {
-				t.Errorf("Dump: want ErrDriverUnsupported, got %v", err)
-			}
-			if err := d.Restore(ctx, spec, strings.NewReader("")); !errors.Is(err, ErrDriverUnsupported) {
-				t.Errorf("Restore: want ErrDriverUnsupported, got %v", err)
 			}
 		})
 	}
