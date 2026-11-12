@@ -185,9 +185,16 @@ func (p *backupPlugin) Provision(stdctx context.Context, req *scpluginv1.Provisi
 	if crErr != nil {
 		return nil, errors.Wrap(crErr, "decode ComponentRaw")
 	}
+	// defaultImage: the Fargate worker task def needs a concrete image ref
+	// at Provision time. When the operator declared `image:` as a string
+	// on BackupConfig it reaches us verbatim; map-form (dockerfile+context
+	// → SC build-and-push to ECR) can't be used for the worker because
+	// the ECR URI isn't known until push-time. Fall back to the fleet-
+	// canonical Dockerhub ref so a map-form smoke still exercises the
+	// full ECS branch end-to-end. See EcsProvisionInputFromRaw's doc.
 	ecsIn, ecsErr := backupInternal.EcsProvisionInputFromRaw(
 		req.GetResourceName(), componentRaw,
-		"", // defaultImage — operator declares image on BackupConfig
+		"simplecontainer/sc-component-backup:latest",
 		"eu-central-1",
 	)
 	if ecsErr != nil {

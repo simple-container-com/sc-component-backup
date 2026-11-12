@@ -37,6 +37,7 @@ import (
 	"github.com/pulumi/pulumi-aws/sdk/v6/go/aws/ecs"
 	"github.com/pulumi/pulumi-aws/sdk/v6/go/aws/iam"
 	sdk "github.com/pulumi/pulumi/sdk/v3/go/pulumi"
+	scPlugin "github.com/simple-container-com/api/pkg/plugin"
 	scpluginv1 "github.com/simple-container-com/api/pkg/plugin/proto/v1"
 )
 
@@ -50,14 +51,33 @@ import (
 // stays decoupled from api's exact runtime package shape.
 func ComponentRawFromProvisionRequestLocal(req *scpluginv1.ProvisionRequest) (map[string]any, error) {
 	raw := req.GetComponentRaw()
-	if len(raw) == 0 {
-		return nil, nil
+	if len(raw) > 0 {
+		var m map[string]any
+		if err := json.Unmarshal(raw, &m); err != nil {
+			return nil, errors.Wrap(err, "unmarshal ComponentRaw JSON")
+		}
+		return m, nil
 	}
-	var m map[string]any
-	if err := json.Unmarshal(raw, &m); err != nil {
-		return nil, errors.Wrap(err, "unmarshal ComponentRaw JSON")
+	// Fallback for the component plugin's OWN Provision RPC: SC core today
+	// only populates `input.ComponentRaw` for the dispatched template's
+	// ProvisionFunc call (api pkg/clouds/pulumi/plugin_sidecars.go:1330),
+	// not for the component plugin's own Provision — so req.ComponentRaw
+	// is empty bytes when our Provision runs. Live-caught on the first
+	// backup-smoke preview, 2026-11-13: the Lambda + APIGW + IAM / SecretsManager
+	// (22 resources) land correctly, but ProvisionEcsWorker returns no-op
+	// because EcsProvisionInputFromRaw(nil, ...) returns (nil, nil).
+	//
+	// req.Inputs carries the same operator-declared config, serialized by
+	// serializeConfigToInputs (plugin_sidecars.go:924) — JSON round-trip of
+	// cfg.Config. InputsToPlain reverses that into a map[string]any that
+	// matches ComponentRaw's shape. The two paths will converge once api
+	// core also populates input.ComponentRaw on the plugin's own Provision;
+	// that's a one-line change in plugin_sidecars.go around line 104, filed
+	// as a follow-up roadmap item.
+	if len(req.GetInputs()) > 0 {
+		return scPlugin.InputsToPlain(req.GetInputs()), nil
 	}
-	return m, nil
+	return nil, nil
 }
 
 // EcsProvisionInput is the operator-config surface the backup plugin
@@ -302,12 +322,19 @@ func EcsProvisionInputFromRaw(
 	if worker == nil {
 		return nil, errors.New("deployTo: lambda requires `worker` block (see BackupConfig.Worker)")
 	}
+	// `image` may be either a string (pre-built ref) OR a map
+	// {dockerfile, context, build} that triggers SC's build-and-push.
+	// For the worker task def we need a concrete image ref at Provision
+	// time. String form is directly usable; map form falls back to
+	// defaultImage (operator-declared fleet-canonical Dockerhub tag) and
+	// if that's also empty we error — the smoke's throwaway use case
+	// passes defaultImage from the plugin's main.go.
 	image, _ := raw["image"].(string)
 	if image == "" {
 		image = defaultImage
 	}
 	if image == "" {
-		return nil, errors.New("EcsProvisionInputFromRaw: no image on config.image or defaultImage")
+		return nil, errors.New("EcsProvisionInputFromRaw: no image on config.image (as string) or defaultImage — map-form image requires a defaultImage fallback for the Fargate worker task def")
 	}
 	in := &EcsProvisionInput{
 		ComponentResourceName: resourceName,
