@@ -82,7 +82,17 @@ func (p *Processor) Process(ctx *sdk.Context, _ api.Stack, input api.ResourceInp
 	stackName := input.StackParams.StackName
 	deps := params.ResourceOutputs
 
-	serviceURL, err := p.readServiceURL(input, deps)
+	// Slice 1d.4-redux: SC core doesn't populate `params.ResourceOutputs`
+	// on consumer-side ComputeProcess today (api/pkg/clouds/pulumi/
+	// provision.go:373-382), so deps is empty on the live path. Open a
+	// StackReference to the parent as the fallback source — matching
+	// sc-plugin-mongodb's precedent. Primary stays `deps` so the day
+	// SC core populates that map, no plugin change is needed.
+	parentRef, parentRefErr := newParentStackRef(ctx, stackName, resName, params.ParentStack)
+	// A missing parent is a hard error only if deps is empty too. Hold
+	// `parentRefErr` and defer the decision to each helper — service URL
+	// lookup needs ParentInfo; signingKey reads only Config.Raw.
+	serviceURL, err := p.readServiceURL(input, deps, parentRef, parentRefErr)
 	if err != nil {
 		return nil, errors.Wrapf(err, "component %q unable to resolve service URL", resName)
 	}
@@ -114,7 +124,7 @@ func (p *Processor) Process(ctx *sdk.Context, _ api.Stack, input api.ResourceInp
 	// an operator registers a tenant explicitly via the on-demand API.
 	// This keeps backward compat with today's smoke shape.
 	if raw, ok := extractConfigRaw(input.Descriptor); ok {
-		if scopedRes, err := p.maybeProvisionScopedUser(ctx.Context(), raw, stackName, deps); err != nil {
+		if scopedRes, err := p.maybeProvisionScopedUser(ctx.Context(), raw, stackName, deps, parentRef); err != nil {
 			return nil, errors.Wrapf(err, "component %q scoped-user provisioning", resName)
 		} else if scopedRes != nil {
 			record.Resources = append(record.Resources, *scopedRes)
@@ -250,7 +260,7 @@ func truncate(s string, limit int) string {
 // payload. Returns (nil, nil) when nothing should happen (backward-compat
 // path).
 func (p *Processor) maybeProvisionScopedUser(
-	ctx context.Context, raw map[string]any, consumerStack string, deps pApi.ResourcesOutputs,
+	ctx context.Context, raw map[string]any, consumerStack string, deps pApi.ResourcesOutputs, parentRef *sdk.StackReference,
 ) (*TenantResource, error) {
 	dbs, admin, err := populateDatabasesFromRaw(raw)
 	if err != nil {
@@ -260,7 +270,7 @@ func (p *Processor) maybeProvisionScopedUser(
 		return nil, nil
 	}
 
-	resourceName, dbName, matched, err := MatchConsumerToDatabase(deps, dbs)
+	resourceName, dbName, matched, err := MatchConsumerToDatabase(deps, dbs, parentRef)
 	if err != nil {
 		return nil, errors.Wrap(err, "match consumer to backup-component databases:")
 	}
@@ -293,7 +303,7 @@ func (p *Processor) maybeProvisionScopedUser(
 	// just-minted scoped user's creds. The URI host part is whatever the
 	// consumer's dependency output already carries (so this works
 	// regardless of srv vs standard mongodb:// shapes).
-	uri, err := scopedMongoURI(deps, resourceName, username, password)
+	uri, err := scopedMongoURI(deps, resourceName, matched.Cluster, username, password, parentRef)
 	if err != nil {
 		return nil, errors.Wrapf(err, "build scoped mongodb URI for consumer %q", consumerStack)
 	}
@@ -310,43 +320,62 @@ func (p *Processor) maybeProvisionScopedUser(
 }
 
 // scopedMongoURI synthesises a mongodb:// URI that embeds the just-minted
-// scoped user's creds. Reads the host+query part from the consumer's own
-// sibling output (keys like `<cluster>-mongo-uri-options` /
-// `<cluster>-mongo-uri` that sc-plugin-mongodb publishes, or the
-// canonical bare `mongo-uri`/`uri` for synthetic test fixtures).
-func scopedMongoURI(deps pApi.ResourcesOutputs, resourceName, username, password string) (string, error) {
-	pro := pluginOutputOf(deps, resourceName)
-	if pro == nil {
-		return "", errors.Errorf("no plugin output for dep %q", resourceName)
-	}
-	// Exact canonical keys first (also what tests build).
+// scoped user's creds. Base URI sources, in order:
+//
+//  1. `deps[resourceName].Outputs[*mongo-uri*]` — typed-deps path, works
+//     once SC core populates `params.ResourceOutputs` on consumer-side
+//     ComputeProcess. Canonical keys (`mongo-uri`/`uri`) tried first,
+//     then suffix-match for sc-plugin-mongodb's `<cluster>-mongo-uri-options`
+//     / `<cluster>-mongo-uri` shape.
+//  2. Parent StackReference GetOutputDetails on
+//     `<clusterHint>-mongo-uri-options` + `<clusterHint>-mongo-uri` —
+//     the working source today (operator provides `cluster:` hint on
+//     the databases entry when the parent's `clusterName:` override
+//     doesn't match the resource name).
+//
+// `cluster` is the operator's hint (defaults to `resourceName` when
+// unset — see populateDatabasesFromRaw).
+func scopedMongoURI(deps pApi.ResourcesOutputs, resourceName, cluster, username, password string, parentRef *sdk.StackReference) (string, error) {
 	var baseURI string
-	for _, key := range []string{"mongo-uri", "uri"} {
-		if s, ok := stringOutputValue(pro, key); ok {
-			baseURI = s
-			break
+	// (b) — typed deps.
+	if pro := pluginOutputOf(deps, resourceName); pro != nil {
+		for _, key := range []string{"mongo-uri", "uri"} {
+			if s, ok := stringOutputValue(pro, key); ok {
+				baseURI = s
+				break
+			}
 		}
-	}
-	// Then sc-plugin-mongodb's `<cluster>-` prefixed shape. Prefer the
-	// `-options` variant because it already carries readPreference /
-	// replicaSet query — mongodump needs them.
-	if baseURI == "" {
-		for _, suffix := range []string{"-mongo-uri-options", "-mongo-uri"} {
-			for k, v := range pro.Outputs {
-				if strings.HasSuffix(k, suffix) {
-					if s, ok := v.Value.(string); ok && s != "" {
-						baseURI = s
-						break
+		if baseURI == "" {
+			for _, suffix := range []string{"-mongo-uri-options", "-mongo-uri"} {
+				for k, v := range pro.Outputs {
+					if strings.HasSuffix(k, suffix) {
+						if s, ok := v.Value.(string); ok && s != "" {
+							baseURI = s
+							break
+						}
 					}
 				}
+				if baseURI != "" {
+					break
+				}
 			}
-			if baseURI != "" {
+		}
+	}
+	// (a) — StackReference. The operator's `cluster:` hint (or defaulted
+	// `resource:` field) is the prefix sc-plugin-mongodb keys its exports
+	// under.
+	if baseURI == "" && parentRef != nil && cluster != "" {
+		for _, suffix := range []string{"-mongo-uri-options", "-mongo-uri"} {
+			if s, found, err := parentStringOutput(parentRef, cluster+suffix); err != nil {
+				return "", errors.Wrapf(err, "parent lookup for %q%s", cluster, suffix)
+			} else if found && s != "" {
+				baseURI = s
 				break
 			}
 		}
 	}
 	if baseURI == "" {
-		return "", errors.Errorf("no mongo-uri key on dependency output %q", resourceName)
+		return "", errors.Errorf("no mongo-uri on dependency output %q (cluster hint %q)", resourceName, cluster)
 	}
 	// Insert user:password@ after mongodb:// or mongodb+srv://. If the
 	// base URI already has creds, replace them.
@@ -363,20 +392,28 @@ func scopedMongoURI(deps pApi.ResourcesOutputs, resourceName, username, password
 	return "", errors.Errorf("unexpected mongo URI shape: %q", baseURI)
 }
 
-// readServiceURL reads the backup component's own service URL off the
-// consumer-side dep outputs. The backup plugin's Provision exports
-// `<resName>-service-url`; when the consumer declares `uses: [my-backup]`,
-// that export is packed into the consumer's compute-process dep outputs
-// under the resource's own name. Falls back to the `_test_service_url`
-// Config.Raw override for unit tests that don't construct dep fixtures.
-func (p *Processor) readServiceURL(input api.ResourceInput, deps pApi.ResourcesOutputs) (string, error) {
+// readServiceURL reads the backup component's own service URL. Three
+// sources, in order (1d.4-redux):
+//
+//  1. `deps[resName].Outputs["<resName>-service-url"]` — the (b) path,
+//     works once SC core populates `params.ResourceOutputs` on consumer-
+//     side ComputeProcess. Returns immediately when the key exists.
+//  2. Parent StackReference `GetOutputDetails("<resName>-service-url")`
+//     — the (a) path, mirrors sc-plugin-mongodb. The working source
+//     today.
+//  3. `_test_service_url` override on Config.Raw — unit tests that
+//     don't construct dep fixtures or open StackReferences.
+//
+// `parentRefErr` is non-nil when `newParentStackRef` failed (no
+// ParentInfo on params). In that case the StackReference path is
+// skipped and only the deps + test-override sources are tried.
+func (p *Processor) readServiceURL(input api.ResourceInput, deps pApi.ResourcesOutputs, parentRef *sdk.StackReference, parentRefErr error) (string, error) {
 	resName := input.Descriptor.Name
+	// (b) — typed deps.
 	if pro := pluginOutputOf(deps, resName); pro != nil {
-		// Primary: the plugin's own `<resName>-service-url` export.
 		if s, ok := stringOutputValue(pro, resName+"-service-url"); ok {
 			return s, nil
 		}
-		// Fallback: any sibling export with a `-service-url` suffix.
 		for k, v := range pro.Outputs {
 			if strings.HasSuffix(k, "-service-url") {
 				if s, ok := v.Value.(string); ok && s != "" {
@@ -385,12 +422,20 @@ func (p *Processor) readServiceURL(input api.ResourceInput, deps pApi.ResourcesO
 			}
 		}
 	}
+	// (a) — StackReference.
+	if parentRefErr == nil && parentRef != nil {
+		if s, found, err := parentStringOutput(parentRef, resName+"-service-url"); err != nil {
+			return "", errors.Wrapf(err, "parent-stack lookup for service URL")
+		} else if found && s != "" {
+			return s, nil
+		}
+	}
 	if raw, ok := extractConfigRaw(input.Descriptor); ok {
 		if v, ok := raw["_test_service_url"].(string); ok && v != "" {
 			return v, nil
 		}
 	}
-	return "", errors.Errorf("service URL not found: no %q-service-url on deps and no _test_service_url override on Config.Raw", resName)
+	return "", errors.Errorf("service URL not found: no %q-service-url on deps or parent exports, and no _test_service_url override on Config.Raw", resName)
 }
 
 func (p *Processor) readSigningKey(input api.ResourceInput) (string, error) {

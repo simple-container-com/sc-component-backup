@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/pkg/errors"
+	sdk "github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 	"github.com/simple-container-com/api/pkg/api"
 	pApi "github.com/simple-container-com/api/pkg/clouds/pulumi/api"
 
@@ -27,9 +28,22 @@ import (
 // dependency on the api/ module from the plugin's compute path (which
 // stays plugin-bus-shape). populateDatabasesFromRaw extracts it from
 // the ComponentRaw map.
+//
+// `Cluster` is an operator-provided hint matching the Atlas cluster
+// name the sibling sc-plugin-mongodb resource publishes its exports
+// under (e.g. "backup-smoke-1d-20261114"). It defaults to `Resource`
+// when unset — sufficient for stacks that let sc-plugin-mongodb
+// auto-name. Operators who set `clusterName:` on the Mongo resource
+// (typical for `adopt: true`) must set this to the override value so
+// the plugin can read `<cluster>-database` / `<cluster>-mongo-uri-options`
+// from the parent stack's exports. Added 2026-11-14 when the live 1d
+// smoke found params.ResourceOutputs is empty on consumer-side
+// ComputeProcess and the plugin has to fall back to
+// `sdk.NewStackReference` (the sc-plugin-mongodb precedent).
 type BackupDatabase struct {
 	Resource string
 	Driver   string
+	Cluster  string
 }
 
 // AtlasAdminRef mirrors api.BackupAtlasAdmin similarly.
@@ -138,8 +152,14 @@ func populateDatabasesFromRaw(raw map[string]any) ([]BackupDatabase, *AtlasAdmin
 			if s, ok := m["driver"].(string); ok {
 				db.Driver = s
 			}
+			if s, ok := m["cluster"].(string); ok {
+				db.Cluster = s
+			}
 			if db.Resource == "" || db.Driver == "" {
 				return nil, nil, errors.Errorf("databases[%d]: resource + driver required (got resource=%q driver=%q)", i, db.Resource, db.Driver)
+			}
+			if db.Cluster == "" {
+				db.Cluster = db.Resource
 			}
 			dbs = append(dbs, db)
 		}
@@ -190,28 +210,35 @@ func populateDatabasesFromRaw(raw map[string]any) ([]BackupDatabase, *AtlasAdmin
 // unprefixed `database`/`dbName`/`databaseName` for canonical-contract
 // plugins or synthetic test fixtures). Slice 1d.2 adds the `-database`
 // export to sc-plugin-mongodb so this matcher starts seeing a DB name.
-func MatchConsumerToDatabase(deps pApi.ResourcesOutputs, databases []BackupDatabase) (resourceName, databaseName string, matched *BackupDatabase, _ error) {
-	if len(deps) == 0 || len(databases) == 0 {
+func MatchConsumerToDatabase(deps pApi.ResourcesOutputs, databases []BackupDatabase, parentRef *sdk.StackReference) (resourceName, databaseName string, matched *BackupDatabase, _ error) {
+	if len(databases) == 0 {
 		return "", "", nil, nil
 	}
 	for i := range databases {
 		db := &databases[i]
-		pro := pluginOutputOf(deps, db.Resource)
-		if pro == nil {
-			continue
-		}
-		// Exact canonical keys first.
-		for _, key := range []string{"database", "dbName", "databaseName"} {
-			if s, ok := stringOutputValue(pro, key); ok {
-				return db.Resource, s, db, nil
-			}
-		}
-		// Suffix match — sc-plugin-mongodb-style `<cluster>-database`.
-		for k, v := range pro.Outputs {
-			if strings.HasSuffix(k, "-database") {
-				if s, ok := v.Value.(string); ok && s != "" {
+		// (b) — typed deps first.
+		if pro := pluginOutputOf(deps, db.Resource); pro != nil {
+			for _, key := range []string{"database", "dbName", "databaseName"} {
+				if s, ok := stringOutputValue(pro, key); ok {
 					return db.Resource, s, db, nil
 				}
+			}
+			for k, v := range pro.Outputs {
+				if strings.HasSuffix(k, "-database") {
+					if s, ok := v.Value.(string); ok && s != "" {
+						return db.Resource, s, db, nil
+					}
+				}
+			}
+		}
+		// (a) — StackReference. The operator's `cluster:` hint (defaults
+		// to `resource:`) is the prefix sc-plugin-mongodb publishes its
+		// `-database` export under.
+		if parentRef != nil && db.Cluster != "" {
+			if s, found, err := parentStringOutput(parentRef, db.Cluster+"-database"); err != nil {
+				return "", "", nil, errors.Wrapf(err, "parent lookup for %q-database", db.Cluster)
+			} else if found && s != "" {
+				return db.Resource, s, db, nil
 			}
 		}
 	}

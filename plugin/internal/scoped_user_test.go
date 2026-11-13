@@ -120,7 +120,7 @@ func TestMatchConsumerToDatabase_HappyPath(t *testing.T) {
 	databases := []BackupDatabase{
 		{Resource: "the-mongo", Driver: "mongodb"},
 	}
-	resName, dbName, matched, err := MatchConsumerToDatabase(deps, databases)
+	resName, dbName, matched, err := MatchConsumerToDatabase(deps, databases, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,7 +134,7 @@ func TestMatchConsumerToDatabase_NoConsumerUsage(t *testing.T) {
 		"the-rds": {"driver": "postgres"},
 	})
 	databases := []BackupDatabase{{Resource: "the-mongo", Driver: "mongodb"}}
-	_, _, matched, err := MatchConsumerToDatabase(deps, databases)
+	_, _, matched, err := MatchConsumerToDatabase(deps, databases, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -149,7 +149,7 @@ func TestMatchConsumerToDatabase_NoDatabaseField(t *testing.T) {
 		"the-mongo": {"my-cluster-mongo-uri": "mongodb://h"},
 	})
 	databases := []BackupDatabase{{Resource: "the-mongo", Driver: "mongodb"}}
-	_, _, matched, err := MatchConsumerToDatabase(deps, databases)
+	_, _, matched, err := MatchConsumerToDatabase(deps, databases, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,7 +166,7 @@ func TestMatchConsumerToDatabase_CanonicalKeys(t *testing.T) {
 			"the-mongo": {key: "forge_conductor"},
 		})
 		databases := []BackupDatabase{{Resource: "the-mongo", Driver: "mongodb"}}
-		_, dbName, matched, err := MatchConsumerToDatabase(deps, databases)
+		_, dbName, matched, err := MatchConsumerToDatabase(deps, databases, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -177,18 +177,43 @@ func TestMatchConsumerToDatabase_CanonicalKeys(t *testing.T) {
 }
 
 func TestMatchConsumerToDatabase_EmptyInputs(t *testing.T) {
-	_, _, matched, err := MatchConsumerToDatabase(nil, []BackupDatabase{{Resource: "x", Driver: "mongodb"}})
+	_, _, matched, err := MatchConsumerToDatabase(nil, []BackupDatabase{{Resource: "x", Driver: "mongodb"}}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if matched != nil {
 		t.Errorf("expected nil match on nil deps, got %v", matched)
 	}
-	_, _, matched, err = MatchConsumerToDatabase(mkDeps(t, nil), nil)
+	_, _, matched, err = MatchConsumerToDatabase(mkDeps(t, nil), nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if matched != nil {
 		t.Errorf("expected nil match on nil dbs, got %v", matched)
+	}
+}
+
+// Slice 1d.4-redux: Cluster field defaults to Resource on populate for
+// stacks that don't set `cluster:` explicitly.
+func TestPopulateDatabasesFromRaw_ClusterDefaultsToResource(t *testing.T) {
+	raw := map[string]any{
+		"databases": []any{
+			map[string]any{"resource": "the-mongo", "driver": "mongodb"},
+			map[string]any{"resource": "the-mongo-2", "driver": "mongodb", "cluster": "custom-name"},
+		},
+		"atlasAdmin": map[string]any{"privateKey": "p", "publicKey": "pub", "projectId": "x"},
+	}
+	dbs, _, err := populateDatabasesFromRaw(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dbs) != 2 {
+		t.Fatalf("count: %d", len(dbs))
+	}
+	if dbs[0].Cluster != "the-mongo" {
+		t.Errorf("default: got %q, want %q", dbs[0].Cluster, "the-mongo")
+	}
+	if dbs[1].Cluster != "custom-name" {
+		t.Errorf("explicit: got %q", dbs[1].Cluster)
 	}
 }
