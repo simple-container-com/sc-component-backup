@@ -100,6 +100,38 @@ type BackupConfig struct {
 	// and the Worker block has no effect there.
 	Worker *BackupWorker `json:"worker,omitempty" yaml:"worker,omitempty"`
 
+	// OperatorPassword is a `${secret:...}` reference to the shared
+	// password the SPA's /login handler validates against. Required for
+	// the operator-facing SPA; the service refuses POST /api/v1/login
+	// when unset (SPA reports `password_set: false` on /api/v1/session).
+	//
+	// Slice 1e.3 originally took this via the BACKUP_OPERATOR_PASSWORD
+	// env — operators still set that env today. Slice 1e.4g promotes it
+	// to a first-class config field so the plugin can inject it into the
+	// dispatched Lambda alongside SigningKey.
+	OperatorPassword string `json:"operatorPassword,omitempty" yaml:"operatorPassword,omitempty"`
+
+	// Storage declares WHERE backup archives land. Required for every
+	// deploy. One of s3 / gcs / filesystem (per design doc §5.1).
+	//
+	// Slice 1e.4a shipped the per-backend archive.Store implementations;
+	// slice 1e.4g wires this config block through the plugin's dispatch
+	// so an operator can declare the archive target in server.yaml
+	// instead of reaching for BACKUP_STORAGE_* env vars by hand.
+	Storage *BackupStorage `json:"storage,omitempty" yaml:"storage,omitempty"`
+
+	// Metadata declares WHERE the service's own bookkeeping (tenants,
+	// projects, runs, snapshots) lives. Optional — when absent,
+	// resolution defaults to:
+	//   - Storage.Type == filesystem → sqlite (same directory)
+	//   - Storage.Type == s3 / gcs   → colocated (same bucket)
+	//
+	// The explicit backends (mongo / postgres / mysql / sqlite / colocated)
+	// land across slices 1e.4b…e. See docs/design/2026-11-13/
+	// sc-component-backup-pluggable-storage §5.2 for the per-backend
+	// operator profiles.
+	Metadata *BackupMetadata `json:"metadata,omitempty" yaml:"metadata,omitempty"`
+
 	// api.Credentials embedded inline so a resource can optionally carry
 	// a `${auth:...}` reference. Rarely needed for a component (templates
 	// carry their own credentials); kept for forward-compat.
@@ -187,6 +219,58 @@ type BackupAtlasAdmin struct {
 	ProjectID string `json:"projectId" yaml:"projectId"`
 }
 
+// BackupStorage declares the archive-storage backend. Exactly one
+// backend-group of fields should be set — the plugin's Validate below
+// cross-checks + errors on inconsistent combinations (e.g. Path set
+// with Type == s3).
+//
+// Design: forge docs/design/2026-11-13/sc-component-backup-pluggable-storage §5.1.
+type BackupStorage struct {
+	// Type is the archive backend: "s3" | "gcs" | "filesystem".
+	// Required.
+	Type string `json:"type" yaml:"type"`
+
+	// Object-store (s3 / gcs) fields.
+	Bucket    string `json:"bucket,omitempty" yaml:"bucket,omitempty"`
+	Region    string `json:"region,omitempty" yaml:"region,omitempty"`
+	Endpoint  string `json:"endpoint,omitempty" yaml:"endpoint,omitempty"`   // S3-compatible endpoint override (MinIO / R2 / DO Spaces / Yandex OS)
+	AccessKey string `json:"accessKey,omitempty" yaml:"accessKey,omitempty"` // `${secret:...}` — omit to use instance profile / Workload Identity
+	SecretKey string `json:"secretKey,omitempty" yaml:"secretKey,omitempty"` // `${secret:...}`
+	// UsePathStyle forces S3 path-style addressing (bucket in URL path
+	// rather than hostname). Required for MinIO; harmless on AWS.
+	UsePathStyle bool `json:"usePathStyle,omitempty" yaml:"usePathStyle,omitempty"`
+	// Credentials is a path to a GCP service-account JSON (or a
+	// `${secret:...}` reference the plugin materialises to a temp file).
+	// Empty for GCS uses Application Default Credentials (Workload
+	// Identity on GKE / Cloud Run / GCE).
+	Credentials string `json:"credentials,omitempty" yaml:"credentials,omitempty"`
+
+	// Filesystem field.
+	Path string `json:"path,omitempty" yaml:"path,omitempty"` // absolute directory path
+}
+
+// BackupMetadata declares the metadata-store backend. Optional — when
+// absent, defaults are chosen from BackupStorage:
+//
+//   - Storage.Type == "filesystem" → sqlite
+//   - Storage.Type == "s3" / "gcs" → colocated
+//
+// Design: forge docs/design/2026-11-13/sc-component-backup-pluggable-storage §5.2.
+type BackupMetadata struct {
+	// Type is one of "colocated" | "mongo" | "postgres" | "mysql" | "sqlite".
+	// Empty resolves per Storage.Type (see above).
+	Type string `json:"type,omitempty" yaml:"type,omitempty"`
+
+	// URI is the connection string for mongo / postgres / mysql.
+	// Typically a `${secret:...}` reference.
+	URI string `json:"uri,omitempty" yaml:"uri,omitempty"`
+
+	// Path overrides the default SQLite file location
+	// (<storage.path>/_meta/sc-component-backup.sqlite). Ignored for
+	// non-SQLite backends.
+	Path string `json:"path,omitempty" yaml:"path,omitempty"`
+}
+
 // BackupIngress models the component's public entry point. Optional — a
 // smoke run can disable ingress via `ingress: null` and expose the service
 // on a high port with no TLS.
@@ -255,6 +339,82 @@ func (c *BackupConfig) Validate() error {
 		if len(c.Worker.SecurityGroupIds) == 0 {
 			return errors.Errorf("`worker.securityGroupIds` is required (at least one security group)")
 		}
+	}
+	// Storage: optional for back-compat (service-side env falls back to
+	// S3_* legacy vars for one release), but when PRESENT must be
+	// well-formed.
+	if c.Storage != nil {
+		if err := c.Storage.Validate(); err != nil {
+			return err
+		}
+	}
+	// Metadata: ditto. Also cross-check against Storage.Type for the
+	// sqlite + non-filesystem rejection.
+	if c.Metadata != nil {
+		if err := c.Metadata.Validate(c.Storage); err != nil {
+			return err
+		}
+	}
+	// Lambda + filesystem archive: refuse at parse time (/tmp is
+	// ephemeral on Lambda cold starts — metadata would evaporate).
+	if c.DeployTo == "lambda" && c.Storage != nil && c.Storage.Type == "filesystem" {
+		return errors.Errorf("`storage.type: filesystem` is incompatible with `deployTo: lambda` — Lambda /tmp is ephemeral; use `storage.type: s3` instead")
+	}
+	return nil
+}
+
+// Validate checks the BackupStorage block for self-consistency.
+func (s *BackupStorage) Validate() error {
+	switch s.Type {
+	case "":
+		return errors.Errorf("`storage.type` is required (one of s3|gcs|filesystem)")
+	case "s3":
+		if s.Bucket == "" {
+			return errors.Errorf("`storage.bucket` is required when `storage.type: s3`")
+		}
+		if s.Path != "" {
+			return errors.Errorf("`storage.path` is only valid when `storage.type: filesystem`")
+		}
+	case "gcs":
+		if s.Bucket == "" {
+			return errors.Errorf("`storage.bucket` is required when `storage.type: gcs`")
+		}
+		if s.Path != "" {
+			return errors.Errorf("`storage.path` is only valid when `storage.type: filesystem`")
+		}
+	case "filesystem":
+		if s.Path == "" {
+			return errors.Errorf("`storage.path` is required when `storage.type: filesystem`")
+		}
+		if s.Bucket != "" || s.Region != "" || s.Endpoint != "" || s.AccessKey != "" || s.SecretKey != "" {
+			return errors.Errorf("object-store fields (bucket/region/endpoint/accessKey/secretKey) are not valid when `storage.type: filesystem`")
+		}
+	default:
+		return errors.Errorf("`storage.type: %q` is not recognised (one of s3|gcs|filesystem)", s.Type)
+	}
+	return nil
+}
+
+// Validate checks the BackupMetadata block + its cross-constraints
+// against the paired BackupStorage.
+func (m *BackupMetadata) Validate(storage *BackupStorage) error {
+	switch m.Type {
+	case "", "colocated":
+		return nil
+	case "mongo", "postgres", "mysql":
+		if m.URI == "" {
+			return errors.Errorf("`metadata.uri` is required when `metadata.type: %s`", m.Type)
+		}
+	case "sqlite":
+		// SQLite only makes sense with a filesystem archive.
+		if storage == nil {
+			return errors.Errorf("`metadata.type: sqlite` requires a `storage:` block of type filesystem")
+		}
+		if storage.Type != "filesystem" {
+			return errors.Errorf("`metadata.type: sqlite` is only valid with `storage.type: filesystem` (got %q) — object stores can't host SQLite's random writes; use `metadata.type: colocated` instead", storage.Type)
+		}
+	default:
+		return errors.Errorf("`metadata.type: %q` is not recognised (one of colocated|mongo|postgres|mysql|sqlite)", m.Type)
 	}
 	return nil
 }
