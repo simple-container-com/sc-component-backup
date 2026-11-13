@@ -119,8 +119,10 @@ func NewFromConfig(ctx context.Context, cfg Config, archive storage.Store) (Stor
 		return newColocatedStore(archive)
 	case TypeSQLite:
 		return newSQLiteStore(ctx, cfg, archive)
-	case TypePostgres, TypeMySQL:
-		return nil, fmt.Errorf("meta: %s backend lands in slice 1e.4e", t)
+	case TypePostgres:
+		return newPostgresStore(ctx, cfg.URI)
+	case TypeMySQL:
+		return newMySQLStore(ctx, cfg.URI)
 	default:
 		return nil, fmt.Errorf("meta: unknown backend type %q (one of mongo/postgres/mysql/sqlite/colocated)", t)
 	}

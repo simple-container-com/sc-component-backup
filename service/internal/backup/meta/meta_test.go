@@ -61,8 +61,12 @@ func TestNewFromConfig_RejectsUnsupportedForNow(t *testing.T) {
 		arch storage.Store
 		msg  string
 	}{
-		{"postgres not yet", Config{Type: TypePostgres, URI: "pg://x"}, fs, "slice 1e.4e"},
-		{"mysql not yet", Config{Type: TypeMySQL, URI: "mysql://x"}, fs, "slice 1e.4e"},
+		// Slice 1e.4e: Postgres + MySQL are now real backends; empty
+		// URIs are refused up-front, malformed URIs are refused by the
+		// driver's own parse. The explicit "no URI" case is the
+		// dialect-selection assertion the brief asked for.
+		{"postgres empty URI refused", Config{Type: TypePostgres}, fs, "requires a URI"},
+		{"mysql empty URI refused", Config{Type: TypeMySQL}, fs, "requires a URI"},
 		{"mongo needs URI", Config{Type: TypeMongo}, fs, "requires a URI"},
 	}
 	for _, tc := range cases {
