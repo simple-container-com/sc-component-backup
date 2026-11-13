@@ -6,6 +6,9 @@ package backup
 import (
 	"strings"
 	"testing"
+
+	"github.com/simple-container-com/api/pkg/api"
+	pApi "github.com/simple-container-com/api/pkg/clouds/pulumi/api"
 )
 
 func TestScopedUsername(t *testing.T) {
@@ -87,13 +90,33 @@ func TestPopulateDatabasesFromRaw_MissingFields(t *testing.T) {
 	}
 }
 
-func TestMatchConsumerToDatabase_HappyPath(t *testing.T) {
-	deps := []byte(`{
-		"the-mongo": {
-			"mongo-uri": "mongodb://host:27017/",
-			"database":  "forge_conductor"
+// mkDeps builds a `ResourcesOutputs` fixture — the shape plugin bus
+// unmarshals a `ComputeProcessRequest.DependencyOutputsJson` into.
+func mkDeps(t *testing.T, m map[string]map[string]any) pApi.ResourcesOutputs {
+	t.Helper()
+	out := make(pApi.ResourcesOutputs, len(m))
+	for name, kv := range m {
+		pro := &api.PluginResourceOutput{
+			PluginName: "test",
+			Urn:        "urn:pulumi:test::test::aws:foo::" + name,
+			Outputs:    make(map[string]api.PluginOutputValue, len(kv)),
 		}
-	}`)
+		for k, v := range kv {
+			pro.Outputs[k] = api.PluginOutputValue{Value: v}
+		}
+		out[name] = &api.ResourceOutput{Ref: pro}
+	}
+	return out
+}
+
+func TestMatchConsumerToDatabase_HappyPath(t *testing.T) {
+	// sc-plugin-mongodb-style exports keyed on the cluster prefix.
+	deps := mkDeps(t, map[string]map[string]any{
+		"the-mongo": {
+			"my-cluster-mongo-uri": "mongodb://host:27017/",
+			"my-cluster-database":  "forge_conductor",
+		},
+	})
 	databases := []BackupDatabase{
 		{Resource: "the-mongo", Driver: "mongodb"},
 	}
@@ -107,8 +130,9 @@ func TestMatchConsumerToDatabase_HappyPath(t *testing.T) {
 }
 
 func TestMatchConsumerToDatabase_NoConsumerUsage(t *testing.T) {
-	// Consumer doesn't use any of the configured Databases → no match.
-	deps := []byte(`{"the-rds": {"driver":"postgres"}}`)
+	deps := mkDeps(t, map[string]map[string]any{
+		"the-rds": {"driver": "postgres"},
+	})
 	databases := []BackupDatabase{{Resource: "the-mongo", Driver: "mongodb"}}
 	_, _, matched, err := MatchConsumerToDatabase(deps, databases)
 	if err != nil {
@@ -121,7 +145,9 @@ func TestMatchConsumerToDatabase_NoConsumerUsage(t *testing.T) {
 
 func TestMatchConsumerToDatabase_NoDatabaseField(t *testing.T) {
 	// Sibling resource is there but no database-name key → no match.
-	deps := []byte(`{"the-mongo": {"mongo-uri":"mongodb://h"}}`)
+	deps := mkDeps(t, map[string]map[string]any{
+		"the-mongo": {"my-cluster-mongo-uri": "mongodb://h"},
+	})
 	databases := []BackupDatabase{{Resource: "the-mongo", Driver: "mongodb"}}
 	_, _, matched, err := MatchConsumerToDatabase(deps, databases)
 	if err != nil {
@@ -132,10 +158,13 @@ func TestMatchConsumerToDatabase_NoDatabaseField(t *testing.T) {
 	}
 }
 
-func TestMatchConsumerToDatabase_AltKeyNames(t *testing.T) {
-	// dbName / databaseName both accepted.
-	for _, key := range []string{"dbName", "databaseName"} {
-		deps := []byte(`{"the-mongo": {"` + key + `":"forge_conductor"}}`)
+func TestMatchConsumerToDatabase_CanonicalKeys(t *testing.T) {
+	// Exact `database`/`dbName`/`databaseName` for canonical-contract
+	// plugins + synthetic test fixtures.
+	for _, key := range []string{"database", "dbName", "databaseName"} {
+		deps := mkDeps(t, map[string]map[string]any{
+			"the-mongo": {key: "forge_conductor"},
+		})
 		databases := []BackupDatabase{{Resource: "the-mongo", Driver: "mongodb"}}
 		_, dbName, matched, err := MatchConsumerToDatabase(deps, databases)
 		if err != nil {
@@ -155,7 +184,7 @@ func TestMatchConsumerToDatabase_EmptyInputs(t *testing.T) {
 	if matched != nil {
 		t.Errorf("expected nil match on nil deps, got %v", matched)
 	}
-	_, _, matched, err = MatchConsumerToDatabase([]byte(`{}`), nil)
+	_, _, matched, err = MatchConsumerToDatabase(mkDeps(t, nil), nil)
 	if err != nil {
 		t.Fatal(err)
 	}

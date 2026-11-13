@@ -5,11 +5,11 @@ package backup
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
 	"strings"
 
 	"github.com/pkg/errors"
+	"github.com/simple-container-com/api/pkg/api"
+	pApi "github.com/simple-container-com/api/pkg/clouds/pulumi/api"
 
 	"github.com/simple-container-com/sc-component-backup/plugin/internal/atlas"
 )
@@ -170,47 +170,78 @@ func populateDatabasesFromRaw(raw map[string]any) ([]BackupDatabase, *AtlasAdmin
 	return dbs, admin, nil
 }
 
-// MatchConsumerToDatabase looks at the consumer's dependency_outputs_json
-// payload (the map SC core assembles from the consumer's `uses:` list) +
-// returns the database name + which component Database entry matched.
+// MatchConsumerToDatabase looks at the consumer's sibling-resource
+// outputs (what SC core packs into ComputeProcessRequest.DependencyOutputsJson
+// and runtime.DependencyOutputsFromComputeProcessRequest unmarshals into
+// `map[resourceName]*api.ResourceOutput` with Ref=*api.PluginResourceOutput)
+// and returns the database name + which component Database entry matched.
 //
-// The depOutputs shape is whatever SC core assembles at ComputeProcess
-// time from the consumer's sibling resource outputs. For a consumer with
-// `uses: [the-mongo]` on an mongodb-atlas resource named `the-mongo`:
+// Shape expected per sibling — sc-plugin-mongodb's exports keyed on a
+// cluster prefix (e.g. `the-mongo-mongo-uri`, `the-mongo-database`):
 //
-//	depOutputs["the-mongo"] = {
-//	    "mongo-uri": "mongodb+srv://...",
-//	    "database": "<consumer-db>",      // consumer-side override OR default-from-stack
+//	deps["the-mongo"].Outputs = {
+//	    "<cluster>-mongo-uri":        PluginOutputValue{...},
+//	    "<cluster>-database":         PluginOutputValue{Value: "forge_app"},
 //	    ...
 //	}
 //
-// This matcher is intentionally lenient — the shape is still stabilising
-// across plugins (see the index-sc-deploy-secrets memory on canonical
-// `connection.*`). We look for any key that looks like a database name.
-func MatchConsumerToDatabase(depOutputsJSON []byte, databases []BackupDatabase) (resourceName, databaseName string, matched *BackupDatabase, _ error) {
-	if len(depOutputsJSON) == 0 || len(databases) == 0 {
+// We don't require the cluster prefix to match the operator's resource
+// name — scan Outputs for any key with the `-database` suffix (plus the
+// unprefixed `database`/`dbName`/`databaseName` for canonical-contract
+// plugins or synthetic test fixtures). Slice 1d.2 adds the `-database`
+// export to sc-plugin-mongodb so this matcher starts seeing a DB name.
+func MatchConsumerToDatabase(deps pApi.ResourcesOutputs, databases []BackupDatabase) (resourceName, databaseName string, matched *BackupDatabase, _ error) {
+	if len(deps) == 0 || len(databases) == 0 {
 		return "", "", nil, nil
-	}
-	var deps map[string]any
-	if err := json.Unmarshal(depOutputsJSON, &deps); err != nil {
-		return "", "", nil, fmt.Errorf("parse dependency_outputs_json: %w", err)
 	}
 	for i := range databases {
 		db := &databases[i]
-		raw, ok := deps[db.Resource]
-		if !ok {
+		pro := pluginOutputOf(deps, db.Resource)
+		if pro == nil {
 			continue
 		}
-		m, ok := raw.(map[string]any)
-		if !ok {
-			continue
-		}
-		// Look for a database-name key on the sibling's output.
+		// Exact canonical keys first.
 		for _, key := range []string{"database", "dbName", "databaseName"} {
-			if v, ok := m[key].(string); ok && v != "" {
-				return db.Resource, v, db, nil
+			if s, ok := stringOutputValue(pro, key); ok {
+				return db.Resource, s, db, nil
+			}
+		}
+		// Suffix match — sc-plugin-mongodb-style `<cluster>-database`.
+		for k, v := range pro.Outputs {
+			if strings.HasSuffix(k, "-database") {
+				if s, ok := v.Value.(string); ok && s != "" {
+					return db.Resource, s, db, nil
+				}
 			}
 		}
 	}
 	return "", "", nil, nil
+}
+
+// pluginOutputOf returns the *api.PluginResourceOutput for a dep name,
+// handling the (name missing) + (Ref wrong type) + (nil Ref) cases.
+func pluginOutputOf(deps pApi.ResourcesOutputs, name string) *api.PluginResourceOutput {
+	ref, ok := deps[name]
+	if !ok || ref == nil {
+		return nil
+	}
+	pro, ok := ref.Ref.(*api.PluginResourceOutput)
+	if !ok || pro == nil {
+		return nil
+	}
+	return pro
+}
+
+// stringOutputValue reads one published output by exact key and returns
+// it as a string. Missing or non-string values return "" + false.
+func stringOutputValue(pro *api.PluginResourceOutput, key string) (string, bool) {
+	v, found := pro.Lookup(key)
+	if !found {
+		return "", false
+	}
+	s, ok := v.Value.(string)
+	if !ok || s == "" {
+		return "", false
+	}
+	return s, true
 }

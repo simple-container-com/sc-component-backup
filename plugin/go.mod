@@ -10,7 +10,7 @@ require (
 	github.com/pkg/errors v0.9.1
 	github.com/pulumi/pulumi-aws/sdk/v6 v6.83.4
 	github.com/pulumi/pulumi/sdk/v3 v3.245.0
-	github.com/simple-container-com/api v0.0.0-20261112103502-f172da4c723f
+	github.com/simple-container-com/api v0.0.0-20261112211434-cd37afb19a71
 	github.com/simple-container-com/sc-component-backup/api v0.0.0
 )
 
@@ -150,6 +150,7 @@ require (
 	gopkg.in/tomb.v1 v1.0.0-20141024135613-dd632973f1e7 // indirect
 	gopkg.in/warnings.v0 v0.1.2 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
+	gotest.tools/v3 v3.5.0 // indirect
 	lukechampine.com/frand v1.5.1 // indirect
 )
 

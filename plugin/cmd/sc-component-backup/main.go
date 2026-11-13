@@ -272,6 +272,26 @@ func (p *backupPlugin) ComputeProcess(stdctx context.Context, req *scpluginv1.Co
 		p.progress.Error("compute-process", "parent decode: "+err.Error())
 		return nil, err
 	}
+	// Slice 1d wire-in: unmarshal the consumer's sibling-resource outputs
+	// (api PR #602) and hand them to Processor.Process via
+	// pApi.ProvisionParams.ResourceOutputs. That's the canonical carrier
+	// for sibling outputs on the compute-process side, matching the
+	// Provision side's `params.ResourceOutputs`.
+	deps, err := runtime.DependencyOutputsFromComputeProcessRequest(req)
+	if err != nil {
+		p.progress.Error("compute-process", "deps decode: "+err.Error())
+		return nil, err
+	}
+
+	// NOTE slice 1d: the backup plugin's compute path wants to read its
+	// own `databases:` + `atlasAdmin:` config here, but
+	// ComputeProcessRequest has no `component_raw` proto field today
+	// (only ProvisionRequest does — api#601). An api follow-up adds the
+	// symmetric ComputeProcess carrier; until then, the processor sees
+	// an empty Config.Raw on ComputeProcess, and `maybeProvisionScopedUser`
+	// is a no-op in production (tests exercise the matcher by passing
+	// typed deps directly). Not a slice-1d.1 regression — this gap has
+	// always existed on the live path.
 	input := runtime.ResourceInputForComputeProcess(req, parent, map[string]any{})
 
 	processor := backupInternal.NewProcessor(backupInternal.ProcessorConfig{
@@ -281,7 +301,7 @@ func (p *backupPlugin) ComputeProcess(stdctx context.Context, req *scpluginv1.Co
 	resp, _, err = runtime.RunComputeProcess(
 		stdctx, rctx,
 		api.Stack{Name: req.GetHeader().GetStackName()}, input,
-		pApi.ProvisionParams{Log: logger.New(), ParentStack: parent},
+		pApi.ProvisionParams{Log: logger.New(), ParentStack: parent, ResourceOutputs: deps},
 		processor.Process,
 	)
 	if err != nil {

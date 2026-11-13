@@ -76,12 +76,13 @@ func NewProcessor(cfg ProcessorConfig) *Processor {
 // (`signingKey`); for the backup's purposes we expect the test harness to
 // pass it via the DependencyOutputsJson or an env var in the plugin
 // binary's process.
-func (p *Processor) Process(ctx *sdk.Context, _ api.Stack, input api.ResourceInput, collector pApi.ComputeContextCollector, _ pApi.ProvisionParams) (*api.ResourceOutput, error) {
+func (p *Processor) Process(ctx *sdk.Context, _ api.Stack, input api.ResourceInput, collector pApi.ComputeContextCollector, params pApi.ProvisionParams) (*api.ResourceOutput, error) {
 	resName := input.Descriptor.Name
 	resType := input.Descriptor.Type
 	stackName := input.StackParams.StackName
+	deps := params.ResourceOutputs
 
-	serviceURL, err := p.readServiceURL(input)
+	serviceURL, err := p.readServiceURL(input, deps)
 	if err != nil {
 		return nil, errors.Wrapf(err, "component %q unable to resolve service URL", resName)
 	}
@@ -103,17 +104,17 @@ func (p *Processor) Process(ctx *sdk.Context, _ api.Stack, input api.ResourceInp
 
 	// Slice 1d scoped-user provisioning (sc-components-platform design doc §5.2).
 	// If the Component config declares `databases:` + `atlasAdmin:` AND the
-	// consumer's dependency_outputs_json shows a usage of one of those DB
-	// resources, mint a readWrite-scoped Atlas user, embed its creds in
-	// the tenant record's Resources list, so the service dumps the
-	// consumer's own DB with its own credential.
+	// consumer's sibling outputs include one of those DB resources with a
+	// `-database` (or canonical `database`) key, mint a readWrite-scoped
+	// Atlas user, embed its creds in the tenant record's Resources list, so
+	// the service dumps the consumer's own DB with its own credential.
 	//
 	// Pre-slice-1d (no databases: configured): no scoped user is minted,
 	// the Resources list stays empty, and the service dumps nothing until
 	// an operator registers a tenant explicitly via the on-demand API.
 	// This keeps backward compat with today's smoke shape.
 	if raw, ok := extractConfigRaw(input.Descriptor); ok {
-		if scopedRes, err := p.maybeProvisionScopedUser(ctx.Context(), raw, stackName, input); err != nil {
+		if scopedRes, err := p.maybeProvisionScopedUser(ctx.Context(), raw, stackName, deps); err != nil {
 			return nil, errors.Wrapf(err, "component %q scoped-user provisioning", resName)
 		} else if scopedRes != nil {
 			record.Resources = append(record.Resources, *scopedRes)
@@ -249,7 +250,7 @@ func truncate(s string, limit int) string {
 // payload. Returns (nil, nil) when nothing should happen (backward-compat
 // path).
 func (p *Processor) maybeProvisionScopedUser(
-	ctx context.Context, raw map[string]any, consumerStack string, input api.ResourceInput,
+	ctx context.Context, raw map[string]any, consumerStack string, deps pApi.ResourcesOutputs,
 ) (*TenantResource, error) {
 	dbs, admin, err := populateDatabasesFromRaw(raw)
 	if err != nil {
@@ -259,12 +260,7 @@ func (p *Processor) maybeProvisionScopedUser(
 		return nil, nil
 	}
 
-	// Find the consumer's dependency outputs blob — SC core populates
-	// this at ComputeProcess time with sibling resource outputs the
-	// consumer `uses:`. We parse it to look for a resource name that
-	// matches one of our `databases:` entries.
-	depOutputs := readDependencyOutputs(input)
-	resourceName, dbName, matched, err := MatchConsumerToDatabase(depOutputs, dbs)
+	resourceName, dbName, matched, err := MatchConsumerToDatabase(deps, dbs)
 	if err != nil {
 		return nil, errors.Wrap(err, "match consumer to backup-component databases:")
 	}
@@ -297,7 +293,7 @@ func (p *Processor) maybeProvisionScopedUser(
 	// just-minted scoped user's creds. The URI host part is whatever the
 	// consumer's dependency output already carries (so this works
 	// regardless of srv vs standard mongodb:// shapes).
-	uri, err := scopedMongoURI(depOutputs, resourceName, username, password)
+	uri, err := scopedMongoURI(deps, resourceName, username, password)
 	if err != nil {
 		return nil, errors.Wrapf(err, "build scoped mongodb URI for consumer %q", consumerStack)
 	}
@@ -313,35 +309,40 @@ func (p *Processor) maybeProvisionScopedUser(
 	}, nil
 }
 
-// readDependencyOutputs extracts the consumer's sibling-resource outputs
-// JSON blob off the ResourceInput. Pre-slice-1a's wire-in, there's no
-// SC-core field for this — we read a test override from Config.Raw.
-func readDependencyOutputs(input api.ResourceInput) []byte {
-	if raw, ok := extractConfigRaw(input.Descriptor); ok {
-		if s, ok := raw["_test_dependency_outputs"].(string); ok && s != "" {
-			return []byte(s)
-		}
-	}
-	return nil
-}
-
 // scopedMongoURI synthesises a mongodb:// URI that embeds the just-minted
 // scoped user's creds. Reads the host+query part from the consumer's own
-// dependency output (deps[resourceName]["mongo-uri"] or "uri").
-func scopedMongoURI(depOutputs []byte, resourceName, username, password string) (string, error) {
-	if len(depOutputs) == 0 {
-		return "", errors.New("no dependency outputs to build URI from")
+// sibling output (keys like `<cluster>-mongo-uri-options` /
+// `<cluster>-mongo-uri` that sc-plugin-mongodb publishes, or the
+// canonical bare `mongo-uri`/`uri` for synthetic test fixtures).
+func scopedMongoURI(deps pApi.ResourcesOutputs, resourceName, username, password string) (string, error) {
+	pro := pluginOutputOf(deps, resourceName)
+	if pro == nil {
+		return "", errors.Errorf("no plugin output for dep %q", resourceName)
 	}
-	var deps map[string]any
-	if err := json.Unmarshal(depOutputs, &deps); err != nil {
-		return "", err
-	}
-	m, _ := deps[resourceName].(map[string]any)
+	// Exact canonical keys first (also what tests build).
 	var baseURI string
-	for _, key := range []string{"mongo-uri", "uri", "mongo-uri-options"} {
-		if v, ok := m[key].(string); ok && v != "" {
-			baseURI = v
+	for _, key := range []string{"mongo-uri", "uri"} {
+		if s, ok := stringOutputValue(pro, key); ok {
+			baseURI = s
 			break
+		}
+	}
+	// Then sc-plugin-mongodb's `<cluster>-` prefixed shape. Prefer the
+	// `-options` variant because it already carries readPreference /
+	// replicaSet query — mongodump needs them.
+	if baseURI == "" {
+		for _, suffix := range []string{"-mongo-uri-options", "-mongo-uri"} {
+			for k, v := range pro.Outputs {
+				if strings.HasSuffix(k, suffix) {
+					if s, ok := v.Value.(string); ok && s != "" {
+						baseURI = s
+						break
+					}
+				}
+			}
+			if baseURI != "" {
+				break
+			}
 		}
 	}
 	if baseURI == "" {
@@ -362,21 +363,34 @@ func scopedMongoURI(depOutputs []byte, resourceName, username, password string) 
 	return "", errors.Errorf("unexpected mongo URI shape: %q", baseURI)
 }
 
-// readServiceURL reads the deployed service URL. In slice 1a's Path A,
-// SC core populates this via DependencyOutputsJson._deployed_service.
-// For the pre-slice-1a smoke, the plugin's test harness passes it via
-// the resource's own Config.Raw["_test_service_url"] override.
-func (p *Processor) readServiceURL(input api.ResourceInput) (string, error) {
-	// TODO slice 1a: once SC core's sidecar wrapper populates
-	// DependencyOutputsJson._deployed_service, read from there.
-	// For now, read from the plugin's own Config.Raw["_test_service_url"]
-	// — a test-only override.
+// readServiceURL reads the backup component's own service URL off the
+// consumer-side dep outputs. The backup plugin's Provision exports
+// `<resName>-service-url`; when the consumer declares `uses: [my-backup]`,
+// that export is packed into the consumer's compute-process dep outputs
+// under the resource's own name. Falls back to the `_test_service_url`
+// Config.Raw override for unit tests that don't construct dep fixtures.
+func (p *Processor) readServiceURL(input api.ResourceInput, deps pApi.ResourcesOutputs) (string, error) {
+	resName := input.Descriptor.Name
+	if pro := pluginOutputOf(deps, resName); pro != nil {
+		// Primary: the plugin's own `<resName>-service-url` export.
+		if s, ok := stringOutputValue(pro, resName+"-service-url"); ok {
+			return s, nil
+		}
+		// Fallback: any sibling export with a `-service-url` suffix.
+		for k, v := range pro.Outputs {
+			if strings.HasSuffix(k, "-service-url") {
+				if s, ok := v.Value.(string); ok && s != "" {
+					return s, nil
+				}
+			}
+		}
+	}
 	if raw, ok := extractConfigRaw(input.Descriptor); ok {
 		if v, ok := raw["_test_service_url"].(string); ok && v != "" {
 			return v, nil
 		}
 	}
-	return "", errors.New("service URL not in DependencyOutputsJson._deployed_service (slice 1a not yet landed) and no _test_service_url override on Config.Raw")
+	return "", errors.Errorf("service URL not found: no %q-service-url on deps and no _test_service_url override on Config.Raw", resName)
 }
 
 func (p *Processor) readSigningKey(input api.ResourceInput) (string, error) {
