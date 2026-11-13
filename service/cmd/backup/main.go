@@ -40,9 +40,7 @@ import (
 	sdkservice "github.com/simple-container-com/go-aws-lambda-sdk/pkg/service"
 
 	"github.com/simple-container-com/sc-component-backup/service/internal/api"
-	"github.com/simple-container-com/sc-component-backup/service/internal/backup/meta"
 	"github.com/simple-container-com/sc-component-backup/service/internal/backup/scheduler"
-	"github.com/simple-container-com/sc-component-backup/service/internal/backup/storage"
 	"github.com/simple-container-com/sc-component-backup/service/internal/ui"
 )
 
@@ -73,52 +71,36 @@ func main() {
 		slog.Error("SERVICE_JWT_SECRET must be at least 32 bytes (HS256 floor)")
 		os.Exit(2)
 	}
-	mongoURI := mustGetEnv("MONGO_URI")
 	port := envOr("PORT", "8080")
 
 	slog.Info("starting sc-component-backup",
-		"version", version, "commit", commit, "revision", revision,
-		"port", port, "mongo_uri_masked", maskMongoURI(mongoURI))
+		"version", version, "commit", commit, "revision", revision, "port", port)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	// S3 store. Endpoint comes from env (MinIO in smoke; empty → AWS).
-	// Slice 1e.4a added FS/GCS/InMem siblings; slice 1e.4g migrates
-	// this block to the new BackupStorage schema.
-	s3Store, err := storage.NewS3Store(ctx, storage.S3Config{
-		Bucket:       envOr("S3_BUCKET", "sc-backup-smoke"),
-		Region:       envOr("S3_REGION", "us-east-1"),
-		EndpointURL:  envOr("S3_ENDPOINT_URL", ""),
-		AccessKey:    envOr("S3_ACCESS_KEY", ""),
-		SecretKey:    envOr("S3_SECRET_KEY", ""),
-		UsePathStyle: envOr("S3_USE_PATH_STYLE", "") != "",
-	})
+	// Slice 1e.4g — archive.Store from env. Operators set
+	// BACKUP_STORAGE_TYPE + the per-backend fields below. For one
+	// release, legacy S3_* env vars are honoured with a deprecation
+	// warning so the fleet's own deployment keeps working during the
+	// migration window (removed in slice 1e.4h).
+	archiveStore, archiveLocation, err := buildArchiveStore(ctx)
 	if err != nil {
-		slog.Error("s3 store init failed", "err", err)
+		slog.Error("archive store init failed", "err", err)
 		os.Exit(1)
 	}
-	if envOr("S3_ENSURE_BUCKET", "") != "" {
-		if err := s3Store.EnsureBucket(ctx); err != nil {
-			slog.Error("s3 ensure-bucket failed", "err", err)
-			os.Exit(1)
-		}
-	}
 
-	// Slice 1e.4b — meta.Store umbrella. One metadata-backend choice
-	// hands four stores (tenants / runs / projects / snapshots) to
-	// every handler. MONGO_URI stays recognised through 1e.4h.
-	metaStore, err := meta.NewFromConfig(ctx, meta.Config{
-		Type: meta.TypeMongo,
-		URI:  mongoURI,
-	}, s3Store)
+	// Slice 1e.4b/4g — meta.Store umbrella. Operators set
+	// BACKUP_METADATA_TYPE + the per-backend fields; legacy MONGO_URI
+	// still implies metadata.type: mongo.
+	metaStore, err := buildMetaStore(ctx, archiveStore)
 	if err != nil {
 		slog.Error("meta store init failed", "err", err)
 		os.Exit(1)
 	}
 	defer metaStore.Close(context.Background())
 
-	sch := scheduler.New(scheduler.Config{}, metaStore.Tenants(), metaStore.Runs(), s3Store, logger, nil)
+	sch := scheduler.New(scheduler.Config{}, metaStore.Tenants(), metaStore.Runs(), archiveStore, logger, nil)
 
 	router := chi.NewRouter()
 	router.Use(middleware.RequestID)
@@ -133,7 +115,7 @@ func main() {
 	overviewCfg := &api.OverviewConfig{
 		Tenants:         metaStore.Tenants(),
 		Runs:            metaStore.Runs(),
-		StorageLocation: fmt.Sprintf("s3://%s/", envOr("S3_BUCKET", "sc-backup-smoke")),
+		StorageLocation: archiveLocation,
 	}
 	projectsCfg := &api.ProjectsConfig{
 		Tenants:  metaStore.Tenants(),
@@ -246,11 +228,14 @@ func envOr(name, fallback string) string {
 	return fallback
 }
 
-// maskMongoURI redacts the password from a mongodb://user:password@host form
-// so a startup log can show the connection target without the credential.
+// maskMongoURI redacts the password from a mongodb://user:password@host
+// form so a startup log can show the connection target without the
+// credential. Called by worker.go against its BACKUP_TENANT_URI env;
+// main.go's own startup no longer logs a top-level URI as of slice
+// 1e.4g (the legacy-MONGO_URI shim in config.go stays silent about the
+// value).
 func maskMongoURI(uri string) string {
 	if idx := indexAt(uri); idx > 0 {
-		// Walk back from `@` to the `:` that starts the password.
 		for i := idx - 1; i >= 0; i-- {
 			if uri[i] == ':' {
 				return uri[:i+1] + "***" + uri[idx:]
