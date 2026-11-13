@@ -25,13 +25,16 @@ type Claims struct {
 }
 
 // SessionCookieName is the HttpOnly cookie the SPA's login flow sets +
-// subsequent /api/v1/* calls read. Matches forge-conductor's
-// forge_session so a single browser sign-in can work across both when
-// they share an origin.
-const SessionCookieName = "forge_session"
+// subsequent /api/v1/* calls read. Scoped to sc-component-backup —
+// this component is a REUSABLE SC Components template, not forge-fleet
+// specific, so the cookie name must not leak fleet branding. A
+// deployment that sits alongside another sc-component-* service on the
+// same origin is still the common case; keep this name distinct from
+// theirs.
+const SessionCookieName = "sc_backup_session"
 
 // JWTMiddleware returns a middleware that verifies the HS256 JWT in
-// either the `Authorization: Bearer ...` header OR the `forge_session`
+// either the `Authorization: Bearer ...` header OR the `sc_backup_session`
 // cookie. Cookie form is what the SPA uses after login
 // (session_handlers.go); Bearer stays for scheduler-tick / machine
 // callers minted by the component plugin.
@@ -71,7 +74,7 @@ func JWTMiddleware(signingKey []byte) func(http.Handler) http.Handler {
 }
 
 // tokenFromRequest reads an HS256 JWT from either the Authorization
-// header or the forge_session cookie. Bearer wins when both are present
+// header or the sc_backup_session cookie. Bearer wins when both are present
 // so a caller with both can still override via header (useful for curl
 // testing against an SPA-authed browser). Exported to internal callers
 // only — the session handler uses it to answer "authenticated?".

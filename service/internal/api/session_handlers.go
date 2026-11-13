@@ -22,10 +22,11 @@ import (
 //
 // Auth model: ONE operator password (env `BACKUP_OPERATOR_PASSWORD`),
 // shared across all operators of this backup component. Matches the
-// Python reference (local-db-backup) + fleet convention for admin-
-// facing SPAs — the backup SPA is operator-only, no per-user accounts,
-// no RBAC. A successful login mints an HS256 JWT scoped to `op=operator`
-// and drops it as an HttpOnly SameSite=Lax cookie (`forge_session`).
+// Python reference (local-db-backup) — the backup SPA is operator-only,
+// no per-user accounts, no RBAC. A successful login mints an HS256 JWT
+// scoped to `op=operator` and drops it as an HttpOnly SameSite=Lax
+// cookie (`sc_backup_session` — see JWTMiddleware for the rename
+// rationale).
 //
 // CSRF: the SPA refreshes a CSRF token after each session rotation
 // (see service/internal/ui/src/api/client.ts refreshCsrf). We don't
@@ -53,9 +54,10 @@ type SessionConfig struct {
 	// surfaces this as `password_set: false` so operators know to
 	// deploy with the env var set.
 	OperatorPassword string
-	// CookieTTL defaults to 12h when zero. Matches forge-conductor's
-	// OAuth session TTL so an operator's browser tab stays signed in
-	// across the typical work day.
+	// CookieTTL defaults to 12h when zero — long enough to keep an
+	// operator's browser tab signed in across a typical work day while
+	// still forcing a re-auth before an unattended cookie survives
+	// overnight.
 	CookieTTL time.Duration
 	// CookieSecure forces Secure cookies off for local dev (set to
 	// false when developing against http://localhost:8080). Defaults

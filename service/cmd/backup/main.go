@@ -2,11 +2,10 @@
 // Copyright (c) Simple Container
 
 // Command backup is the microservice half of sc-component-backup — the
-// throwaway service that gets dispatched into the operator's chosen
-// template (lambda / compose / k8s) and receives tenant registrations
-// from any consumer that `uses: [my-backup]`.
+// service that gets dispatched into the operator's chosen template
+// (lambda / compose / k8s) and receives tenant registrations from any
+// consumer that `uses: [my-backup]`.
 //
-// Shape cribbed from forge-notifier/cmd/notifier/main.go:
 //   - Reads env: SERVICE_JWT_SECRET (HS256, 32+ bytes, operator-set via
 //     the plugin's config.signingKey), MONGO_URI, PORT (default 8080).
 //   - HTTP router:
@@ -16,10 +15,11 @@
 //     GET  /*                               — embedded SPA
 //   - Graceful shutdown on SIGTERM.
 //
-// Auth model (differs from forge-notifier): the operator sets
-// config.signingKey in server.yaml; Path A's dispatch injects it as
-// SERVICE_JWT_SECRET env on this container. Same key signs the plugin's
-// per-consumer JWTs at ComputeProcess time. NO fleet-wide alias.
+// Auth model: the operator sets config.signingKey in server.yaml;
+// Path A's dispatch injects it as SERVICE_JWT_SECRET env on this
+// container. Same key signs the plugin's per-consumer JWTs at
+// ComputeProcess time. This is sc-component-backup's own key — not an
+// alias of any larger fleet's shared secret.
 package main
 
 import (
@@ -178,8 +178,7 @@ func main() {
 	// (AWS_LAMBDA_FUNCTION_NAME env set), it joins the Lambda runtime API
 	// and routes events through its-felix/aws-lambda-go-url-adapter
 	// (the vanilla handler path). Outside Lambda — LOCAL_DEBUG=true or
-	// just missing the env — it falls back to net/http on :PORT. Same
-	// shape every forge-* service uses; see forge-notifier/cmd/notifier/main.go.
+	// just missing the env — it falls back to net/http on :PORT.
 	slog.Info("starting service (sdkservice bridge)", "port", port)
 	svc, err := sdkservice.New(ctx, sdkservice.WithVanillaHandler(router))
 	if err != nil {

@@ -15,11 +15,11 @@ func TestRenderPath(t *testing.T) {
 		tmpl, tenant, resource, uuid, want string
 	}{
 		{
-			tmpl:     "forge-{tenant}/{yyyy}/{mm}/{dd}/{resource}-{ts-rfc3339}.archive.gz",
+			tmpl:     "{tenant}/{yyyy}/{mm}/{dd}/{resource}-{ts-rfc3339}.archive.gz",
 			tenant:   "smoke-client",
 			resource: "mongodb",
 			uuid:     "x",
-			want:     "forge-smoke-client/2026/11/11/mongodb-2026-11-11T09-30-15Z.archive.gz",
+			want:     "smoke-client/2026/11/11/mongodb-2026-11-11T09-30-15Z.archive.gz",
 		},
 		{
 			tmpl:     "{tenant}/{uuid}",

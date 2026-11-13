@@ -71,7 +71,7 @@ func TestBackupConfigValidate(t *testing.T) {
 		Image:      "simplecontainer/sc-component-backup:latest",
 		SigningKey: "${secret:backup-service-jwt-key}",
 		Worker: &BackupWorker{
-			Cluster:          "forge-backup-cluster",
+			Cluster:          "sc-backup-cluster",
 			SubnetIds:        []string{"subnet-abc"},
 			SecurityGroupIds: []string{"sg-xyz"},
 		},

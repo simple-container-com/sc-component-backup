@@ -1,7 +1,13 @@
-# db-backup — web UI
+# sc-component-backup — web UI
 
-SPA built with Vite + React 18 + TypeScript. Backend contract: [`docs/api.md`](../docs/api.md).
-The build goes to `web/dist`; FastAPI serves it from `/` (with an SPA fallback to `index.html`).
+SPA built with Vite + React 18 + TypeScript. Backend contract: Go HTTP handlers
+in `service/internal/api/` + the `/api/v1/*` surface defined in
+`service/internal/ui/src/api/client.ts`. The build goes to `dist/`; the Go
+binary serves it from `/` via `//go:embed all:dist` (SPA fallback to
+`index.html`). Historical note: the SPA was ported from the Python reference
+`local-db-backup` in slice 1e of the sc-components-platform milestone — a few
+mock fixtures (`mock/data.ts`) still carry the reference's example tenant
+names; they are fixtures, not deployed content.
 
 ## Commands
 
@@ -17,7 +23,7 @@ npm run build       # type check + build into dist/
 
 Password: `admin`. Data is in memory and resets on restart:
 
-- `infra-staging` — MongoDB, 23 databases (including `forge-conductor--staging`, ~1.5 GB); the last
+- `infra-staging` — MongoDB, 23 databases (including a large one at ~1.5 GB); the last
   finished run is partial (`Failed: connection closed`), a manual run is in progress;
 - `billing` — PostgreSQL every 6 h, with globals;
 - `shop-legacy` — MariaDB, never run.

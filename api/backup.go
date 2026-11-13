@@ -18,9 +18,10 @@ import (
 //   - Test fixtures in the plugin module that need a typed view
 //   - Documentation of the on-the-wire shape
 //
-// See the forge memory
-// `interface_assertion_against_plugin_owned_value_fails_in_prod` and
-// sc-components-platform design doc §P1 v1.5 for why this is doc-only.
+// See the sc-components-platform design doc §P1 v1.5 for why this is
+// doc-only: the production `sc` binary does not link plugin /api
+// modules, so a plugin-owned config cannot be Go-interface-asserted
+// against; the dispatch reads `.Raw` instead.
 type BackupConfig struct {
 	// DeployTo names a top-level template from the parent server.yaml's
 	// `templates:` block. SC core's sidecar wrapper (slice 1a) looks this
@@ -151,8 +152,9 @@ type BackupWorker struct {
 
 	// Cluster is the ECS cluster ARN (or name) the Fargate task runs on.
 	// Operator-declared; this plugin does NOT create ECS clusters —
-	// clusters are a shared operator resource (think `forge-fleet-tasks`)
-	// that backup tasks join alongside other short-lived jobs.
+	// clusters are a shared operator resource (e.g. a company-wide
+	// `tasks` cluster) that backup tasks join alongside other
+	// short-lived jobs.
 	// Required for deployTo: lambda.
 	Cluster string `json:"cluster" yaml:"cluster"`
 

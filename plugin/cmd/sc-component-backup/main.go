@@ -21,10 +21,9 @@
 // config value. The production `sc` binary does NOT link this plugin's
 // /api module; plugin-owned values arrive at core as opaque
 // *api.PluginFieldConfig with .Raw carrying the operator's YAML. See
-// forge memory interface_assertion_against_plugin_owned_value_fails_in_prod
-// + sc-components-platform design doc §P1 v1.5 for why. Dispatch is
-// Schema-advertised component_resource_types + `.Raw` reader, not
-// Go-interface assertion.
+// the sc-components-platform design doc §P1 v1.5 for the full rationale.
+// Dispatch is Schema-advertised component_resource_types + `.Raw`
+// reader, not Go-interface assertion.
 //
 // Schema() below advertises the component machinery:
 //

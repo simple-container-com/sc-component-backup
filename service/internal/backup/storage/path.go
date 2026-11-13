@@ -24,8 +24,8 @@ import (
 //
 // Example:
 //
-//	template = "forge-{tenant}/{yyyy}/{mm}/{dd}/{resource}-{ts-rfc3339}.archive.gz"
-//	result   = "forge-smoke-client/2026/11/11/mongodb-2026-11-11T09-30-15Z.archive.gz"
+//	template = "{tenant}/{yyyy}/{mm}/{dd}/{resource}-{ts-rfc3339}.archive.gz"
+//	result   = "smoke-client/2026/11/11/mongodb-2026-11-11T09-30-15Z.archive.gz"
 func RenderPath(template, tenantStack, resourceName, runID string, now time.Time) string {
 	now = now.UTC()
 	r := strings.NewReplacer(

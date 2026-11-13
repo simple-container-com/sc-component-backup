@@ -4,8 +4,9 @@
 package main
 
 // Worker mode — the one-shot execution shape used when the Backup
-// Component is deployed to aws-lambda. Design doc:
-// forge/docs/design/2026-11-12/sc-component-backup-refactor/README.md §5.3.
+// Component is deployed to aws-lambda. Design: the sc-component-backup
+// refactor doc (external to this public repo; see the sc-components-platform
+// milestone's §5.3 for the full rationale).
 //
 // Lambda's 15-minute cap makes it unsuitable for the actual mongodump of
 // a non-trivial DB. The deployed Lambda stays short: tenant store +

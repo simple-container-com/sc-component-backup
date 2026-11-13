@@ -19,7 +19,7 @@
 //
 //   TODO — need backend handlers before the SPA page using them works:
 //     - session / login / logout / CSRF — the service accepts JWT cookie
-//       (`forge_session`) or Bearer; no CSRF on today's backend. Kept for
+//       (`sc_backup_session`) or Bearer; no CSRF on today's backend. Kept for
 //       compatibility with the reference's rotation flow. [TODO backend]
 //     - overview / meta — aggregate home page [TODO backend]
 //     - projects CRUD — maps to tenants but shape differs [TODO backend]
@@ -36,7 +36,7 @@
 // Auth transport: the reference used `credentials: "same-origin"`; we
 // switch to `credentials: "include"` so a browser that lives on a
 // different origin than the service (e.g. ngrok tunnel, isolated-stack
-// subdomain) still forwards the `forge_session` cookie.
+// subdomain) still forwards the `sc_backup_session` cookie.
 import type {
   AppSettings,
   ArchivesResponse,
@@ -144,7 +144,7 @@ const enc = encodeURIComponent;
 
 export const api = {
   // TODO backend: /api/v1/session + CSRF rotation. Today the service
-  // accepts a JWT cookie (`forge_session`) or Authorization: Bearer; no
+  // accepts a JWT cookie (`sc_backup_session`) or Authorization: Bearer; no
   // CSRF mint endpoint exists yet. Returning a stub session unblocks the
   // SPA shell so pages that don't actually use CSRF continue to work.
   session: () => request<Session>("GET", "/api/v1/session"),

@@ -39,7 +39,7 @@ type RunStore interface {
 // server.yaml → sc-backup resource config; defaults chosen to avoid
 // surprising ops behaviour on first boot.
 type Config struct {
-	PathTemplate      string        // default "forge-{tenant}/{yyyy}/{mm}/{dd}/{resource}-{ts-rfc3339}.archive.gz"
+	PathTemplate      string        // default "{tenant}/{yyyy}/{mm}/{dd}/{resource}-{ts-rfc3339}.archive.gz"
 	RetentionDays     int           // default 0 (disabled)
 	TickInterval      time.Duration // default 60s; operator override for dev
 	BackupTimeout     time.Duration // per-run; default 1h
@@ -49,7 +49,7 @@ type Config struct {
 // FillDefaults fills zero-valued fields with the chosen defaults.
 func (c *Config) FillDefaults() {
 	if c.PathTemplate == "" {
-		c.PathTemplate = "forge-{tenant}/{yyyy}/{mm}/{dd}/{resource}-{ts-rfc3339}.archive.gz"
+		c.PathTemplate = "{tenant}/{yyyy}/{mm}/{dd}/{resource}-{ts-rfc3339}.archive.gz"
 	}
 	if c.TickInterval == 0 {
 		c.TickInterval = 60 * time.Second
