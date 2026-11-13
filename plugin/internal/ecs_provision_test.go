@@ -254,7 +254,7 @@ func TestEcsProvisionInputFromRaw(t *testing.T) {
 				"image":    "simplecontainer/sc-component-backup:v1",
 				"worker":   map[string]any{"cpu": 512, "memoryMB": 2048},
 			},
-			wantErr: "BACKUP_S3_BUCKET required",
+			wantErr: "storage.bucket",
 		},
 		{
 			name: "complete lambda config: input populated",

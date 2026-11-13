@@ -350,16 +350,31 @@ func EcsProvisionInputFromRaw(
 	if v, ok := worker["ephemeralStorageGB"].(int); ok {
 		in.EphemeralStorageGB = v
 	}
-	// ArchivesBucket is pulled from the Lambda's env (BACKUP_S3_BUCKET).
-	// We look it up on raw["env"]["BACKUP_S3_BUCKET"] — operator-declared
-	// alongside the other backup env.
-	if env, ok := raw["env"].(map[string]any); ok {
-		if b, ok := env["BACKUP_S3_BUCKET"].(string); ok {
+	// ArchivesBucket drives the S3 policy scope on the Fargate task
+	// role. Resolution order matches the service-side env resolution
+	// (slice 1e.4g.2):
+	//
+	//  1. storage.bucket     — new generic shape (slice 1e.4g schema)
+	//  2. env.STORAGE_BUCKET — operator-set in env: block directly
+	//  3. env.BACKUP_STORAGE_BUCKET — slice 1e.4g env-first
+	//  4. env.BACKUP_S3_BUCKET — pre-1e.4 legacy
+	if storage, ok := raw["storage"].(map[string]any); ok {
+		if b, ok := storage["bucket"].(string); ok {
 			in.ArchivesBucket = b
 		}
 	}
 	if in.ArchivesBucket == "" {
-		return nil, errors.New("EcsProvisionInputFromRaw: env.BACKUP_S3_BUCKET required when deployTo: lambda")
+		if env, ok := raw["env"].(map[string]any); ok {
+			for _, key := range []string{"STORAGE_BUCKET", "BACKUP_STORAGE_BUCKET", "BACKUP_S3_BUCKET"} {
+				if b, ok := env[key].(string); ok && b != "" {
+					in.ArchivesBucket = b
+					break
+				}
+			}
+		}
+	}
+	if in.ArchivesBucket == "" {
+		return nil, errors.New("EcsProvisionInputFromRaw: storage.bucket (or env.STORAGE_BUCKET / env.BACKUP_STORAGE_BUCKET / env.BACKUP_S3_BUCKET) required when deployTo: lambda")
 	}
 	return in, nil
 }
