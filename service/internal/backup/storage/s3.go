@@ -22,14 +22,36 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
-// Store is the backup archive store. Implementations: S3Store (prod +
-// smoke via MinIO). An in-memory one for unit tests lives alongside.
+// Store is the backup archive store. Implementations:
+//
+//   - S3Store       — production, also drives MinIO / R2 / DO Spaces /
+//     Yandex Object Storage via EndpointURL.
+//   - FSStore       — local filesystem (VM mount / k8s PV / ECS + EFS).
+//   - GCSStore      — Google Cloud Storage (skeleton — full impl is
+//     slice 1e.4f).
+//   - InMemoryStore — unit-test backend (see mem.go).
+//
+// Design: forge docs/design/2026-11-13/sc-component-backup-pluggable-storage.
 type Store interface {
 	Put(ctx context.Context, path string, body io.Reader) (sizeBytes int64, err error)
 	Get(ctx context.Context, path string) (io.ReadCloser, error)
 	List(ctx context.Context, prefix string) ([]StoredObject, error)
 	Delete(ctx context.Context, path string) error
+	// Presign mints a time-limited URL for `path`. For S3 + GCS the URL
+	// is a full signed https:// URL. For FSStore (no external URL) the
+	// return is a RELATIVE path like "/api/v1/files/<jwt>" that the
+	// HTTP layer rewrites against the request's host header.
+	Presign(ctx context.Context, path string, expires time.Duration) (string, error)
 }
+
+// ErrNotFound is returned by Store.Get when the key doesn't exist. Lets
+// callers (e.g. the colocated metadata store) distinguish "missing" from
+// "backend failure" without matching on wrapped error strings.
+var ErrNotFound = &notFoundError{}
+
+type notFoundError struct{}
+
+func (*notFoundError) Error() string { return "storage: object not found" }
 
 // StoredObject is a listing result.
 type StoredObject struct {
@@ -134,9 +156,29 @@ func (s *S3Store) Get(ctx context.Context, path string) (io.ReadCloser, error) {
 		Key:    aws.String(path),
 	})
 	if err != nil {
+		var nsk *types.NoSuchKey
+		if errorsAs(err, &nsk) {
+			return nil, ErrNotFound
+		}
 		return nil, fmt.Errorf("s3 get %q: %w", path, err)
 	}
 	return out.Body, nil
+}
+
+// Presign returns a GET URL valid for `expires`. Uses the standard
+// AWS signature v4 PresignGetObject flow — works against AWS S3,
+// MinIO, R2, DO Spaces, Yandex Object Storage uniformly.
+func (s *S3Store) Presign(ctx context.Context, path string, expires time.Duration) (string, error) {
+	path = strings.TrimPrefix(path, "/")
+	ps := s3.NewPresignClient(s.client)
+	req, err := ps.PresignGetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(s.cfg.Bucket),
+		Key:    aws.String(path),
+	}, s3.WithPresignExpires(expires))
+	if err != nil {
+		return "", fmt.Errorf("s3 presign %q: %w", path, err)
+	}
+	return req.URL, nil
 }
 
 func (s *S3Store) List(ctx context.Context, prefix string) ([]StoredObject, error) {
