@@ -121,18 +121,35 @@ func main() {
 	router.Use(middleware.Recoverer)
 	router.Use(requestLogger)
 
-	// Unauthenticated endpoints.
+	// Slice 1e.2 — SPA-facing handlers.
+	sessionCfg := api.NewSessionConfigFromEnv([]byte(jwtSecret))
+	metaCfg := &api.MetaConfig{Version: version, Commit: commit}
+	overviewCfg := &api.OverviewConfig{
+		Tenants:         store,
+		Runs:            runs,
+		StorageLocation: fmt.Sprintf("s3://%s/", envOr("S3_BUCKET", "sc-backup-smoke")),
+	}
+	projectsCfg := &api.ProjectsConfig{Tenants: store, Runs: runs}
+
+	// Unauthenticated endpoints — healthz + the session probe + login/logout.
 	router.Get("/healthz", api.Healthz)
+	router.Get("/api/v1/session", sessionCfg.Session)
+	router.Post("/api/v1/login", sessionCfg.Login)
+	router.Post("/api/v1/logout", sessionCfg.Logout)
 
 	// JWT-authenticated endpoints.
 	router.Group(func(r chi.Router) {
 		r.Use(api.JWTMiddleware([]byte(jwtSecret)))
+
+		// Core tenant / run surface (predates the SPA; plugin-auth path
+		// stays intact — register uses op=register claim).
 		r.Post("/api/v1/tenants/register", api.TenantsRegister(store))
 		r.Get("/api/v1/tenants", api.TenantsList(store))
 		r.Get("/api/v1/backups", api.NewBackupsListHandler(runs).ServeHTTP)
 		r.Post("/api/v1/tenants/{stack}/backup-now", api.NewBackupNowHandler(sch, store).ServeHTTP)
 		r.Post("/api/v1/tenants/{stack}/restore", api.NewRestoreHandler(sch, runs).ServeHTTP)
 		r.Get("/api/v1/restores/{id}", api.NewRestoreStatusHandler(runs).ServeHTTP)
+
 		// Scheduler tick — EventBridge fires this every minute when
 		// deployTo: lambda (design doc §5.3). Walks tenants, fires ECS
 		// Fargate one-shot tasks per due tenant. ?force=true on an
@@ -140,6 +157,13 @@ func main() {
 		// schedule. Nil Ecs here → handler builds its own client from
 		// the AWS SDK default config chain at first-tick time.
 		r.Post("/api/v1/scheduler/tick", api.NewSchedulerTickHandler(api.SchedulerTickConfig{Tenants: store}).ServeHTTP)
+
+		// SPA-facing read-only surface (slice 1e.2 2026-11-13). Mutating
+		// project CRUD + settings + stats endpoints stay TODO (slice 1e.3).
+		r.Get("/api/v1/meta", metaCfg.Meta)
+		r.Get("/api/v1/overview", overviewCfg.Overview)
+		r.Get("/api/v1/projects/{name}", projectsCfg.Project)
+		r.Get("/api/v1/projects/{name}/runs", projectsCfg.RunsForProject)
 	})
 
 	// Embedded SPA.

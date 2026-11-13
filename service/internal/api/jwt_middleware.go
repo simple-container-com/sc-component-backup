@@ -24,11 +24,20 @@ type Claims struct {
 	jwt.RegisteredClaims
 }
 
-// JWTMiddleware returns a middleware that verifies the HS256 JWT in the
-// Authorization: Bearer header against the signing key.
+// SessionCookieName is the HttpOnly cookie the SPA's login flow sets +
+// subsequent /api/v1/* calls read. Matches forge-conductor's
+// forge_session so a single browser sign-in can work across both when
+// they share an origin.
+const SessionCookieName = "forge_session"
+
+// JWTMiddleware returns a middleware that verifies the HS256 JWT in
+// either the `Authorization: Bearer ...` header OR the `forge_session`
+// cookie. Cookie form is what the SPA uses after login
+// (session_handlers.go); Bearer stays for scheduler-tick / machine
+// callers minted by the component plugin.
 //
 // Rejections (401):
-//   - Missing or malformed Authorization header
+//   - Both header AND cookie missing
 //   - Unsigned or wrong-alg token
 //   - Signature doesn't verify
 //   - Expired (exp < now) or not-yet-valid (nbf > now)
@@ -37,12 +46,11 @@ type Claims struct {
 func JWTMiddleware(signingKey []byte) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			authz := r.Header.Get("Authorization")
-			if !strings.HasPrefix(authz, "Bearer ") {
-				http.Error(w, "missing or malformed Authorization header", http.StatusUnauthorized)
+			raw := tokenFromRequest(r)
+			if raw == "" {
+				http.Error(w, "missing or malformed credentials", http.StatusUnauthorized)
 				return
 			}
-			raw := strings.TrimPrefix(authz, "Bearer ")
 
 			claims := &Claims{}
 			tok, err := jwt.ParseWithClaims(raw, claims, func(t *jwt.Token) (any, error) {
@@ -60,6 +68,21 @@ func JWTMiddleware(signingKey []byte) func(http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+// tokenFromRequest reads an HS256 JWT from either the Authorization
+// header or the forge_session cookie. Bearer wins when both are present
+// so a caller with both can still override via header (useful for curl
+// testing against an SPA-authed browser). Exported to internal callers
+// only — the session handler uses it to answer "authenticated?".
+func tokenFromRequest(r *http.Request) string {
+	if authz := r.Header.Get("Authorization"); strings.HasPrefix(authz, "Bearer ") {
+		return strings.TrimPrefix(authz, "Bearer ")
+	}
+	if c, err := r.Cookie(SessionCookieName); err == nil && c.Value != "" {
+		return c.Value
+	}
+	return ""
 }
 
 // ClaimsFromContext pulls the verified claims out of the request context.
