@@ -30,7 +30,7 @@ func TestResolveType_Defaults(t *testing.T) {
 		{"default FS → sqlite", TypeDefault, fs, TypeSQLite, ""},
 		{"default mem → colocated", TypeDefault, mem, TypeColocated, ""},
 		{"explicit sqlite on FS", TypeSQLite, fs, TypeSQLite, ""},
-		{"explicit sqlite on mem (test shim)", TypeSQLite, mem, TypeSQLite, ""},
+		{"explicit sqlite on mem refused", TypeSQLite, mem, "", "requires an archive of type filesystem"},
 		{"explicit colocated", TypeColocated, fs, TypeColocated, ""},
 		{"explicit mongo", TypeMongo, fs, TypeMongo, ""},
 	}
@@ -61,10 +61,8 @@ func TestNewFromConfig_RejectsUnsupportedForNow(t *testing.T) {
 		arch storage.Store
 		msg  string
 	}{
-		{"sqlite not yet", Config{Type: TypeSQLite}, fs, "slice 1e.4d"},
 		{"postgres not yet", Config{Type: TypePostgres, URI: "pg://x"}, fs, "slice 1e.4e"},
 		{"mysql not yet", Config{Type: TypeMySQL, URI: "mysql://x"}, fs, "slice 1e.4e"},
-		{"colocated not yet", Config{Type: TypeColocated}, fs, "slice 1e.4c"},
 		{"mongo needs URI", Config{Type: TypeMongo}, fs, "requires a URI"},
 	}
 	for _, tc := range cases {

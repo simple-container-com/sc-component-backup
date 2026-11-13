@@ -116,7 +116,7 @@ func NewFromConfig(ctx context.Context, cfg Config, archive storage.Store) (Stor
 		}
 		return newMongoStore(ctx, cfg.URI)
 	case TypeColocated:
-		return nil, fmt.Errorf("meta: colocated backend lands in slice 1e.4c (archive.Store is already wired for it)")
+		return newColocatedStore(archive)
 	case TypeSQLite:
 		return nil, fmt.Errorf("meta: sqlite backend lands in slice 1e.4d")
 	case TypePostgres, TypeMySQL:
@@ -130,14 +130,15 @@ func NewFromConfig(ctx context.Context, cfg Config, archive storage.Store) (Stor
 // backend. Also rejects invalid pairings up front.
 func resolveType(t Type, archive storage.Store) (Type, error) {
 	if t != TypeDefault {
-		// Up-front rejection: SQLite with an object-store archive
-		// doesn't work (object stores don't do random writes; the
-		// download-modify-upload shape is worse than colocated JSON).
+		// Up-front rejection: SQLite with a non-filesystem archive
+		// doesn't work. Object stores don't do random writes (download-
+		// modify-upload is worse than colocated JSON), and the
+		// InMemoryStore would leave archives in RAM while metadata lands
+		// on disk — tests that want SQLite round-trips should pair it
+		// with an FSStore under t.TempDir().
 		if t == TypeSQLite {
 			if _, isFS := archive.(*storage.FSStore); !isFS {
-				if _, isMem := archive.(*storage.InMemoryStore); !isMem {
-					return "", fmt.Errorf("meta: sqlite backend requires an archive of type filesystem (got %T)", archive)
-				}
+				return "", fmt.Errorf("meta: sqlite backend requires an archive of type filesystem (got %T)", archive)
 			}
 		}
 		return t, nil
