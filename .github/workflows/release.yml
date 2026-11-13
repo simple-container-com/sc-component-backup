@@ -163,30 +163,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Check Dockerhub credentials
-        id: creds
-        env:
-          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
-        run: |
-          if [ -z "$DOCKERHUB_USERNAME" ] || [ -z "$DOCKERHUB_TOKEN" ]; then
-            echo "::warning title=Dockerhub creds missing::skipping image push — set DOCKERHUB_USERNAME + DOCKERHUB_TOKEN as org secrets to enable"
-            echo "have=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "have=true" >> "$GITHUB_OUTPUT"
-          fi
+      # Fleet-shared Dockerhub login: pulls simplecontainer:dockerhub-cicd-token
+      # from the api repo's SC secrets registry via the single org-level
+      # SC_CONFIG secret. One place to rotate creds (api/.sc/stacks/dist/
+      # secrets.yaml), every plugin + component repo inherits. Replaces the
+      # per-repo DOCKERHUB_USERNAME/DOCKERHUB_TOKEN org-secret pattern.
+      - uses: simple-container-com/actions/install-sc@main
+      - uses: simple-container-com/actions/dockerhub-login@main
+        with:
+          sc-config: ${{ secrets.SC_CONFIG }}
 
       - uses: docker/setup-buildx-action@v3
-        if: steps.creds.outputs.have == 'true'
-
-      - uses: docker/login-action@v3
-        if: steps.creds.outputs.have == 'true'
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Build + push image
-        if: steps.creds.outputs.have == 'true'
         uses: docker/build-push-action@v5
         with:
           context: service
@@ -201,17 +190,14 @@ jobs:
             simplecontainer/sc-component-backup:${{ needs.version.outputs.version }}
             simplecontainer/sc-component-backup:latest
 
-# NOTE on the no-publish fallback.
+# NOTE on fleet-shared Dockerhub creds (slice 1e.4-follow-up, 2026-11-13).
 #
-# The `docker` job above only publishes when the two Dockerhub secrets
-# are present. In the absence of the secrets (an un-configured fork,
-# or any state before the operator wires `DOCKERHUB_USERNAME` +
-# `DOCKERHUB_TOKEN` at the simple-container-com org level), the job
-# emits a GitHub Actions `::warning` and no-ops. The plugin binaries
-# still release via the `release` job. This matches fleet CLAUDE.md
-# "package publishing, registries or release pipelines" — publishing
-# into `simplecontainer/*` requires explicit operator yes, which is
-# captured here as the presence of the credentials.
+# The `docker` job uses the simple-container-com/actions/dockerhub-login
+# composite. The composite pulls the Dockerhub token from
+# `sc stack secret-get -s dist dockerhub-cicd-token` — the fleet's own
+# SC secrets registry inside the api repo. Only ONE org-level secret
+# (SC_CONFIG) is required here; token rotations happen in the api repo's
+# secrets.yaml (encrypted, committed) + never need per-repo updates.
 #
 # Local developer workflow continues to be: `make docker` in service/
 # builds the image, `docker save` + `scp` + `docker load` to a test
