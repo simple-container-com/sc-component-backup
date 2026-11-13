@@ -92,7 +92,7 @@ func (p *Processor) Process(ctx *sdk.Context, _ api.Stack, input api.ResourceInp
 	// A missing parent is a hard error only if deps is empty too. Hold
 	// `parentRefErr` and defer the decision to each helper — service URL
 	// lookup needs ParentInfo; signingKey reads only Config.Raw.
-	serviceURL, err := p.readServiceURL(input, deps, parentRef, parentRefErr)
+	serviceURL, err := p.readServiceURL(input, deps, params.ParentStack, parentRef, parentRefErr)
 	if err != nil {
 		return nil, errors.Wrapf(err, "component %q unable to resolve service URL", resName)
 	}
@@ -398,25 +398,32 @@ func scopedMongoURI(deps pApi.ResourcesOutputs, resourceName, cluster, username,
 //  1. `deps[resName].Outputs["<resName>-service-url"]` — the (b) path,
 //     works once SC core populates `params.ResourceOutputs` on consumer-
 //     side ComputeProcess. Returns immediately when the key exists.
-//  2. Parent StackReference `GetOutputDetails("<resName>-service-url")`
-//     — the (a) path, mirrors sc-plugin-mongodb. The working source
-//     today.
+//  2. Parent StackReference, with a cascade of candidate keys:
+//     a. `<resName>-service-url` — the backup plugin's own Provision
+//     export. Today this is the pre-slice-1a placeholder
+//     `unset-pre-slice-1a` (SC core's component-dispatch sidecar
+//     doesn't populate `_deployed_service` yet), which we treat as
+//     "not found" and fall through.
+//     b. `<parentStackName>-<parentEnv>-function-url` — the aws-lambda
+//     template's own export, published by sc-plugin-aws when the
+//     component dispatches `deployTo: lambda`. This is the working
+//     URL today (live-caught on backup-smoke-1d, 2026-11-14).
 //  3. `_test_service_url` override on Config.Raw — unit tests that
 //     don't construct dep fixtures or open StackReferences.
 //
 // `parentRefErr` is non-nil when `newParentStackRef` failed (no
 // ParentInfo on params). In that case the StackReference path is
 // skipped and only the deps + test-override sources are tried.
-func (p *Processor) readServiceURL(input api.ResourceInput, deps pApi.ResourcesOutputs, parentRef *sdk.StackReference, parentRefErr error) (string, error) {
+func (p *Processor) readServiceURL(input api.ResourceInput, deps pApi.ResourcesOutputs, parent *pApi.ParentInfo, parentRef *sdk.StackReference, parentRefErr error) (string, error) {
 	resName := input.Descriptor.Name
 	// (b) — typed deps.
 	if pro := pluginOutputOf(deps, resName); pro != nil {
-		if s, ok := stringOutputValue(pro, resName+"-service-url"); ok {
+		if s, ok := stringOutputValue(pro, resName+"-service-url"); ok && !isUnsetServiceURL(s) {
 			return s, nil
 		}
 		for k, v := range pro.Outputs {
-			if strings.HasSuffix(k, "-service-url") {
-				if s, ok := v.Value.(string); ok && s != "" {
+			if strings.HasSuffix(k, "-service-url") || strings.HasSuffix(k, "-function-url") {
+				if s, ok := v.Value.(string); ok && !isUnsetServiceURL(s) {
 					return s, nil
 				}
 			}
@@ -426,8 +433,21 @@ func (p *Processor) readServiceURL(input api.ResourceInput, deps pApi.ResourcesO
 	if parentRefErr == nil && parentRef != nil {
 		if s, found, err := parentStringOutput(parentRef, resName+"-service-url"); err != nil {
 			return "", errors.Wrapf(err, "parent-stack lookup for service URL")
-		} else if found && s != "" {
+		} else if found && !isUnsetServiceURL(s) {
 			return s, nil
+		}
+		// Fallback: aws-lambda template's own `<parentStack>-<env>-function-url`
+		// export. The template publishes this from sc-plugin-aws when the
+		// component dispatches `deployTo: lambda`. Covers the slice-1a gap
+		// (SC core's component-dispatch sidecar doesn't propagate
+		// `_deployed_service` to the plugin's Provision input yet).
+		if parent != nil && parent.StackName != "" && parent.StackEnv != "" {
+			key := parent.StackName + "-" + parent.StackEnv + "-function-url"
+			if s, found, err := parentStringOutput(parentRef, key); err != nil {
+				return "", errors.Wrapf(err, "parent-stack lookup for %q", key)
+			} else if found && !isUnsetServiceURL(s) {
+				return s, nil
+			}
 		}
 	}
 	if raw, ok := extractConfigRaw(input.Descriptor); ok {
@@ -435,7 +455,21 @@ func (p *Processor) readServiceURL(input api.ResourceInput, deps pApi.ResourcesO
 			return v, nil
 		}
 	}
-	return "", errors.Errorf("service URL not found: no %q-service-url on deps or parent exports, and no _test_service_url override on Config.Raw", resName)
+	return "", errors.Errorf("service URL not found: no %q-service-url on deps/parent (or value is the unset placeholder), no %q-<env>-function-url on parent, and no _test_service_url override on Config.Raw", resName, func() string {
+		if parent != nil {
+			return parent.StackName
+		}
+		return ""
+	}())
+}
+
+// isUnsetServiceURL returns true for empty strings OR the pre-slice-1a
+// placeholder the plugin's Provision exports when SC core's sidecar
+// wrapper hasn't populated `_deployed_service` on its dependency outputs.
+// Treats either as "not a real URL" so callers can fall through to the
+// template's own `-function-url` export.
+func isUnsetServiceURL(s string) bool {
+	return s == "" || s == "unset-pre-slice-1a"
 }
 
 func (p *Processor) readSigningKey(input api.ResourceInput) (string, error) {
