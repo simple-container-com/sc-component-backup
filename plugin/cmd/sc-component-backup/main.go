@@ -124,23 +124,27 @@ func (p *backupPlugin) Schema(_ context.Context, _ *scpluginv1.SchemaRequest) (*
 			//
 			// Needs sc-plugin-aws ≥ v2026.11.12-90d5f1b (the overlay-side
 			// cloudExtras pass-through from sc-plugin-aws#19).
-			// `worker`, `databases`, `atlasAdmin` are the backup-plugin-
-			// specific top-level keys on BackupConfig that SC core's
-			// validator sees as NON-well-known. They land here NOT as
-			// "overlay these onto the dispatched template" (template-side
-			// overlays are image/env/ingressRoutes/imagePullSecretRef/
-			// cloudExtras above) but because SC core's component validator
-			// dual-uses the same list for allowed-top-level-keys on the
-			// component config — surfaced 2026-11-13 on the first live
-			// preview against the backup-smoke stack ("unknown or
-			// disallowed top-level key 'worker' for component type
-			// 'sc-backup'"). Semantically the two concepts differ; core's
-			// mergeComponentIntoTemplate leaves these unseen and the
-			// plugin reads them off ComponentRaw.{worker,databases,
-			// atlasAdmin} in its own Provision + ComputeProcess paths.
+			// `worker`, `databases`, `atlasAdmin`, `storage`, `metadata`,
+			// `operatorPassword` are the backup-plugin-specific top-level
+			// keys on BackupConfig that SC core's validator sees as
+			// NON-well-known. They land here NOT as "overlay these onto
+			// the dispatched template" (template-side overlays are
+			// image/env/ingressRoutes/imagePullSecretRef/cloudExtras
+			// above) but because SC core's component validator dual-uses
+			// the same list for allowed-top-level-keys on the component
+			// config — surfaced 2026-11-13 on the first live preview
+			// against the backup-smoke stack ("unknown or disallowed
+			// top-level key 'worker' for component type 'sc-backup'").
+			// Semantically the two concepts differ; core's
+			// mergeComponentIntoTemplate leaves these unseen. The plugin
+			// reads worker/databases/atlasAdmin off ComponentRaw.* in its
+			// own Provision + ComputeProcess paths; storage/metadata are
+			// advisory today (slice 1e.4g schema) + translate to env on
+			// the dispatched service in slice 1e.4g.2.
 			backupApi.ResourceType: {Values: []string{
 				"image", "env", "ingressRoutes", "imagePullSecretRef", "cloudExtras",
 				"worker", "databases", "atlasAdmin",
+				"storage", "metadata", "operatorPassword",
 			}},
 		},
 	}, nil
