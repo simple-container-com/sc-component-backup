@@ -175,13 +175,33 @@ jobs:
 
       - uses: docker/setup-buildx-action@v3
 
+      # Caching:
+      #   - `cache-from: type=gha` pulls last run's layers from the
+      #     GitHub Actions cache (stable builder; buildx bakes the
+      #     tag-less manifest + descriptor). Hit ratio drops to zero
+      #     only when the Dockerfile itself changes meaningfully.
+      #   - `cache-to: type=gha,mode=max` writes every stage (including
+      #     the Node + Go builders) so a subsequent run reuses npm
+      #     install + go mod download + dnf install + mongodb-tools
+      #     tarball download — the three slow phases.
+      #
+      # Platform: amd64 ONLY. Multi-arch (linux/arm64) bit this at the
+      # live smoke on 2026-11-13 — arm64 under QEMU emulates every
+      # `dnf install` + the 90 MB mongodb-tools tarball extract at
+      # ~1/10th native speed, so the job ran ~25 min for a single
+      # release. Lambda deploys pick ONE arch per function, so
+      # emitting both buys nothing. Operators who need arm64 add
+      # `platforms: linux/amd64,linux/arm64` in a follow-up (+ the
+      # time cost), with Graviton Lambda support settled separately.
       - name: Build + push image
         uses: docker/build-push-action@v5
         with:
           context: service
           file: service/Dockerfile
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64
           push: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
           build-args: |
             VERSION=${{ needs.version.outputs.version }}
             COMMIT=${{ github.sha }}
