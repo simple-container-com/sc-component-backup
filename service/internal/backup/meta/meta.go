@@ -118,7 +118,7 @@ func NewFromConfig(ctx context.Context, cfg Config, archive storage.Store) (Stor
 	case TypeColocated:
 		return newColocatedStore(archive)
 	case TypeSQLite:
-		return nil, fmt.Errorf("meta: sqlite backend lands in slice 1e.4d")
+		return newSQLiteStore(ctx, cfg, archive)
 	case TypePostgres, TypeMySQL:
 		return nil, fmt.Errorf("meta: %s backend lands in slice 1e.4e", t)
 	default:
