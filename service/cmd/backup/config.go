@@ -42,7 +42,7 @@ func buildArchiveStore(ctx context.Context) (storage.Store, string, error) {
 	case "filesystem":
 		return buildFSArchive(ctx)
 	case "gcs":
-		return nil, "", fmt.Errorf("BACKUP_STORAGE_TYPE=gcs — full impl lands in slice 1e.4f")
+		return buildGCSArchive(ctx)
 	default:
 		return nil, "", fmt.Errorf("BACKUP_STORAGE_TYPE=%q not recognised (one of s3|gcs|filesystem)", t)
 	}
@@ -71,6 +71,22 @@ func buildS3Archive(ctx context.Context) (storage.Store, string, error) {
 		}
 	}
 	return s3Store, fmt.Sprintf("s3://%s/", cfg.Bucket), nil
+}
+
+func buildGCSArchive(ctx context.Context) (storage.Store, string, error) {
+	bucket := os.Getenv("BACKUP_STORAGE_BUCKET")
+	if bucket == "" {
+		return nil, "", fmt.Errorf("BACKUP_STORAGE_BUCKET is required when BACKUP_STORAGE_TYPE=gcs")
+	}
+	cfg := storage.GCSConfig{
+		Bucket:          bucket,
+		CredentialsFile: os.Getenv("BACKUP_STORAGE_CREDENTIALS_FILE"),
+	}
+	g, err := storage.NewGCSStore(ctx, cfg)
+	if err != nil {
+		return nil, "", fmt.Errorf("gcs archive init: %w", err)
+	}
+	return g, fmt.Sprintf("gs://%s/", cfg.Bucket), nil
 }
 
 func buildFSArchive(ctx context.Context) (storage.Store, string, error) {
