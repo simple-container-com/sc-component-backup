@@ -283,16 +283,24 @@ func (p *backupPlugin) ComputeProcess(stdctx context.Context, req *scpluginv1.Co
 		return nil, err
 	}
 
-	// NOTE slice 1d: the backup plugin's compute path wants to read its
-	// own `databases:` + `atlasAdmin:` config here, but
-	// ComputeProcessRequest has no `component_raw` proto field today
-	// (only ProvisionRequest does — api#601). An api follow-up adds the
-	// symmetric ComputeProcess carrier; until then, the processor sees
-	// an empty Config.Raw on ComputeProcess, and `maybeProvisionScopedUser`
-	// is a no-op in production (tests exercise the matcher by passing
-	// typed deps directly). Not a slice-1d.1 regression — this gap has
-	// always existed on the live path.
-	input := runtime.ResourceInputForComputeProcess(req, parent, map[string]any{})
+	// Slice 1d.4: decode the component's own `.Raw` map off the
+	// ComputeProcessRequest.component_raw side-channel (api#608, released
+	// in 2026.11.57). The backup plugin's compute path reads
+	// `databases:` + `atlasAdmin:` off this map to mint a per-consumer
+	// scoped Atlas user. extractConfigRaw (compute.go:427) picks up a
+	// plain `map[string]any` as its last-resort fallback, so handing the
+	// decoded raw in here lights up `maybeProvisionScopedUser` on the
+	// live RPC path. Nil raw (non-component dispatch, older SC core) is
+	// treated as an empty map so every other code path stays unchanged.
+	componentRaw, err := runtime.ComponentRawFromComputeProcessRequest(req)
+	if err != nil {
+		p.progress.Error("compute-process", "component_raw decode: "+err.Error())
+		return nil, err
+	}
+	if componentRaw == nil {
+		componentRaw = map[string]any{}
+	}
+	input := runtime.ResourceInputForComputeProcess(req, parent, componentRaw)
 
 	processor := backupInternal.NewProcessor(backupInternal.ProcessorConfig{
 		Progress: p.progress,
