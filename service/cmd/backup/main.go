@@ -40,10 +40,9 @@ import (
 	sdkservice "github.com/simple-container-com/go-aws-lambda-sdk/pkg/service"
 
 	"github.com/simple-container-com/sc-component-backup/service/internal/api"
-	"github.com/simple-container-com/sc-component-backup/service/internal/backup/project"
+	"github.com/simple-container-com/sc-component-backup/service/internal/backup/meta"
 	"github.com/simple-container-com/sc-component-backup/service/internal/backup/scheduler"
 	"github.com/simple-container-com/sc-component-backup/service/internal/backup/storage"
-	"github.com/simple-container-com/sc-component-backup/service/internal/tenant"
 	"github.com/simple-container-com/sc-component-backup/service/internal/ui"
 )
 
@@ -84,14 +83,9 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	store, err := tenant.NewMongoStore(ctx, mongoURI)
-	if err != nil {
-		slog.Error("mongo connect failed", "err", err)
-		os.Exit(1)
-	}
-	defer store.Close(context.Background())
-
 	// S3 store. Endpoint comes from env (MinIO in smoke; empty → AWS).
+	// Slice 1e.4a added FS/GCS/InMem siblings; slice 1e.4g migrates
+	// this block to the new BackupStorage schema.
 	s3Store, err := storage.NewS3Store(ctx, storage.S3Config{
 		Bucket:       envOr("S3_BUCKET", "sc-backup-smoke"),
 		Region:       envOr("S3_REGION", "us-east-1"),
@@ -111,27 +105,20 @@ func main() {
 		}
 	}
 
-	// In-memory run store for the smoke (no Mongo collection for runs
-	// in v1; rebuild from state on restart is a follow-up).
-	runs := scheduler.NewInMemoryRunStore()
-	sch := scheduler.New(scheduler.Config{}, store, runs, s3Store, logger, nil)
-
-	// Slice 1e.3 — project.Store: operator-edited project configs,
-	// persisted separately from the plugin-driven tenant.Record. In-mem
-	// for the first wire-in; swap to Mongo-backed when an operator
-	// smoke actually persists across restarts. BACKUP_PROJECTS_MODE=mongo
-	// opts into the Mongo-backed implementation and shares the same
-	// MONGO_URI as the tenant store.
-	var projects project.Store = project.NewInMemoryStore()
-	if envOr("BACKUP_PROJECTS_MODE", "") == "mongo" {
-		pStore, err := project.NewMongoStore(ctx, mongoURI)
-		if err != nil {
-			slog.Error("project.Store mongo connect failed", "err", err)
-			os.Exit(1)
-		}
-		defer pStore.Close(context.Background())
-		projects = pStore
+	// Slice 1e.4b — meta.Store umbrella. One metadata-backend choice
+	// hands four stores (tenants / runs / projects / snapshots) to
+	// every handler. MONGO_URI stays recognised through 1e.4h.
+	metaStore, err := meta.NewFromConfig(ctx, meta.Config{
+		Type: meta.TypeMongo,
+		URI:  mongoURI,
+	}, s3Store)
+	if err != nil {
+		slog.Error("meta store init failed", "err", err)
+		os.Exit(1)
 	}
+	defer metaStore.Close(context.Background())
+
+	sch := scheduler.New(scheduler.Config{}, metaStore.Tenants(), metaStore.Runs(), s3Store, logger, nil)
 
 	router := chi.NewRouter()
 	router.Use(middleware.RequestID)
@@ -139,30 +126,23 @@ func main() {
 	router.Use(middleware.Recoverer)
 	router.Use(requestLogger)
 
-	// Slice 1e.2 — SPA-facing handlers.
+	// Slice 1e.2 — SPA-facing handlers. Every handler reaches its
+	// narrow store through the meta.Store's accessors (slice 1e.4b).
 	sessionCfg := api.NewSessionConfigFromEnv([]byte(jwtSecret))
 	metaCfg := &api.MetaConfig{Version: version, Commit: commit}
 	overviewCfg := &api.OverviewConfig{
-		Tenants:         store,
-		Runs:            runs,
+		Tenants:         metaStore.Tenants(),
+		Runs:            metaStore.Runs(),
 		StorageLocation: fmt.Sprintf("s3://%s/", envOr("S3_BUCKET", "sc-backup-smoke")),
 	}
-	projectsCfg := &api.ProjectsConfig{Tenants: store, Runs: runs, Projects: projects}
-	testConnCfg := &api.TestConnectionConfig{Projects: projects, Timeout: 10 * time.Second}
-	cancelCfg := &api.CancelConfig{Runs: runs}
-
-	// Slice 1e.3 — stats handler. BACKUP_SNAPSHOTS_MONGO_URI defaults to
-	// MONGO_URI (single-cluster deploys, which is the common case). The
-	// snapshot store shares the `sc_component_backup` database with the
-	// run + tenant collections.
-	snapURI := envOr("BACKUP_SNAPSHOTS_MONGO_URI", mongoURI)
-	snapStore, snapErr := scheduler.NewMongoSnapshotStore(ctx, snapURI, "", runs)
-	if snapErr != nil {
-		slog.Error("snapshot store init failed", "err", snapErr)
-		os.Exit(1)
+	projectsCfg := &api.ProjectsConfig{
+		Tenants:  metaStore.Tenants(),
+		Runs:     metaStore.Runs(),
+		Projects: metaStore.Projects(),
 	}
-	defer snapStore.Close(context.Background())
-	statsCfg := &api.StatsConfig{Snapshots: snapStore, Runs: runs}
+	testConnCfg := &api.TestConnectionConfig{Projects: metaStore.Projects(), Timeout: 10 * time.Second}
+	cancelCfg := &api.CancelConfig{Runs: metaStore.Runs()}
+	statsCfg := &api.StatsConfig{Snapshots: metaStore.Snapshots(), Runs: metaStore.Runs()}
 
 	// Unauthenticated endpoints — healthz + the session probe + login/logout.
 	router.Get("/healthz", api.Healthz)
@@ -176,12 +156,12 @@ func main() {
 
 		// Core tenant / run surface (predates the SPA; plugin-auth path
 		// stays intact — register uses op=register claim).
-		r.Post("/api/v1/tenants/register", api.TenantsRegister(store))
-		r.Get("/api/v1/tenants", api.TenantsList(store))
-		r.Get("/api/v1/backups", api.NewBackupsListHandler(runs).ServeHTTP)
-		r.Post("/api/v1/tenants/{stack}/backup-now", api.NewBackupNowHandler(sch, store).ServeHTTP)
-		r.Post("/api/v1/tenants/{stack}/restore", api.NewRestoreHandler(sch, runs).ServeHTTP)
-		r.Get("/api/v1/restores/{id}", api.NewRestoreStatusHandler(runs).ServeHTTP)
+		r.Post("/api/v1/tenants/register", api.TenantsRegister(metaStore.Tenants()))
+		r.Get("/api/v1/tenants", api.TenantsList(metaStore.Tenants()))
+		r.Get("/api/v1/backups", api.NewBackupsListHandler(metaStore.Runs()).ServeHTTP)
+		r.Post("/api/v1/tenants/{stack}/backup-now", api.NewBackupNowHandler(sch, metaStore.Tenants()).ServeHTTP)
+		r.Post("/api/v1/tenants/{stack}/restore", api.NewRestoreHandler(sch, metaStore.Runs()).ServeHTTP)
+		r.Get("/api/v1/restores/{id}", api.NewRestoreStatusHandler(metaStore.Runs()).ServeHTTP)
 
 		// Scheduler tick — EventBridge fires this every minute when
 		// deployTo: lambda (design doc §5.3). Walks tenants, fires ECS
@@ -189,7 +169,7 @@ func main() {
 		// operator-driven call runs every tenant regardless of
 		// schedule. Nil Ecs here → handler builds its own client from
 		// the AWS SDK default config chain at first-tick time.
-		r.Post("/api/v1/scheduler/tick", api.NewSchedulerTickHandler(api.SchedulerTickConfig{Tenants: store}).ServeHTTP)
+		r.Post("/api/v1/scheduler/tick", api.NewSchedulerTickHandler(api.SchedulerTickConfig{Tenants: metaStore.Tenants()}).ServeHTTP)
 
 		// SPA-facing read-only surface (slice 1e.2 2026-11-13). Mutating
 		// project CRUD + settings + stats endpoints stay TODO (slice 1e.3).
