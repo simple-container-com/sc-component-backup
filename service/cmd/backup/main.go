@@ -40,6 +40,7 @@ import (
 	sdkservice "github.com/simple-container-com/go-aws-lambda-sdk/pkg/service"
 
 	"github.com/simple-container-com/sc-component-backup/service/internal/api"
+	"github.com/simple-container-com/sc-component-backup/service/internal/backup/project"
 	"github.com/simple-container-com/sc-component-backup/service/internal/backup/scheduler"
 	"github.com/simple-container-com/sc-component-backup/service/internal/backup/storage"
 	"github.com/simple-container-com/sc-component-backup/service/internal/tenant"
@@ -115,6 +116,23 @@ func main() {
 	runs := scheduler.NewInMemoryRunStore()
 	sch := scheduler.New(scheduler.Config{}, store, runs, s3Store, logger, nil)
 
+	// Slice 1e.3 — project.Store: operator-edited project configs,
+	// persisted separately from the plugin-driven tenant.Record. In-mem
+	// for the first wire-in; swap to Mongo-backed when an operator
+	// smoke actually persists across restarts. BACKUP_PROJECTS_MODE=mongo
+	// opts into the Mongo-backed implementation and shares the same
+	// MONGO_URI as the tenant store.
+	var projects project.Store = project.NewInMemoryStore()
+	if envOr("BACKUP_PROJECTS_MODE", "") == "mongo" {
+		pStore, err := project.NewMongoStore(ctx, mongoURI)
+		if err != nil {
+			slog.Error("project.Store mongo connect failed", "err", err)
+			os.Exit(1)
+		}
+		defer pStore.Close(context.Background())
+		projects = pStore
+	}
+
 	router := chi.NewRouter()
 	router.Use(middleware.RequestID)
 	router.Use(middleware.RealIP)
@@ -129,7 +147,22 @@ func main() {
 		Runs:            runs,
 		StorageLocation: fmt.Sprintf("s3://%s/", envOr("S3_BUCKET", "sc-backup-smoke")),
 	}
-	projectsCfg := &api.ProjectsConfig{Tenants: store, Runs: runs}
+	projectsCfg := &api.ProjectsConfig{Tenants: store, Runs: runs, Projects: projects}
+	testConnCfg := &api.TestConnectionConfig{Projects: projects, Timeout: 10 * time.Second}
+	cancelCfg := &api.CancelConfig{Runs: runs}
+
+	// Slice 1e.3 — stats handler. BACKUP_SNAPSHOTS_MONGO_URI defaults to
+	// MONGO_URI (single-cluster deploys, which is the common case). The
+	// snapshot store shares the `sc_component_backup` database with the
+	// run + tenant collections.
+	snapURI := envOr("BACKUP_SNAPSHOTS_MONGO_URI", mongoURI)
+	snapStore, snapErr := scheduler.NewMongoSnapshotStore(ctx, snapURI, "", runs)
+	if snapErr != nil {
+		slog.Error("snapshot store init failed", "err", snapErr)
+		os.Exit(1)
+	}
+	defer snapStore.Close(context.Background())
+	statsCfg := &api.StatsConfig{Snapshots: snapStore, Runs: runs}
 
 	// Unauthenticated endpoints — healthz + the session probe + login/logout.
 	router.Get("/healthz", api.Healthz)
@@ -164,6 +197,31 @@ func main() {
 		r.Get("/api/v1/overview", overviewCfg.Overview)
 		r.Get("/api/v1/projects/{name}", projectsCfg.Project)
 		r.Get("/api/v1/projects/{name}/runs", projectsCfg.RunsForProject)
+
+		// Slice 1e.3 — project CRUD + setSecret.
+		r.Post("/api/v1/projects", projectsCfg.CreateProject)
+		r.Put("/api/v1/projects/{name}", projectsCfg.UpdateProject)
+		r.Delete("/api/v1/projects/{name}", projectsCfg.DeleteProject)
+		r.Put("/api/v1/projects/{name}/secret", projectsCfg.SetSecret)
+
+		// Slice 1e.3 — stats endpoints. Data flows from the Mongo-backed
+		// SnapshotStore (if BACKUP_SNAPSHOTS_MONGO_URI set, else the
+		// MONGO_URI default) through the stats aggregator and out as
+		// JSON matching the SPA's ProjectStats/ObjectStats/ObjectHistory
+		// TypeScript types. Snapshot ingestion from the scheduler is a
+		// follow-up slice — in the meantime a clean deploy answers these
+		// routes with empty series.
+		r.Get("/api/v1/projects/{name}/stats", statsCfg.ProjectStats)
+		r.Get("/api/v1/projects/{name}/stats/objects", statsCfg.ObjectStats)
+		r.Get("/api/v1/projects/{name}/stats/object-history", statsCfg.ObjectHistory)
+
+		// Slice 1e.3 — test-connection + cancel. test-connection wraps
+		// the Driver.Test shape (service/internal/backup/driver) so the
+		// SPA's NewProject form can validate a URI before committing;
+		// cancel marks the newest running BackupRun as cancelled
+		// (worker-side signal plumbing is a 1e.4 follow-up).
+		r.Post("/api/v1/test-connection", testConnCfg.TestConnection)
+		r.Post("/api/v1/projects/{name}/cancel", cancelCfg.Cancel)
 	})
 
 	// Embedded SPA.
