@@ -10,12 +10,17 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/simple-container-com/sc-component-backup/service/internal/backup"
 	"github.com/simple-container-com/sc-component-backup/service/internal/backup/scheduler"
 )
 
 // NewRestoreHandler serves `POST /api/v1/tenants/{stack}/restore`.
-// Body: `{"backupRunId": "<id>"}`. Returns 202 + RestoreRun{id,...}
-// immediately; the actual restore streams in a background goroutine.
+// Body: `{"backupRunId": "<id>"}`. Runs the restore synchronously
+// (goroutine + select, matching backup-now) and returns 202 with the
+// finished RestoreRun. Lambda freezes the container after a response
+// returns, so fire-and-forget would strand the goroutine — live-caught
+// 2026-11-13 on the 1f smoke: a 202 landed, Lambda froze, and widgets
+// stayed empty because the restore never progressed past accept.
 func NewRestoreHandler(sch *scheduler.Scheduler, runs scheduler.RunStore) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		stack := chi.URLParam(r, "stack")
@@ -27,8 +32,6 @@ func NewRestoreHandler(sch *scheduler.Scheduler, runs scheduler.RunStore) http.H
 			return
 		}
 
-		// Sanity: the referenced backup run must belong to this tenant
-		// (defence against operator typos naming the wrong stack).
 		br, err := runs.GetBackup(r.Context(), body.BackupRunID)
 		if err != nil {
 			http.Error(w, `{"error":"backupRunId not found"}`, http.StatusNotFound)
@@ -39,21 +42,25 @@ func NewRestoreHandler(sch *scheduler.Scheduler, runs scheduler.RunStore) http.H
 			return
 		}
 
-		// Kick off the restore on a background context + return 202.
+		runCh := make(chan backup.RestoreRun, 1)
+		errCh := make(chan error, 1)
 		go func() {
-			_, _ = sch.RunRestore(context.Background(), body.BackupRunID, "operator")
+			bg := context.Background()
+			rr, err := sch.RunRestore(bg, body.BackupRunID, "operator")
+			if err != nil {
+				errCh <- err
+				return
+			}
+			runCh <- rr
 		}()
-
-		// For the operator's immediate response: build a provisional
-		// RestoreRun row. The scheduler also writes its own authoritative
-		// row; the operator can poll by id.
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusAccepted)
-		_ = json.NewEncoder(w).Encode(map[string]string{
-			"status":      "accepted",
-			"backupRunId": body.BackupRunID,
-			"hint":        "poll GET /api/v1/restores by latest id for progress; or watch tenant.LastSeenAt resetting on success",
-		})
+		select {
+		case rr := <-runCh:
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(rr)
+		case err := <-errCh:
+			http.Error(w, `{"error":"`+jsonEscape(err.Error())+`"}`, http.StatusInternalServerError)
+		}
 	})
 }
 
