@@ -68,6 +68,21 @@ func main() {
 	slog.SetDefault(logger)
 
 	jwtSecret := mustGetEnv("SERVICE_JWT_SECRET")
+	// Resolve the ARN when SC core's `${secret:…}` wiring left an
+	// `arn:aws:secretsmanager:…` string in the env. See the resolver's
+	// doc comment for the full why; summary: the plugin mints JWTs with
+	// the resolved signingKey, so this service MUST validate with the
+	// resolved value too or every push-register is 401.
+	{
+		resolveCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		resolved, err := resolveAWSSecretARN(resolveCtx, jwtSecret)
+		cancel()
+		if err != nil {
+			slog.Error("failed to resolve SERVICE_JWT_SECRET from SecretsManager", "err", err)
+			os.Exit(2)
+		}
+		jwtSecret = resolved
+	}
 	if len(jwtSecret) < 32 {
 		slog.Error("SERVICE_JWT_SECRET must be at least 32 bytes (HS256 floor)")
 		os.Exit(2)
