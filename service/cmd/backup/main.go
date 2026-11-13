@@ -7,7 +7,8 @@
 // consumer that `uses: [my-backup]`.
 //
 //   - Reads env: SERVICE_JWT_SECRET (HS256, 32+ bytes, operator-set via
-//     the plugin's config.signingKey), MONGO_URI, PORT (default 8080).
+//     the plugin's config.signingKey), STORAGE_* / METADATA_* (archive +
+//     metadata backend selection — see config.go), PORT (default 8080).
 //   - HTTP router:
 //     GET  /healthz                         — unauthenticated, 200
 //     POST /api/v1/tenants/register         — JWT-auth, upsert row
@@ -79,20 +80,14 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	// Slice 1e.4g — archive.Store from env. Operators set
-	// BACKUP_STORAGE_TYPE + the per-backend fields below. For one
-	// release, legacy S3_* env vars are honoured with a deprecation
-	// warning so the fleet's own deployment keeps working during the
-	// migration window (removed in slice 1e.4h).
+	// Slice 1e.4g — archive.Store from env (STORAGE_*).
 	archiveStore, archiveLocation, err := buildArchiveStore(ctx)
 	if err != nil {
 		slog.Error("archive store init failed", "err", err)
 		os.Exit(1)
 	}
 
-	// Slice 1e.4b/4g — meta.Store umbrella. Operators set
-	// BACKUP_METADATA_TYPE + the per-backend fields; legacy MONGO_URI
-	// still implies metadata.type: mongo.
+	// Slice 1e.4b/4g — meta.Store umbrella (METADATA_*).
 	metaStore, err := buildMetaStore(ctx, archiveStore)
 	if err != nil {
 		slog.Error("meta store init failed", "err", err)
@@ -166,13 +161,12 @@ func main() {
 		r.Delete("/api/v1/projects/{name}", projectsCfg.DeleteProject)
 		r.Put("/api/v1/projects/{name}/secret", projectsCfg.SetSecret)
 
-		// Slice 1e.3 — stats endpoints. Data flows from the Mongo-backed
-		// SnapshotStore (if BACKUP_SNAPSHOTS_MONGO_URI set, else the
-		// MONGO_URI default) through the stats aggregator and out as
-		// JSON matching the SPA's ProjectStats/ObjectStats/ObjectHistory
-		// TypeScript types. Snapshot ingestion from the scheduler is a
-		// follow-up slice — in the meantime a clean deploy answers these
-		// routes with empty series.
+		// Slice 1e.3 — stats endpoints. Data flows from
+		// metaStore.Snapshots() through the stats aggregator and out
+		// as JSON matching the SPA's ProjectStats/ObjectStats/
+		// ObjectHistory TypeScript types. Snapshot ingestion from the
+		// scheduler is a follow-up slice — in the meantime a clean
+		// deploy answers these routes with empty series.
 		r.Get("/api/v1/projects/{name}/stats", statsCfg.ProjectStats)
 		r.Get("/api/v1/projects/{name}/stats/objects", statsCfg.ObjectStats)
 		r.Get("/api/v1/projects/{name}/stats/object-history", statsCfg.ObjectHistory)
@@ -230,10 +224,7 @@ func envOr(name, fallback string) string {
 
 // maskMongoURI redacts the password from a mongodb://user:password@host
 // form so a startup log can show the connection target without the
-// credential. Called by worker.go against its BACKUP_TENANT_URI env;
-// main.go's own startup no longer logs a top-level URI as of slice
-// 1e.4g (the legacy-MONGO_URI shim in config.go stays silent about the
-// value).
+// credential. Called by worker.go against its BACKUP_TENANT_URI env.
 func maskMongoURI(uri string) string {
 	if idx := indexAt(uri); idx > 0 {
 		for i := idx - 1; i >= 0; i-- {

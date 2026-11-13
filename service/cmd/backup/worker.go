@@ -51,7 +51,7 @@ import (
 //     preferred, but explicit creds work for smoke + non-AWS object stores)
 //
 // Tenant metadata env keys live under BACKUP_TENANT_* so they can't be
-// confused with the service-mode MONGO_URI / S3_BUCKET env the Lambda
+// confused with the service-mode STORAGE_* / METADATA_* env the Lambda
 // itself uses for its tenant store.
 func runWorker(ctx context.Context) int {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
