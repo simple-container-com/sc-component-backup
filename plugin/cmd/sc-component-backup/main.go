@@ -178,6 +178,29 @@ func (p *backupPlugin) Provision(stdctx context.Context, req *scpluginv1.Provisi
 
 	rctx.Pulumi.Export(fmt.Sprintf("%s-service-url", req.GetResourceName()), sdk.String(serviceURL))
 
+	// Slice 1d.5 PreDestroy cleanup prep: export atlasAdmin + signingKey
+	// to parent stack state. The parent-side PreDestroy hook reads them
+	// from StackOutputs to purge scoped Atlas users consumers minted via
+	// ComputeProcess. Both signingKey and atlasAdmin.* are wrapped in
+	// sdk.ToSecret so the state checkpoint encrypts them + `sc stack
+	// outputs` masks them. Without these exports PreDestroy can't call
+	// the service (needs the signingKey-minted JWT) or Atlas REST (needs
+	// the admin creds), and every smoke leaves orphan Atlas users behind.
+	{
+		raw, rawErr := backupInternal.ComponentRawFromProvisionRequestLocal(req)
+		if rawErr == nil && raw != nil {
+			resName := req.GetResourceName()
+			if _, admin, perr := backupInternal.PopulateDatabasesFromRaw(raw); perr == nil && admin != nil {
+				rctx.Pulumi.Export(resName+"-atlas-admin-public-key", sdk.ToSecret(sdk.String(admin.PublicKey)))
+				rctx.Pulumi.Export(resName+"-atlas-admin-private-key", sdk.ToSecret(sdk.String(admin.PrivateKey)))
+				rctx.Pulumi.Export(resName+"-atlas-admin-project-id", sdk.String(admin.ProjectID))
+			}
+			if sk, ok := raw["signingKey"].(string); ok && sk != "" {
+				rctx.Pulumi.Export(resName+"-signing-key", sdk.ToSecret(sdk.String(sk)))
+			}
+		}
+	}
+
 	// Slice 1c expansion — template-aware compute backend provisioning
 	// (design doc §5.3). When deployTo: lambda, the Lambda's 15-min cap
 	// can't fit a real mongodump — the actual dump runs in an ECS Fargate

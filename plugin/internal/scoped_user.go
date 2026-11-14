@@ -127,6 +127,14 @@ func ScopedUsername(consumerStack string) string {
 	return name
 }
 
+// PopulateDatabasesFromRaw is the exported wrapper over populateDatabasesFromRaw.
+// Used by the plugin's main.go Provision to extract atlasAdmin at parent
+// provision time and export it to stack state for PreDestroy's scoped-user
+// cleanup pass.
+func PopulateDatabasesFromRaw(raw map[string]any) ([]BackupDatabase, *AtlasAdminRef, error) {
+	return populateDatabasesFromRaw(raw)
+}
+
 // populateDatabasesFromRaw extracts the `databases:` + `atlasAdmin:` from
 // a Component's Config.Raw map. Returns nil + empty list if absent (no
 // slice 1d matching to do).
