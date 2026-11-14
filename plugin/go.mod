@@ -10,7 +10,7 @@ require (
 	github.com/pkg/errors v0.9.1
 	github.com/pulumi/pulumi-aws/sdk/v6 v6.83.4
 	github.com/pulumi/pulumi/sdk/v3 v3.245.0
-	github.com/simple-container-com/api v0.0.0-20261114192524-9d11b51a7956
+	github.com/simple-container-com/api v0.0.0-20261114203417-4037e5088568
 	github.com/simple-container-com/sc-component-backup/api v0.0.0
 )
 

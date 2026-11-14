@@ -106,12 +106,12 @@ func (p *backupPlugin) SetBroker(b *hplugin.GRPCBroker) { p.broker = b }
 // so operators who don't write these blocks get the plugin's defaults
 // automatically, while operators who DO write them keep their value.
 //
-// Scope note: everything here is a PURE CONSTANT — no `${name}`,
-// `${env}`, `${parent:…}` tokens yet. Those tokens are added by
-// [[sc-components-defaults-template-interpolation]] in a follow-up;
-// once released, storage.bucket + worker.{cluster,subnetIds,
-// securityGroupIds} get defaults too and the operator config shrinks
-// to almost nothing.
+// Scope note (Tier-2): scalars from Tier-1 + interpolated defaults for
+// `storage.bucket` + `worker.cluster` + `storage.region` via the api's
+// `$$sc:<expr>` sentinel from
+// [[sc-components-defaults-template-interpolation]] (api PR #615).
+// `worker.subnetIds/securityGroupIds` + the whole `atlasAdmin:` block
+// still require follow-ups (parent-output tokens; plugin-peer-invoke).
 //
 // Marshalled once at init time to avoid re-marshalling on every
 // Schema() RPC.
@@ -135,17 +135,24 @@ var componentDefaultsJSON = func() []byte {
 		},
 		// Only colocated is supported today; fleet-wide uniform setting.
 		"metadata": map[string]any{"type": "colocated"},
-		// S3 is the only storage backend on the aws-lambda target
-		// today. Operator still names the bucket + region (follow-up
-		// to default those via interpolation).
-		"storage": map[string]any{"type": "s3"},
-		// Worker scalars — operator still names subnets/SG/cluster
-		// (follow-up to default from parent outputs + name
-		// interpolation).
+		// S3 is the only storage backend on the aws-lambda target. Bucket
+		// name derives from the component resource name + dispatch env;
+		// region defaults from the chosen template's `config.region`.
+		// Operator can override any field — operator wins per-key.
+		"storage": map[string]any{
+			"type":   "s3",
+			"bucket": "$$sc:sc-backup-${name}-archives--${env}",
+			"region": "$$sc:${template.region}",
+		},
+		// Worker shape: scalars fixed; cluster name derives from the
+		// component resource name. subnetIds + securityGroupIds still
+		// need parent-output tokens — unblocked once that follow-up
+		// slice lands.
 		"worker": map[string]any{
 			"cpu":                512,
 			"memoryMB":           2048,
 			"ephemeralStorageGB": 50,
+			"cluster":            "$$sc:sc-backup-${name}-cluster",
 		},
 		// The only `deployTo:` target with a per-plugin dispatch
 		// today. Operator can override to any aws-lambda-shaped
