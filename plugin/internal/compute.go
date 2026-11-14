@@ -112,24 +112,29 @@ func (p *Processor) Process(ctx *sdk.Context, _ api.Stack, input api.ResourceInp
 		Resources: readConsumerResources(input),
 	}
 
-	// Slice 1d scoped-user provisioning (sc-components-platform design doc §5.2).
-	// If the Component config declares `databases:` + `atlasAdmin:` AND the
-	// consumer's sibling outputs include one of those DB resources with a
-	// `-database` (or canonical `database`) key, mint a readWrite-scoped
-	// Atlas user, embed its creds in the tenant record's Resources list, so
-	// the service dumps the consumer's own DB with its own credential.
+	// Slice 1d.7 scoped-user provisioning via COLLECTOR DISCOVERY.
 	//
-	// Pre-slice-1d (no databases: configured): no scoped user is minted,
-	// the Resources list stays empty, and the service dumps nothing until
-	// an operator registers a tenant explicitly via the on-demand API.
-	// This keeps backward compat with today's smoke shape.
+	// Each sibling compute processor the consumer `uses:` emits its own
+	// env vars into the shared collector: sc-plugin-mongodb emits
+	// `MONGO_URI` + `MONGO_DATABASE` (+ `MONGO_USER`, `MONGO_PASSWORD`).
+	// The backup plugin reads those at its own ComputeProcess and mints
+	// a `backup-<consumer-stack>` readWrite-scoped Atlas user on each
+	// discovered database. No operator-side `databases:` config needed.
+	//
+	// Ordering caveat: `uses:` is processed in declaration order; this
+	// only sees env vars emitted by siblings whose compute ran BEFORE
+	// the backup component's. Operators must list `my-backup` LAST in
+	// `uses:` for discovery to work. SC core sorting Component-type
+	// processors last is a separate api follow-up.
 	if raw, ok := extractConfigRaw(input.Descriptor); ok {
-		if scopedRes, err := p.maybeProvisionScopedUser(ctx.Context(), raw, stackName, deps, parentRef); err != nil {
+		scopedResources, err := p.maybeProvisionScopedUsers(ctx.Context(), raw, stackName, collector)
+		if err != nil {
 			return nil, errors.Wrapf(err, "component %q scoped-user provisioning", resName)
-		} else if scopedRes != nil {
-			record.Resources = append(record.Resources, *scopedRes)
+		}
+		for _, r := range scopedResources {
+			record.Resources = append(record.Resources, r)
 			if p.cfg.Progress != nil {
-				p.cfg.Progress.Info("compute-process", fmt.Sprintf("scoped user minted for tenant %q on database %q", stackName, scopedRes.Connection["database"]))
+				p.cfg.Progress.Info("compute-process", fmt.Sprintf("scoped user minted for tenant %q on database %q (discovered via %s)", stackName, r.Connection["database"], r.Connection["driver"]))
 			}
 		}
 	}
@@ -253,143 +258,99 @@ func truncate(s string, limit int) string {
 	return s[:limit] + "…"
 }
 
-// maybeProvisionScopedUser is the slice-1d hook: if the Component config
-// declares `databases:` + `atlasAdmin:` AND the consumer's dependency
-// outputs match one of those DB resources, mint a readWrite-scoped Atlas
-// user and return a TenantResource ready to embed in the push-register
-// payload. Returns (nil, nil) when nothing should happen (backward-compat
-// path).
-func (p *Processor) maybeProvisionScopedUser(
-	ctx context.Context, raw map[string]any, consumerStack string, deps pApi.ResourcesOutputs, parentRef *sdk.StackReference,
-) (*TenantResource, error) {
-	dbs, admin, err := populateDatabasesFromRaw(raw)
+// maybeProvisionScopedUsers is the slice-1d.7 hook: enumerate databases
+// the consumer actually uses (via collector env-var discovery — see
+// `discoverDatabasesFromCollector`), and for each one mint a readWrite-
+// scoped Atlas user. Returns one TenantResource per database.
+//
+// Returns an empty slice when:
+//   - `atlasAdmin:` is not configured on the backup component (operator
+//     opted out of scoped-user minting).
+//   - No sibling compute processor emitted a recognisable DB env (either
+//     the consumer uses no DBs, OR the operator listed `my-backup` before
+//     its DB siblings in `uses:` — in which case discovery sees nothing).
+//
+// Errors are returned verbatim — a failed Atlas call blocks the consumer
+// deploy (per §P3 non-silent-skip rule).
+func (p *Processor) maybeProvisionScopedUsers(
+	ctx context.Context, raw map[string]any, consumerStack string, collector pApi.ComputeContextCollector,
+) ([]TenantResource, error) {
+	admin, err := populateAtlasAdminFromRaw(raw)
 	if err != nil {
-		return nil, errors.Wrap(err, "parse databases/atlasAdmin config")
+		return nil, errors.Wrap(err, "parse atlasAdmin config")
 	}
-	if len(dbs) == 0 {
+
+	discovered := discoverDatabasesFromCollector(collector)
+	if len(discovered) == 0 {
 		return nil, nil
 	}
 
-	resourceName, dbName, matched, err := MatchConsumerToDatabase(deps, dbs, parentRef)
-	if err != nil {
-		return nil, errors.Wrap(err, "match consumer to backup-component databases:")
-	}
-	if matched == nil {
-		return nil, nil
-	}
+	var out []TenantResource
+	for _, db := range discovered {
+		// Only mongodb is wired in slice 1d.7; postgres/mysql follow-ups
+		// add their own scoped-user mint paths once those plugins emit
+		// canonical `POSTGRES_URI` / `MYSQL_URI` env vars.
+		if db.driver != "mongodb" {
+			continue
+		}
+		if db.database == "" {
+			// Discovered a URI but no DB name — the sibling compute
+			// processor didn't emit MONGO_DATABASE (or an operator
+			// override wiped it). Skip rather than mint a user without
+			// a scoped grant.
+			continue
+		}
+		if admin == nil {
+			return nil, errors.Errorf("discovered mongodb consumer use but atlasAdmin not configured on backup component — set `atlasAdmin: { publicKey, privateKey, projectId }` in server.yaml")
+		}
 
-	// Only mongodb is wired in slice 1d; postgres/mysql follow-ups add
-	// their own scoped-user mint paths.
-	if matched.Driver != "mongodb" {
-		return nil, nil
-	}
-	if admin == nil {
-		return nil, errors.Errorf("databases[%q].driver = mongodb but atlasAdmin not configured", resourceName)
-	}
+		username := ScopedUsername(consumerStack)
+		password, err := ProvisionScopedMongoUser(ctx, ScopedUserPolicy{
+			Username:   username,
+			Database:   db.database,
+			AtlasAdmin: *admin,
+		})
+		if err != nil {
+			return nil, errors.Wrapf(err, "provision scoped Atlas user %q for consumer %q on database %q", username, consumerStack, db.database)
+		}
 
-	username := ScopedUsername(consumerStack)
-	password, err := ProvisionScopedMongoUser(ctx, ScopedUserPolicy{
-		Username:   username,
-		Database:   dbName,
-		AtlasAdmin: *admin,
-	})
-	if err != nil {
-		return nil, errors.Wrapf(err, "provision scoped Atlas user %q for consumer %q on database %q", username, consumerStack, dbName)
-	}
+		// Rebuild the URI with the scoped user's creds. The sibling's
+		// URI carries that sibling's OWN user/pass; we swap them for
+		// the just-minted backup-specific user.
+		uri, err := rewriteMongoURICreds(db.uri, username, password)
+		if err != nil {
+			return nil, errors.Wrapf(err, "build scoped mongodb URI for consumer %q", consumerStack)
+		}
 
-	// Build the tenant-resource entry that the backup service will see.
-	// The service's mongodb driver reads connection.uri + .database at
-	// backup-now time. We synthesise a connection string with the
-	// just-minted scoped user's creds. The URI host part is whatever the
-	// consumer's dependency output already carries (so this works
-	// regardless of srv vs standard mongodb:// shapes).
-	uri, err := scopedMongoURI(deps, resourceName, matched.Cluster, username, password, parentRef)
-	if err != nil {
-		return nil, errors.Wrapf(err, "build scoped mongodb URI for consumer %q", consumerStack)
+		out = append(out, TenantResource{
+			Type: "mongodb",
+			Name: consumerStack, // tenant-level name; no sibling-resource-name known from env
+			Connection: map[string]string{
+				"driver":   "mongodb",
+				"uri":      uri,
+				"database": db.database,
+			},
+		})
 	}
-
-	return &TenantResource{
-		Type: "mongodb",
-		Name: resourceName,
-		Connection: map[string]string{
-			"driver":   "mongodb",
-			"uri":      uri,
-			"database": dbName,
-		},
-	}, nil
+	return out, nil
 }
 
-// scopedMongoURI synthesises a mongodb:// URI that embeds the just-minted
-// scoped user's creds. Base URI sources, in order:
-//
-//  1. `deps[resourceName].Outputs[*mongo-uri*]` — typed-deps path, works
-//     once SC core populates `params.ResourceOutputs` on consumer-side
-//     ComputeProcess. Canonical keys (`mongo-uri`/`uri`) tried first,
-//     then suffix-match for sc-plugin-mongodb's `<cluster>-mongo-uri-options`
-//     / `<cluster>-mongo-uri` shape.
-//  2. Parent StackReference GetOutputDetails on
-//     `<clusterHint>-mongo-uri-options` + `<clusterHint>-mongo-uri` —
-//     the working source today (operator provides `cluster:` hint on
-//     the databases entry when the parent's `clusterName:` override
-//     doesn't match the resource name).
-//
-// `cluster` is the operator's hint (defaults to `resourceName` when
-// unset — see populateDatabasesFromRaw).
-func scopedMongoURI(deps pApi.ResourcesOutputs, resourceName, cluster, username, password string, parentRef *sdk.StackReference) (string, error) {
-	var baseURI string
-	// (b) — typed deps.
-	if pro := pluginOutputOf(deps, resourceName); pro != nil {
-		for _, key := range []string{"mongo-uri", "uri"} {
-			if s, ok := stringOutputValue(pro, key); ok {
-				baseURI = s
-				break
-			}
-		}
-		if baseURI == "" {
-			for _, suffix := range []string{"-mongo-uri-options", "-mongo-uri"} {
-				for k, v := range pro.Outputs {
-					if strings.HasSuffix(k, suffix) {
-						if s, ok := v.Value.(string); ok && s != "" {
-							baseURI = s
-							break
-						}
-					}
-				}
-				if baseURI != "" {
-					break
-				}
-			}
-		}
-	}
-	// (a) — StackReference. The operator's `cluster:` hint (or defaulted
-	// `resource:` field) is the prefix sc-plugin-mongodb keys its exports
-	// under.
-	if baseURI == "" && parentRef != nil && cluster != "" {
-		for _, suffix := range []string{"-mongo-uri-options", "-mongo-uri"} {
-			if s, found, err := parentStringOutput(parentRef, cluster+suffix); err != nil {
-				return "", errors.Wrapf(err, "parent lookup for %q%s", cluster, suffix)
-			} else if found && s != "" {
-				baseURI = s
-				break
-			}
-		}
-	}
-	if baseURI == "" {
-		return "", errors.Errorf("no mongo-uri on dependency output %q (cluster hint %q)", resourceName, cluster)
-	}
-	// Insert user:password@ after mongodb:// or mongodb+srv://. If the
-	// base URI already has creds, replace them.
-	u, p := username, password
+// rewriteMongoURICreds swaps the user:pass segment of a mongodb[+srv]://
+// URI with the given credentials. Mirrors the inner body of the old
+// `scopedMongoURI`, decoupled from any sibling-output lookup since the
+// URI is already discovered via the collector.
+func rewriteMongoURICreds(uri, username, password string) (string, error) {
 	for _, prefix := range []string{"mongodb+srv://", "mongodb://"} {
-		if strings.HasPrefix(baseURI, prefix) {
-			rest := strings.TrimPrefix(baseURI, prefix)
-			if idx := strings.Index(rest, "@"); idx >= 0 {
-				rest = rest[idx+1:]
-			}
-			return prefix + u + ":" + p + "@" + rest, nil
+		if !strings.HasPrefix(uri, prefix) {
+			continue
 		}
+		rest := strings.TrimPrefix(uri, prefix)
+		if idx := strings.Index(rest, "@"); idx >= 0 {
+			rest = rest[idx+1:]
+		}
+		return prefix + username + ":" + password + "@" + rest, nil
 	}
-	return "", errors.Errorf("unexpected mongo URI shape: %q", baseURI)
+	return "", errors.Errorf("unexpected mongo URI shape: %q", uri)
 }
 
 // readServiceURL reads the backup component's own service URL. Three

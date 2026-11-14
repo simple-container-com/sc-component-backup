@@ -8,7 +8,6 @@ import (
 	"strings"
 
 	"github.com/pkg/errors"
-	sdk "github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 	"github.com/simple-container-com/api/pkg/api"
 	pApi "github.com/simple-container-com/api/pkg/clouds/pulumi/api"
 
@@ -135,6 +134,49 @@ func PopulateDatabasesFromRaw(raw map[string]any) ([]BackupDatabase, *AtlasAdmin
 	return populateDatabasesFromRaw(raw)
 }
 
+// PopulateAtlasAdminFromRaw is the exported wrapper over
+// populateAtlasAdminFromRaw. Called by main.go Provision to export
+// atlasAdmin to parent state for PreDestroy's scoped-user cleanup pass.
+func PopulateAtlasAdminFromRaw(raw map[string]any) (*AtlasAdminRef, error) {
+	return populateAtlasAdminFromRaw(raw)
+}
+
+// populateAtlasAdminFromRaw extracts just the `atlasAdmin:` block from a
+// Component's Config.Raw map. Returns nil + no error when atlasAdmin is
+// absent (operator opted out of scoped-user minting).
+//
+// Slice 1d.7 splits atlasAdmin extraction out from the legacy
+// `databases:` extraction: discovery is now from collector env vars,
+// not from an operator-authored databases list. The `databases:` block
+// is deprecated but tolerated for one release (populateDatabasesFromRaw
+// stays available and PopulateDatabasesFromRaw's return is still called
+// by main.go's Provision for the atlasAdmin half; the dbs slice is
+// ignored).
+func populateAtlasAdminFromRaw(raw map[string]any) (*AtlasAdminRef, error) {
+	if raw == nil {
+		return nil, nil
+	}
+	v, ok := raw["atlasAdmin"]
+	if !ok || v == nil {
+		return nil, nil
+	}
+	m, ok := v.(map[string]any)
+	if !ok {
+		return nil, errors.Errorf("atlasAdmin: want map, got %T", v)
+	}
+	admin := &AtlasAdminRef{}
+	if s, ok := m["privateKey"].(string); ok {
+		admin.PrivateKey = s
+	}
+	if s, ok := m["publicKey"].(string); ok {
+		admin.PublicKey = s
+	}
+	if s, ok := m["projectId"].(string); ok {
+		admin.ProjectID = s
+	}
+	return admin, nil
+}
+
 // populateDatabasesFromRaw extracts the `databases:` + `atlasAdmin:` from
 // a Component's Config.Raw map. Returns nil + empty list if absent (no
 // slice 1d matching to do).
@@ -196,61 +238,6 @@ func populateDatabasesFromRaw(raw map[string]any) ([]BackupDatabase, *AtlasAdmin
 		}
 	}
 	return dbs, admin, nil
-}
-
-// MatchConsumerToDatabase looks at the consumer's sibling-resource
-// outputs (what SC core packs into ComputeProcessRequest.DependencyOutputsJson
-// and runtime.DependencyOutputsFromComputeProcessRequest unmarshals into
-// `map[resourceName]*api.ResourceOutput` with Ref=*api.PluginResourceOutput)
-// and returns the database name + which component Database entry matched.
-//
-// Shape expected per sibling — sc-plugin-mongodb's exports keyed on a
-// cluster prefix (e.g. `the-mongo-mongo-uri`, `the-mongo-database`):
-//
-//	deps["the-mongo"].Outputs = {
-//	    "<cluster>-mongo-uri":        PluginOutputValue{...},
-//	    "<cluster>-database":         PluginOutputValue{Value: "forge_app"},
-//	    ...
-//	}
-//
-// We don't require the cluster prefix to match the operator's resource
-// name — scan Outputs for any key with the `-database` suffix (plus the
-// unprefixed `database`/`dbName`/`databaseName` for canonical-contract
-// plugins or synthetic test fixtures). Slice 1d.2 adds the `-database`
-// export to sc-plugin-mongodb so this matcher starts seeing a DB name.
-func MatchConsumerToDatabase(deps pApi.ResourcesOutputs, databases []BackupDatabase, parentRef *sdk.StackReference) (resourceName, databaseName string, matched *BackupDatabase, _ error) {
-	if len(databases) == 0 {
-		return "", "", nil, nil
-	}
-	for i := range databases {
-		db := &databases[i]
-		// (b) — typed deps first.
-		if pro := pluginOutputOf(deps, db.Resource); pro != nil {
-			for _, key := range []string{"database", "dbName", "databaseName"} {
-				if s, ok := stringOutputValue(pro, key); ok {
-					return db.Resource, s, db, nil
-				}
-			}
-			for k, v := range pro.Outputs {
-				if strings.HasSuffix(k, "-database") {
-					if s, ok := v.Value.(string); ok && s != "" {
-						return db.Resource, s, db, nil
-					}
-				}
-			}
-		}
-		// (a) — StackReference. The operator's `cluster:` hint (defaults
-		// to `resource:`) is the prefix sc-plugin-mongodb publishes its
-		// `-database` export under.
-		if parentRef != nil && db.Cluster != "" {
-			if s, found, err := parentStringOutput(parentRef, db.Cluster+"-database"); err != nil {
-				return "", "", nil, errors.Wrapf(err, "parent lookup for %q-database", db.Cluster)
-			} else if found && s != "" {
-				return db.Resource, s, db, nil
-			}
-		}
-	}
-	return "", "", nil, nil
 }
 
 // pluginOutputOf returns the *api.PluginResourceOutput for a dep name,

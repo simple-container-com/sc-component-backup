@@ -190,7 +190,7 @@ func (p *backupPlugin) Provision(stdctx context.Context, req *scpluginv1.Provisi
 		raw, rawErr := backupInternal.ComponentRawFromProvisionRequestLocal(req)
 		if rawErr == nil && raw != nil {
 			resName := req.GetResourceName()
-			if _, admin, perr := backupInternal.PopulateDatabasesFromRaw(raw); perr == nil && admin != nil {
+			if admin, perr := backupInternal.PopulateAtlasAdminFromRaw(raw); perr == nil && admin != nil {
 				rctx.Pulumi.Export(resName+"-atlas-admin-public-key", sdk.ToSecret(sdk.String(admin.PublicKey)))
 				rctx.Pulumi.Export(resName+"-atlas-admin-private-key", sdk.ToSecret(sdk.String(admin.PrivateKey)))
 				rctx.Pulumi.Export(resName+"-atlas-admin-project-id", sdk.String(admin.ProjectID))

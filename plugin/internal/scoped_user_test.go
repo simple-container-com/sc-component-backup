@@ -109,111 +109,39 @@ func mkDeps(t *testing.T, m map[string]map[string]any) pApi.ResourcesOutputs {
 	return out
 }
 
-func TestMatchConsumerToDatabase_HappyPath(t *testing.T) {
-	// sc-plugin-mongodb-style exports keyed on the cluster prefix.
-	deps := mkDeps(t, map[string]map[string]any{
-		"the-mongo": {
-			"my-cluster-mongo-uri": "mongodb://host:27017/",
-			"my-cluster-database":  "forge_conductor",
+// Slice 1d.7: populateAtlasAdminFromRaw extracts just the atlasAdmin
+// block. Replaces the three-field return of the old
+// populateDatabasesFromRaw for callers that only need the admin creds.
+func TestPopulateAtlasAdminFromRaw(t *testing.T) {
+	cases := map[string]struct {
+		raw  map[string]any
+		want *AtlasAdminRef
+	}{
+		"absent":  {map[string]any{}, nil},
+		"nil-map": {nil, nil},
+		"present": {
+			map[string]any{"atlasAdmin": map[string]any{
+				"privateKey": "p", "publicKey": "pub", "projectId": "x",
+			}},
+			&AtlasAdminRef{PrivateKey: "p", PublicKey: "pub", ProjectID: "x"},
 		},
-	})
-	databases := []BackupDatabase{
-		{Resource: "the-mongo", Driver: "mongodb"},
 	}
-	resName, dbName, matched, err := MatchConsumerToDatabase(deps, databases, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resName != "the-mongo" || dbName != "forge_conductor" || matched == nil {
-		t.Errorf("got resName=%q dbName=%q matched=%v", resName, dbName, matched)
-	}
-}
-
-func TestMatchConsumerToDatabase_NoConsumerUsage(t *testing.T) {
-	deps := mkDeps(t, map[string]map[string]any{
-		"the-rds": {"driver": "postgres"},
-	})
-	databases := []BackupDatabase{{Resource: "the-mongo", Driver: "mongodb"}}
-	_, _, matched, err := MatchConsumerToDatabase(deps, databases, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if matched != nil {
-		t.Errorf("expected no match, got %v", matched)
-	}
-}
-
-func TestMatchConsumerToDatabase_NoDatabaseField(t *testing.T) {
-	// Sibling resource is there but no database-name key → no match.
-	deps := mkDeps(t, map[string]map[string]any{
-		"the-mongo": {"my-cluster-mongo-uri": "mongodb://h"},
-	})
-	databases := []BackupDatabase{{Resource: "the-mongo", Driver: "mongodb"}}
-	_, _, matched, err := MatchConsumerToDatabase(deps, databases, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if matched != nil {
-		t.Errorf("expected no match, got %v", matched)
-	}
-}
-
-func TestMatchConsumerToDatabase_CanonicalKeys(t *testing.T) {
-	// Exact `database`/`dbName`/`databaseName` for canonical-contract
-	// plugins + synthetic test fixtures.
-	for _, key := range []string{"database", "dbName", "databaseName"} {
-		deps := mkDeps(t, map[string]map[string]any{
-			"the-mongo": {key: "forge_conductor"},
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			got, err := populateAtlasAdminFromRaw(tc.raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if (got == nil) != (tc.want == nil) {
+				t.Fatalf("got=%v want=%v", got, tc.want)
+			}
+			if got != nil && *got != *tc.want {
+				t.Errorf("got=%+v want=%+v", got, tc.want)
+			}
 		})
-		databases := []BackupDatabase{{Resource: "the-mongo", Driver: "mongodb"}}
-		_, dbName, matched, err := MatchConsumerToDatabase(deps, databases, nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if matched == nil || dbName != "forge_conductor" {
-			t.Errorf("key=%q: got dbName=%q matched=%v", key, dbName, matched)
-		}
 	}
 }
 
-func TestMatchConsumerToDatabase_EmptyInputs(t *testing.T) {
-	_, _, matched, err := MatchConsumerToDatabase(nil, []BackupDatabase{{Resource: "x", Driver: "mongodb"}}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if matched != nil {
-		t.Errorf("expected nil match on nil deps, got %v", matched)
-	}
-	_, _, matched, err = MatchConsumerToDatabase(mkDeps(t, nil), nil, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if matched != nil {
-		t.Errorf("expected nil match on nil dbs, got %v", matched)
-	}
-}
-
-// Slice 1d.4-redux: Cluster field defaults to Resource on populate for
-// stacks that don't set `cluster:` explicitly.
-func TestPopulateDatabasesFromRaw_ClusterDefaultsToResource(t *testing.T) {
-	raw := map[string]any{
-		"databases": []any{
-			map[string]any{"resource": "the-mongo", "driver": "mongodb"},
-			map[string]any{"resource": "the-mongo-2", "driver": "mongodb", "cluster": "custom-name"},
-		},
-		"atlasAdmin": map[string]any{"privateKey": "p", "publicKey": "pub", "projectId": "x"},
-	}
-	dbs, _, err := populateDatabasesFromRaw(raw)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(dbs) != 2 {
-		t.Fatalf("count: %d", len(dbs))
-	}
-	if dbs[0].Cluster != "the-mongo" {
-		t.Errorf("default: got %q, want %q", dbs[0].Cluster, "the-mongo")
-	}
-	if dbs[1].Cluster != "custom-name" {
-		t.Errorf("explicit: got %q", dbs[1].Cluster)
-	}
-}
+// Keep mkDeps even though MatchConsumerToDatabase is gone — may be used
+// by future tests for StackReference-based readers.
+var _ = mkDeps
