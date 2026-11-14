@@ -49,6 +49,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"sync"
@@ -99,6 +100,67 @@ func (p *backupPlugin) SetBroker(b *hplugin.GRPCBroker) { p.broker = b }
 // ComponentValidator picks these up at plugin-load time and the sidecar
 // wrapper dispatches `my-backup` resources into the template named by
 // their `config.deployTo:` field.
+// componentDefaultsJSON is the plugin's advertised default `.Raw` for
+// the sc-backup component resource type. SC core deep-merges the
+// operator's declared `.Raw` on top at dispatch time (operator wins),
+// so operators who don't write these blocks get the plugin's defaults
+// automatically, while operators who DO write them keep their value.
+//
+// Scope note: everything here is a PURE CONSTANT — no `${name}`,
+// `${env}`, `${parent:…}` tokens yet. Those tokens are added by
+// [[sc-components-defaults-template-interpolation]] in a follow-up;
+// once released, storage.bucket + worker.{cluster,subnetIds,
+// securityGroupIds} get defaults too and the operator config shrinks
+// to almost nothing.
+//
+// Marshalled once at init time to avoid re-marshalling on every
+// Schema() RPC.
+var componentDefaultsJSON = func() []byte {
+	b, err := json.Marshal(map[string]any{
+		// Lambda routing + the full IAM role list the backup service
+		// needs for its own S3-colocated metadata + ECS-dispatched
+		// backup workers. Dropping these on a stack with
+		// `metadata: colocated` breaks the service's tenant upsert
+		// (500) — live-caught 2026-11-14 on backup-smoke-1d's
+		// minimal-shape smoke; see memory
+		// [[sc_component_auto_discover_requires_withincomingenvvars_opt_in]]
+		// + the scalar-defaults roadmap item.
+		"cloudExtras": map[string]any{
+			"lambdaRoutingType": "function-url",
+			"awsRoles": []string{
+				"s3:PutObject", "s3:GetObject", "s3:ListBucket",
+				"s3:DeleteObject", "s3:AbortMultipartUpload",
+				"ecs:RunTask", "iam:PassRole",
+			},
+		},
+		// Only colocated is supported today; fleet-wide uniform setting.
+		"metadata": map[string]any{"type": "colocated"},
+		// S3 is the only storage backend on the aws-lambda target
+		// today. Operator still names the bucket + region (follow-up
+		// to default those via interpolation).
+		"storage": map[string]any{"type": "s3"},
+		// Worker scalars — operator still names subnets/SG/cluster
+		// (follow-up to default from parent outputs + name
+		// interpolation).
+		"worker": map[string]any{
+			"cpu":                512,
+			"memoryMB":           2048,
+			"ephemeralStorageGB": 50,
+		},
+		// The only `deployTo:` target with a per-plugin dispatch
+		// today. Operator can override to any aws-lambda-shaped
+		// template by name.
+		"deployTo": "lambda",
+	})
+	if err != nil {
+		// Can't return an error from an init-time `var ... = func()()`;
+		// a bad defaults payload would cascade to every Schema() RPC
+		// anyway. Panic so a plugin binary fails fast on load.
+		panic("sc-component-backup: componentDefaultsJSON: " + err.Error())
+	}
+	return b
+}()
+
 func (p *backupPlugin) Schema(_ context.Context, _ *scpluginv1.SchemaRequest) (*scpluginv1.SchemaResponse, error) {
 	return &scpluginv1.SchemaResponse{
 		PluginVersion:         "sc-component-backup-0.0.1",
@@ -114,6 +176,21 @@ func (p *backupPlugin) Schema(_ context.Context, _ *scpluginv1.SchemaRequest) (*
 		VmDrivers: []*scpluginv1.VmDriverSpec{},
 		// Slice 1a (SC Components Platform) — Path A dispatch.
 		ComponentResourceTypes: []string{backupApi.ResourceType},
+		// Slice 1d.6 (ComponentDefaults, api PR #614 → v>=TBD): plugin-
+		// declared defaults SC core merges UNDER the operator's .Raw at
+		// dispatch time (operator wins per-key; see pApi.DeepMergeComponentRaw).
+		// First adoption of the generic mechanism — scalar constants only.
+		// Follow-ups (as each generic layer lands):
+		//   - storage.{bucket,region} + worker.cluster: need
+		//     ${name}/${env}/${template.region} interpolation
+		//     ([[sc-components-defaults-template-interpolation]]).
+		//   - worker.subnetIds/securityGroupIds: need parent-output
+		//     interpolation (same item, parent-output tokens section).
+		//   - atlasAdmin removed entirely: needs peer-invoke RPC
+		//     ([[sc-components-plugin-peer-invoke]]).
+		ComponentDefaults: map[string][]byte{
+			backupApi.ResourceType: componentDefaultsJSON,
+		},
 		ComponentAllowedOverrides: map[string]*scpluginv1.StringList{
 			// cloudExtras added for slice 1c expansion (design doc §5.3):
 			// the backup Component overlays lambdaRoutingType=function-url
