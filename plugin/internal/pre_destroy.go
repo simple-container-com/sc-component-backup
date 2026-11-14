@@ -221,7 +221,14 @@ type listTenantsResp struct {
 
 func fetchTenantsList(ctx context.Context, serviceURL, token string) ([]TenantRecord, error) {
 	target := strings.TrimRight(serviceURL, "/") + "/api/v1/tenants"
-	reqCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	// 60s budget: the Lambda service may be stone-cold after a day
+	// idle, and `sc destroy` is the first HTTPS hit that warms it.
+	// Observed cold-start + TLS + request round-trip: 10-25s. The
+	// earlier 15s timeout tripped on the first 1d.5 validation smoke
+	// (2026-11-14 11:17:20 — context deadline exceeded) and skipped the
+	// scoped-user cleanup entirely. Bigger budget trades a slower
+	// teardown for correctness.
+	reqCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, target, nil)
 	if err != nil {
