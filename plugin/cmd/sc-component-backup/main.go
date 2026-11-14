@@ -329,11 +329,21 @@ func (p *backupPlugin) ComputeProcess(stdctx context.Context, req *scpluginv1.Co
 		Progress: p.progress,
 	})
 
+	// Seed the plugin's collector from `ComputeProcessRequest.compute_env_vars`
+	// (api PR #611, released in api v2026.11.59). SC core's sidecar packs the
+	// shared `ComputeContextCollector` into that field before the RPC fires, so
+	// `processor.Process` sees env vars prior sibling compute processors have
+	// emitted on the same consumer's deploy — `MONGO_URI`/`MONGO_DATABASE` from
+	// the mongodb plugin, in the slice 1d.7 auto-discover path. Without the
+	// option the collector's incoming pool is empty (the default) and
+	// `discoverDatabasesFromCollector` sees nothing, which is what live-caught
+	// the 2026-11-14 backup-smoke-1d run.
 	resp, _, err = runtime.RunComputeProcess(
 		stdctx, rctx,
 		api.Stack{Name: req.GetHeader().GetStackName()}, input,
 		pApi.ProvisionParams{Log: logger.New(), ParentStack: parent, ResourceOutputs: deps},
 		processor.Process,
+		runtime.WithIncomingEnvVars(req),
 	)
 	if err != nil {
 		p.progress.Error("compute-process", err.Error())
