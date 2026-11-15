@@ -35,6 +35,14 @@ type discoveredDB struct {
 	uri      string // mongodb+srv://user:pass@host/?...
 	database string
 	user     string // prior sibling's compute-processor-minted user (not the scoped one)
+	// cluster is the SC resource name of the mongodb/postgres/mysql
+	// sibling (e.g. "the-mongo", "forge-infra-mongo"). Read from the
+	// collector's ComputeEnvVariable.ResourceName field — the mongodb
+	// plugin stamps it on every MONGO_* env var it emits. Used by the
+	// Tier-4 peer-invoke path to route scoped-user mint calls to the
+	// right mongodb cluster (sc-plugin-mongodb's peer handlers look up
+	// Atlas creds by cluster name).
+	cluster string
 }
 
 // discoverDatabasesFromCollector walks the consumer's accumulated env
@@ -54,15 +62,22 @@ type discoveredDB struct {
 // component's README; will go away if SC core starts sorting
 // Component-type processors last (api follow-up).
 func discoverDatabasesFromCollector(collector pApi.ComputeContextCollector) []discoveredDB {
-	// Build a flat name→value map from both plain + secret env lists.
-	// The collector's own AddEnv* methods enforce no-overwrite, so
-	// each name has at most one value here.
+	// Build name→value AND name→resourceName maps from both plain +
+	// secret env lists. The collector's AddEnv* methods enforce
+	// no-overwrite, so each name has at most one value here. We keep a
+	// parallel resourceName map so the Tier-4 peer-invoke mint path can
+	// identify the mongodb cluster by SC resource name (the mongodb
+	// plugin stamps ResourceName on every MONGO_* it emits; see
+	// sc-plugin-mongodb/plugin/internal/compute_proc.go).
 	byName := make(map[string]string, 16)
+	byResource := make(map[string]string, 16)
 	for _, e := range collector.EnvVariables() {
 		byName[e.Name] = e.Value
+		byResource[e.Name] = e.ResourceName
 	}
 	for _, e := range collector.SecretEnvVariables() {
 		byName[e.Name] = e.Value
+		byResource[e.Name] = e.ResourceName
 	}
 
 	var out []discoveredDB
@@ -72,6 +87,7 @@ func discoverDatabasesFromCollector(collector pApi.ComputeContextCollector) []di
 			uri:      uri,
 			database: byName["MONGO_DATABASE"],
 			user:     byName["MONGO_USER"],
+			cluster:  byResource["MONGO_URI"],
 		})
 	}
 	// Follow-ups when the fleet has them:

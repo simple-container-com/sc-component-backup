@@ -227,8 +227,12 @@ func (p *backupPlugin) Schema(_ context.Context, _ *scpluginv1.SchemaRequest) (*
 			// the dispatched service in slice 1e.4g.2.
 			backupApi.ResourceType: {Values: []string{
 				"image", "env", "ingressRoutes", "imagePullSecretRef", "cloudExtras",
-				"worker", "databases", "atlasAdmin",
-				"storage", "metadata", "operatorPassword",
+				"worker", "storage", "metadata", "operatorPassword",
+				// Removed in Tier-4 (sc-components-plugin-peer-invoke):
+				//   - databases: discovery is auto now (slice 1d.7, api v2026.11.59)
+				//   - atlasAdmin: creds live on the mongodb resource;
+				//     scoped-user mint via peer-invoke to that plugin.
+				//     Backup component is driver-agnostic.
 			}},
 		},
 	}, nil
@@ -262,23 +266,21 @@ func (p *backupPlugin) Provision(stdctx context.Context, req *scpluginv1.Provisi
 
 	rctx.Pulumi.Export(fmt.Sprintf("%s-service-url", req.GetResourceName()), sdk.String(serviceURL))
 
-	// Slice 1d.5 PreDestroy cleanup prep: export atlasAdmin + signingKey
-	// to parent stack state. The parent-side PreDestroy hook reads them
-	// from StackOutputs to purge scoped Atlas users consumers minted via
-	// ComputeProcess. Both signingKey and atlasAdmin.* are wrapped in
-	// sdk.ToSecret so the state checkpoint encrypts them + `sc stack
-	// outputs` masks them. Without these exports PreDestroy can't call
-	// the service (needs the signingKey-minted JWT) or Atlas REST (needs
-	// the admin creds), and every smoke leaves orphan Atlas users behind.
+	// PreDestroy cleanup prep: export signingKey to parent stack state
+	// so the parent-side hook can mint a short-TTL JWT to call the
+	// backup service for tenant enumeration. Wrapped in sdk.ToSecret
+	// so the state checkpoint encrypts it + `sc stack outputs` masks.
+	//
+	// Pre-Tier-4 this block also exported atlasAdmin.{public-key,
+	// private-key,project-id} for the plugin's own Atlas REST calls.
+	// Tier-4 removes atlasAdmin from the component config entirely —
+	// scoped-user mint + delete both flow via peer-invoke to the
+	// database-owning plugin (sc-plugin-mongodb for mongodb, etc.).
+	// No driver-specific credentials cross through this plugin.
 	{
 		raw, rawErr := backupInternal.ComponentRawFromProvisionRequestLocal(req)
 		if rawErr == nil && raw != nil {
 			resName := req.GetResourceName()
-			if admin, perr := backupInternal.PopulateAtlasAdminFromRaw(raw); perr == nil && admin != nil {
-				rctx.Pulumi.Export(resName+"-atlas-admin-public-key", sdk.ToSecret(sdk.String(admin.PublicKey)))
-				rctx.Pulumi.Export(resName+"-atlas-admin-private-key", sdk.ToSecret(sdk.String(admin.PrivateKey)))
-				rctx.Pulumi.Export(resName+"-atlas-admin-project-id", sdk.String(admin.ProjectID))
-			}
 			if sk, ok := raw["signingKey"].(string); ok && sk != "" {
 				rctx.Pulumi.Export(resName+"-signing-key", sdk.ToSecret(sdk.String(sk)))
 			}
@@ -409,8 +411,20 @@ func (p *backupPlugin) ComputeProcess(stdctx context.Context, req *scpluginv1.Co
 	}
 	input := runtime.ResourceInputForComputeProcess(req, parent, componentRaw)
 
+	// Tier-4 (sc-components-plugin-peer-invoke) wiring: the mint-scoped-user
+	// path uses sc-plugin-mongodb's peer capability when `atlasAdmin:` is
+	// not configured on the backup component. PeerDialer closes over this
+	// plugin's broker + the ComputeProcessRequest.header so the mint path
+	// can open an SCCore client without reaching back into main.go's
+	// context on each call. Returns a fresh client per call; caller closes.
+	reqHeader := req.GetHeader()
+	peerDialer := func(ctx context.Context) (*scPlugin.PeerClient, error) {
+		return scPlugin.NewPeerClient(ctx, p.broker, reqHeader)
+	}
+
 	processor := backupInternal.NewProcessor(backupInternal.ProcessorConfig{
-		Progress: p.progress,
+		Progress:   p.progress,
+		PeerDialer: peerDialer,
 	})
 
 	// Seed the plugin's collector from `ComputeProcessRequest.compute_env_vars`
@@ -445,7 +459,15 @@ func (p *backupPlugin) ComputeProcess(stdctx context.Context, req *scpluginv1.Co
 // scheduler stops, pending backups flush, S3 writers close. For backup,
 // there is nothing to clean up; log and return.
 func (p *backupPlugin) PreDestroy(ctx context.Context, req *scpluginv1.PreDestroyRequest) (*scpluginv1.PreDestroyResponse, error) {
-	if err := backupInternal.PreDestroy(ctx, p.progress, req); err != nil {
+	// PeerDialer for the scoped-user peer-invoke delete calls. Same
+	// shape as the ComputeProcess wiring — closes over this plugin's
+	// broker + the PreDestroyRequest.header so each per-tenant delete
+	// opens a fresh SCCore client.
+	reqHeader := req.GetHeader()
+	peerDialer := func(ctx context.Context) (*scPlugin.PeerClient, error) {
+		return scPlugin.NewPeerClient(ctx, p.broker, reqHeader)
+	}
+	if err := backupInternal.PreDestroy(ctx, p.progress, req, peerDialer); err != nil {
 		p.progress.Error("pre-destroy", err.Error())
 	}
 	return &scpluginv1.PreDestroyResponse{}, nil
