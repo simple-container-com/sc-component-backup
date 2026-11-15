@@ -36,14 +36,14 @@ import (
 //
 // Errors are LOGGED, NEVER returned. A Lambda destroy may race the Atlas
 // calls, and the teardown should never block on a credential cleanup.
-func PreDestroy(ctx context.Context, publisher *scPlugin.Publisher, req *scpluginv1.PreDestroyRequest) error {
+func PreDestroy(ctx context.Context, publisher *scPlugin.Publisher, req *scpluginv1.PreDestroyRequest, peerDialer func(context.Context) (*scPlugin.PeerClient, error)) error {
 	publisher.Info("pre-destroy", fmt.Sprintf("backup component resource_type=%q stack=%q env=%q",
 		req.GetResourceType(), req.GetHeader().GetStackName(), req.GetHeader().GetEnvironment()))
 
 	outputs := req.GetStackOutputs()
 	publisher.Info("pre-destroy", fmt.Sprintf("stack outputs: %d key(s)", len(outputs)))
 
-	cleanupScopedUsers(ctx, publisher, req)
+	cleanupScopedUsers(ctx, publisher, req, peerDialer)
 
 	return nil
 }
@@ -51,41 +51,58 @@ func PreDestroy(ctx context.Context, publisher *scPlugin.Publisher, req *scplugi
 // cleanupScopedUsers is the best-effort PreDestroy helper. All errors
 // log + swallow — the plugin destroy continues regardless.
 //
-// Inputs come exclusively from StackOutputs (what Provision exported on
-// this component's state). Three keys are mandatory:
+// Inputs come from StackOutputs (what Provision exported on this
+// component's state). Required keys per component prefix:
 //   - `<res>-signing-key`  — minted a short-TTL JWT for the service call.
-//   - `<res>-atlas-admin-{public-key,private-key,project-id}` — Atlas REST auth.
 //   - `<res>-service-url`  — backup service HTTPS endpoint. Falls back to
 //     any `*-function-url` key when the primary value is the pre-slice-1a
 //     placeholder `unset-pre-slice-1a` (matches `readServiceURL`'s cascade).
 //
-// If any are missing, cleanup is a no-op — operators who opt out of
-// `atlasAdmin:` wouldn't want the hook calling Atlas, and the hook has
-// no admin creds to call with anyway.
-func cleanupScopedUsers(ctx context.Context, publisher *scPlugin.Publisher, req *scpluginv1.PreDestroyRequest) {
+// Scoped-user delete flows via peer-invoke to the database-owning plugin
+// (sc-plugin-mongodb for mongodb, etc.) — NO driver-specific knowledge
+// in this plugin. Each tenant.Record.Resources entry carries its driver
+// + cluster name; PreDestroy routes delete calls by driver.
+//
+// LIMITATION: the database-owning plugin's cred-cache is populated at
+// ComputeProcess time (consumer deploys), not at PreDestroy time
+// (parent-stack destroys). So isolated-backup-destroy (operator removes
+// `my-backup` while mongodb cluster stays) will hit cache-miss errors
+// from the owning plugin's handler, orphaning scoped users. The cleanup
+// loop logs + swallows those errors. Parent-stack destroy is fine —
+// mongodb cluster is destroyed concurrently, carrying its users with it.
+//
+// Full fix tracked under
+// sc-components-plugin-peer-invoke.md's "Follow-ups" section:
+// mongodb plugin exports its Atlas creds to parent state; its
+// PluginInvoke handler reads via StackReference on cache-miss.
+func cleanupScopedUsers(ctx context.Context, publisher *scPlugin.Publisher, req *scpluginv1.PreDestroyRequest, peerDialer func(context.Context) (*scPlugin.PeerClient, error)) {
 	outputs := req.GetStackOutputs()
 
-	// PreDestroyRequest has no resource_name field (api/pkg/plugin/proto/v1
-	// :2923), so the per-component prefix is discovered from stack output
-	// keys: any `<prefix>-atlas-admin-public-key` is a component Provision
-	// exported for cleanup. Operators who have multiple sc-backup components
-	// in one stack get each cleaned in turn.
+	// PreDestroyRequest has no resource_name field so the per-component
+	// prefix is discovered from stack-output signing-key keys: any
+	// `<prefix>-signing-key` is a backup component Provision exported.
 	prefixes := discoverComponentPrefixes(outputs)
 	if len(prefixes) == 0 {
-		publisher.Info("pre-destroy", "scoped-user cleanup skipped: no `-atlas-admin-public-key` export in stack outputs (expected on non-slice-1d stacks)")
+		publisher.Info("pre-destroy", "scoped-user cleanup skipped: no `-signing-key` export in stack outputs (expected on non-slice-1d stacks)")
+		return
+	}
+	if peerDialer == nil {
+		publisher.Info("pre-destroy", "scoped-user cleanup skipped: PeerDialer not wired on this plugin binary")
 		return
 	}
 
 	for _, resName := range prefixes {
 		publisher.Info("pre-destroy", fmt.Sprintf("scoped-user cleanup for component %q", resName))
-		cleanupOneComponent(ctx, publisher, resName, outputs)
+		cleanupOneComponent(ctx, publisher, resName, outputs, peerDialer)
 	}
 }
 
 // discoverComponentPrefixes returns every unique `<prefix>` where
-// `<prefix>-atlas-admin-public-key` appears in StackOutputs.
+// `<prefix>-signing-key` appears in StackOutputs — one per backup
+// component in the stack. Signing-key is always exported by Provision
+// (slice 1d.5) regardless of config, so it's a reliable discriminator.
 func discoverComponentPrefixes(outputs map[string][]byte) []string {
-	const suffix = "-atlas-admin-public-key"
+	const suffix = "-signing-key"
 	var out []string
 	for k := range outputs {
 		if strings.HasSuffix(k, suffix) {
@@ -95,11 +112,12 @@ func discoverComponentPrefixes(outputs map[string][]byte) []string {
 	return out
 }
 
-// cleanupOneComponent runs the Atlas-REST purge for one `<prefix>`.
-func cleanupOneComponent(ctx context.Context, publisher *scPlugin.Publisher, resName string, outputs map[string][]byte) {
-	publicKey := readStackOutputString(outputs, resName+"-atlas-admin-public-key")
-	privateKey := readStackOutputString(outputs, resName+"-atlas-admin-private-key")
-	projectID := readStackOutputString(outputs, resName+"-atlas-admin-project-id")
+// cleanupOneComponent runs the peer-invoke scoped-user purge for one
+// `<prefix>`. Enumerates tenants via the service, then for each tenant
+// resource issues a peer.PluginInvoke(<owning-plugin>, "delete-scoped-user",
+// {cluster, username}). All failures swallow; orphan users are a
+// documented limitation (see cleanupScopedUsers header).
+func cleanupOneComponent(ctx context.Context, publisher *scPlugin.Publisher, resName string, outputs map[string][]byte, peerDialer func(context.Context) (*scPlugin.PeerClient, error)) {
 	signingKey := readStackOutputString(outputs, resName+"-signing-key")
 	serviceURL := readStackOutputString(outputs, resName+"-service-url")
 
@@ -107,8 +125,8 @@ func cleanupOneComponent(ctx context.Context, publisher *scPlugin.Publisher, res
 		serviceURL = scanForFunctionURL(outputs)
 	}
 
-	if publicKey == "" || privateKey == "" || projectID == "" || signingKey == "" || isUnsetServiceURL(serviceURL) {
-		publisher.Info("pre-destroy", fmt.Sprintf("component %q cleanup skipped: missing admin/signingKey/serviceURL", resName))
+	if signingKey == "" || isUnsetServiceURL(serviceURL) {
+		publisher.Info("pre-destroy", fmt.Sprintf("component %q cleanup skipped: missing signingKey/serviceURL", resName))
 		return
 	}
 
@@ -124,22 +142,39 @@ func cleanupOneComponent(ctx context.Context, publisher *scPlugin.Publisher, res
 		return
 	}
 
-	admin := AtlasAdminRef{PublicKey: publicKey, PrivateKey: privateKey, ProjectID: projectID}
+	peer, err := peerDialer(ctx)
+	if err != nil {
+		publisher.Warn("pre-destroy", fmt.Sprintf("component %q: peer-dial SCCore: %v — swallowed", resName, err))
+		return
+	}
+	defer peer.Close()
+
 	deleted := 0
 	for _, t := range tenants {
 		for _, r := range t.Resources {
-			if r.Connection["driver"] != "mongodb" {
+			driver := r.Connection["driver"]
+			cluster := r.Connection["cluster"]
+			if _, known := PluginForDriver(driver); !known {
 				continue
 			}
 			username := extractUsernameFromMongoURI(r.Connection["uri"])
-			if !strings.HasPrefix(username, "backup-") {
+			if !strings.HasPrefix(username, "backup-") && !strings.HasPrefix(username, "sc-component-backup-") && !strings.HasPrefix(username, "peer-") {
+				// Not one we minted (legacy stacks may have different
+				// prefixes); skip.
 				continue
 			}
-			if dErr := DeleteScopedMongoUser(ctx, admin, username); dErr != nil {
-				publisher.Warn("pre-destroy", fmt.Sprintf("component %q: delete %q: %v — swallowed", resName, username, dErr))
+			if cluster == "" {
+				// Tenants registered pre-Tier-4 don't carry cluster
+				// on their connection map; we have no way to route
+				// the delete peer-invoke. Log + skip.
+				publisher.Warn("pre-destroy", fmt.Sprintf("component %q: tenant %q has no cluster recorded; skipping delete of %q", resName, t.StackName, username))
 				continue
 			}
-			publisher.Info("pre-destroy", fmt.Sprintf("component %q: deleted scoped Atlas user %q", resName, username))
+			if dErr := DeleteScopedUser(ctx, peer, driver, cluster, username); dErr != nil {
+				publisher.Warn("pre-destroy", fmt.Sprintf("component %q: peer-invoke delete %q on %s cluster %q: %v — swallowed (owning plugin's cred-cache likely empty at parent-destroy; orphan user remains for isolated-destroy case — see sc-components-plugin-peer-invoke follow-ups)", resName, username, driver, cluster, dErr))
+				continue
+			}
+			publisher.Info("pre-destroy", fmt.Sprintf("component %q: deleted scoped %s user %q via peer-invoke", resName, driver, username))
 			deleted++
 		}
 	}

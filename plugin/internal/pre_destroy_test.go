@@ -23,13 +23,15 @@ func TestPreDestroy_FireAndForget(t *testing.T) {
 		ResourceType: "sc-backup",
 	}
 
-	err := PreDestroy(t.Context(), pub, req)
+	err := PreDestroy(t.Context(), pub, req, nil)
 	Expect(err).ToNot(HaveOccurred())
 }
 
-// Slice 1d.5: discoverComponentPrefixes walks stack outputs for every
-// `<prefix>-atlas-admin-public-key` key. Covers single + multi-component
-// stacks + the no-opt-in degraded path.
+// Tier-4: discoverComponentPrefixes walks stack outputs for every
+// `<prefix>-signing-key` key. Covers single + multi-component stacks
+// + the no-opt-in degraded path. Signing-key replaces the former
+// atlas-admin-public-key discriminator — atlasAdmin is no longer
+// exported by this plugin (creds live on the mongodb resource).
 func TestDiscoverComponentPrefixes(t *testing.T) {
 	cases := []struct {
 		name string
@@ -37,18 +39,17 @@ func TestDiscoverComponentPrefixes(t *testing.T) {
 		want int
 	}{
 		{"empty", map[string][]byte{}, 0},
-		{"non-slice-1d stack (no atlasAdmin export)", map[string][]byte{
+		{"non-slice-1d stack (no signing-key export)", map[string][]byte{
 			"my-backup-service-url": []byte(`"https://x"`),
 		}, 0},
 		{"single component", map[string][]byte{
-			"my-backup-atlas-admin-public-key":  []byte(`"pub"`),
-			"my-backup-atlas-admin-private-key": []byte(`"priv"`),
-			"my-backup-service-url":             []byte(`"https://x"`),
+			"my-backup-signing-key": []byte(`"sk"`),
+			"my-backup-service-url": []byte(`"https://x"`),
 		}, 1},
 		{"two components", map[string][]byte{
-			"my-backup-atlas-admin-public-key": []byte(`"pub"`),
-			"my-other-atlas-admin-public-key":  []byte(`"pub2"`),
-			"my-backup-service-url":            []byte(`"https://x"`),
+			"my-backup-signing-key": []byte(`"sk1"`),
+			"my-other-signing-key":  []byte(`"sk2"`),
+			"my-backup-service-url": []byte(`"https://x"`),
 		}, 2},
 	}
 	for _, tc := range cases {

@@ -48,6 +48,15 @@ var backoffSeconds = []int{1, 2, 4}
 type ProcessorConfig struct {
 	Progress   *scPlugin.Publisher
 	HTTPClient *http.Client // nil → use default
+
+	// PeerDialer opens a PeerClient to SC core's SCCore endpoint.
+	// Supplied by main.go, which closes over the plugin's GRPC
+	// broker + receives the current ComputeProcessRequest.header at
+	// call time. REQUIRED — scoped-user mint happens exclusively via
+	// peer-invoke to the database-owning plugin (sc-plugin-mongodb
+	// for mongodb, etc.). A nil dialer disables scoped-user mint;
+	// provisionScopedUsers returns an error naming the gap.
+	PeerDialer func(ctx context.Context) (*scPlugin.PeerClient, error)
 }
 
 // Processor is the ComputeProcessor for a `uses: [my-backup]` consumer.
@@ -112,30 +121,31 @@ func (p *Processor) Process(ctx *sdk.Context, _ api.Stack, input api.ResourceInp
 		Resources: readConsumerResources(input),
 	}
 
-	// Slice 1d.7 scoped-user provisioning via COLLECTOR DISCOVERY.
+	// Scoped-user provisioning via peer-invoke to the database-owning
+	// plugin. Driver-agnostic: backup discovers DB siblings via env
+	// vars (slice 1d.7); each driver maps to its owning plugin's name
+	// (see driverPlugins in scoped_user.go); mint is a peer.PluginInvoke
+	// call to that plugin's `mint-scoped-user` capability (api
+	// v2026.11.63+, Tier-4 of sc-components-backup-scalar-defaults).
 	//
-	// Each sibling compute processor the consumer `uses:` emits its own
-	// env vars into the shared collector: sc-plugin-mongodb emits
-	// `MONGO_URI` + `MONGO_DATABASE` (+ `MONGO_USER`, `MONGO_PASSWORD`).
-	// The backup plugin reads those at its own ComputeProcess and mints
-	// a `backup-<consumer-stack>` readWrite-scoped Atlas user on each
-	// discovered database. No operator-side `databases:` config needed.
+	// No Atlas-specific knowledge in this plugin — operator writes NO
+	// `atlasAdmin:` block. Credentials live on the mongodb resource;
+	// the mongodb plugin uses them to mint via its own ComputeProcess-
+	// stashed cache.
 	//
 	// Ordering caveat: `uses:` is processed in declaration order; this
 	// only sees env vars emitted by siblings whose compute ran BEFORE
 	// the backup component's. Operators must list `my-backup` LAST in
 	// `uses:` for discovery to work. SC core sorting Component-type
 	// processors last is a separate api follow-up.
-	if raw, ok := extractConfigRaw(input.Descriptor); ok {
-		scopedResources, err := p.maybeProvisionScopedUsers(ctx.Context(), raw, stackName, collector)
-		if err != nil {
-			return nil, errors.Wrapf(err, "component %q scoped-user provisioning", resName)
-		}
-		for _, r := range scopedResources {
-			record.Resources = append(record.Resources, r)
-			if p.cfg.Progress != nil {
-				p.cfg.Progress.Info("compute-process", fmt.Sprintf("scoped user minted for tenant %q on database %q (discovered via %s)", stackName, r.Connection["database"], r.Connection["driver"]))
-			}
+	scopedResources, err := p.provisionScopedUsers(ctx.Context(), stackName, collector)
+	if err != nil {
+		return nil, errors.Wrapf(err, "component %q scoped-user provisioning", resName)
+	}
+	for _, r := range scopedResources {
+		record.Resources = append(record.Resources, r)
+		if p.cfg.Progress != nil {
+			p.cfg.Progress.Info("compute-process", fmt.Sprintf("scoped user minted for tenant %q on database %q (discovered via %s)", stackName, r.Connection["database"], r.Connection["driver"]))
 		}
 	}
 
@@ -258,77 +268,99 @@ func truncate(s string, limit int) string {
 	return s[:limit] + "…"
 }
 
-// maybeProvisionScopedUsers is the slice-1d.7 hook: enumerate databases
-// the consumer actually uses (via collector env-var discovery — see
-// `discoverDatabasesFromCollector`), and for each one mint a readWrite-
-// scoped Atlas user. Returns one TenantResource per database.
+// provisionScopedUsers is the slice-1d.7 + Tier-4 hook: enumerate
+// databases the consumer actually uses (via collector env-var
+// discovery — see `discoverDatabasesFromCollector`), and for each
+// one call the OWNING plugin's `mint-scoped-user` capability via
+// peer-invoke. Returns one TenantResource per database.
 //
-// Returns an empty slice when:
-//   - `atlasAdmin:` is not configured on the backup component (operator
-//     opted out of scoped-user minting).
-//   - No sibling compute processor emitted a recognisable DB env (either
-//     the consumer uses no DBs, OR the operator listed `my-backup` before
-//     its DB siblings in `uses:` — in which case discovery sees nothing).
+// Driver-agnostic by design: backup plugin knows nothing about
+// Atlas / RDS / etc. The mint logic lives in each database plugin.
+// `PluginForDriver` maps a discovered driver to the SC plugin name
+// (sc-plugin-mongodb for mongodb; future sc-plugin-postgres, etc.).
 //
-// Errors are returned verbatim — a failed Atlas call blocks the consumer
-// deploy (per §P3 non-silent-skip rule).
-func (p *Processor) maybeProvisionScopedUsers(
-	ctx context.Context, raw map[string]any, consumerStack string, collector pApi.ComputeContextCollector,
+// Returns an empty slice when discovery finds no DB siblings —
+// either the consumer uses no DBs, OR the operator listed
+// `my-backup` before its DB siblings in `uses:` (discovery sees
+// nothing then — documented ordering caveat).
+//
+// Errors are returned verbatim — a failed peer-invoke blocks the
+// consumer deploy (per §P3 non-silent-skip rule) so the operator
+// sees the exact failure.
+func (p *Processor) provisionScopedUsers(
+	ctx context.Context, consumerStack string, collector pApi.ComputeContextCollector,
 ) ([]TenantResource, error) {
-	admin, err := populateAtlasAdminFromRaw(raw)
-	if err != nil {
-		return nil, errors.Wrap(err, "parse atlasAdmin config")
-	}
-
 	discovered := discoverDatabasesFromCollector(collector)
 	if len(discovered) == 0 {
 		return nil, nil
 	}
 
+	if p.cfg.PeerDialer == nil {
+		return nil, errors.New("provisionScopedUsers: PeerDialer not wired on this backup plugin — rebuild against a binary that wires scPlugin.NewPeerClient in main.go")
+	}
+
+	peer, err := p.cfg.PeerDialer(ctx)
+	if err != nil {
+		return nil, errors.Wrap(err, "peer-dial SCCore")
+	}
+	defer peer.Close()
+
 	var out []TenantResource
 	for _, db := range discovered {
-		// Only mongodb is wired in slice 1d.7; postgres/mysql follow-ups
-		// add their own scoped-user mint paths once those plugins emit
-		// canonical `POSTGRES_URI` / `MYSQL_URI` env vars.
-		if db.driver != "mongodb" {
+		if _, known := PluginForDriver(db.driver); !known {
+			// Driver not wired to a plugin name. Skip rather than
+			// error — allows future drivers to be added without
+			// breaking existing stacks.
+			if p.cfg.Progress != nil {
+				p.cfg.Progress.Warn("compute-process", fmt.Sprintf("discovered driver %q has no plugin wired on this backup binary; skipping scoped-user mint (known drivers: %v)", db.driver, knownDrivers()))
+			}
 			continue
 		}
 		if db.database == "" {
 			// Discovered a URI but no DB name — the sibling compute
-			// processor didn't emit MONGO_DATABASE (or an operator
-			// override wiped it). Skip rather than mint a user without
-			// a scoped grant.
+			// processor didn't emit the matching _DATABASE env (or
+			// an operator override wiped it). Skip rather than mint
+			// a user without a scoped grant.
 			continue
 		}
-		if admin == nil {
-			return nil, errors.Errorf("discovered mongodb consumer use but atlasAdmin not configured on backup component — set `atlasAdmin: { publicKey, privateKey, projectId }` in server.yaml")
+		if db.cluster == "" {
+			// Owning plugin didn't stamp ResourceName on the env
+			// var (older plugin version). Required for peer-invoke
+			// to route to the right cluster.
+			return nil, errors.Errorf("component %q: discovered %s driver but no ResourceName on %s_URI — upgrade sc-plugin-%s so its ComputeProcessor stamps the cluster name on emits", consumerStack, db.driver, db.driver, db.driver)
 		}
 
-		username := ScopedUsername(consumerStack)
-		password, err := ProvisionScopedMongoUser(ctx, ScopedUserPolicy{
-			Username:   username,
-			Database:   db.database,
-			AtlasAdmin: *admin,
-		})
+		result, err := MintScopedUser(ctx, peer, db.driver, db.cluster, db.database, consumerStack)
 		if err != nil {
-			return nil, errors.Wrapf(err, "provision scoped Atlas user %q for consumer %q on database %q", username, consumerStack, db.database)
+			return nil, errors.Wrapf(err, "component %q: mint scoped user via peer-invoke for %s cluster %q database %q", consumerStack, db.driver, db.cluster, db.database)
 		}
 
-		// Rebuild the URI with the scoped user's creds. The sibling's
-		// URI carries that sibling's OWN user/pass; we swap them for
-		// the just-minted backup-specific user.
-		uri, err := rewriteMongoURICreds(db.uri, username, password)
-		if err != nil {
-			return nil, errors.Wrapf(err, "build scoped mongodb URI for consumer %q", consumerStack)
+		// Prefer the owning plugin's woven URI; fall back to
+		// rewriting the discovered URI locally if the plugin
+		// returned an empty URI (defensive — current mongodb
+		// weaver emits a non-empty one, but a future plugin
+		// might differ).
+		uri := result.URI
+		if uri == "" {
+			var rewriteErr error
+			uri, rewriteErr = rewriteMongoURICreds(db.uri, result.Username, result.Password)
+			if rewriteErr != nil {
+				return nil, errors.Wrapf(rewriteErr, "component %q: weave scoped creds into URI", consumerStack)
+			}
 		}
 
 		out = append(out, TenantResource{
-			Type: "mongodb",
-			Name: consumerStack, // tenant-level name; no sibling-resource-name known from env
+			Type: db.driver,
+			Name: consumerStack,
 			Connection: map[string]string{
-				"driver":   "mongodb",
+				"driver":   db.driver,
 				"uri":      uri,
 				"database": db.database,
+				// Record the cluster + plugin for PreDestroy's
+				// peer-invoke delete — PreDestroy has no access to
+				// the compute collector so it must read these from
+				// tenant state.
+				"cluster": db.cluster,
 			},
 		})
 	}

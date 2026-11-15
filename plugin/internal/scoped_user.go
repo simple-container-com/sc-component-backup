@@ -5,243 +5,138 @@ package backup
 
 import (
 	"context"
-	"strings"
+	"encoding/json"
 
 	"github.com/pkg/errors"
 	"github.com/simple-container-com/api/pkg/api"
 	pApi "github.com/simple-container-com/api/pkg/clouds/pulumi/api"
-
-	"github.com/simple-container-com/sc-component-backup/plugin/internal/atlas"
+	scPlugin "github.com/simple-container-com/api/pkg/plugin"
 )
 
-// Slice 1d scoped-user provisioning (sc-components-platform design doc §5.2).
+// Scoped-user provisioning via cross-plugin peer-invoke
+// (sc-components-plugin-peer-invoke, api v2026.11.63+). This plugin
+// stays driver-agnostic — it never calls Atlas REST (or any other
+// DB admin API) directly. The database-owning plugin advertises
+// capabilities it then handles with ITS OWN credentials:
 //
-// When a consumer `uses: [the-backup, the-mongo]`, sc-plugin-backup's
-// ComputeProcess calls Atlas REST (with the operator-supplied admin
-// credential from `config.atlasAdmin:`) to mint `backup-<consumer-stack>`
-// with `readWrite` on the consumer's specific DB. The scoped user is
-// deleted when the consumer's `sc destroy` fires PreDestroy on the
-// backup resource.
-
-// BackupDatabase mirrors the api.BackupDatabase shape without taking a
-// dependency on the api/ module from the plugin's compute path (which
-// stays plugin-bus-shape). populateDatabasesFromRaw extracts it from
-// the ComponentRaw map.
+//   - sc-plugin-mongodb: mint-scoped-user, delete-scoped-user.
+//     Requires sc-plugin-mongodb >= v2026.11.15-5705452.
+//   - future sc-plugin-postgres: same capability names, different
+//     plugin owner. Same contract.
 //
-// `Cluster` is an operator-provided hint matching the Atlas cluster
-// name the sibling sc-plugin-mongodb resource publishes its exports
-// under (e.g. "backup-smoke-1d-20261114"). It defaults to `Resource`
-// when unset — sufficient for stacks that let sc-plugin-mongodb
-// auto-name. Operators who set `clusterName:` on the Mongo resource
-// (typical for `adopt: true`) must set this to the override value so
-// the plugin can read `<cluster>-database` / `<cluster>-mongo-uri-options`
-// from the parent stack's exports. Added 2026-11-14 when the live 1d
-// smoke found params.ResourceOutputs is empty on consumer-side
-// ComputeProcess and the plugin has to fall back to
-// `sdk.NewStackReference` (the sc-plugin-mongodb precedent).
-type BackupDatabase struct {
-	Resource string
-	Driver   string
-	Cluster  string
+// Driver → plugin name convention: the driver string the mongodb
+// plugin stamps on MONGO_URI (via collector.AddSecretEnvVariableIfNotExist)
+// matches the plugin's SC name. "mongodb" → the mongodb plugin.
+// Registered in `driverPlugins` below; keep in sync with each
+// database plugin's advertised SchemaResponse.plugin_name.
+
+// driverPlugins maps a discovered driver name to the SC plugin name
+// that owns scoped-user minting for it. Centralised here so new
+// database plugins land as a one-line addition — not scattered
+// capability-call sites.
+var driverPlugins = map[string]string{
+	"mongodb": "mongodb",
+	// Future:
+	// "postgres": "postgres",
+	// "mysql":    "mysql",
 }
 
-// AtlasAdminRef mirrors api.BackupAtlasAdmin similarly.
-type AtlasAdminRef struct {
-	PrivateKey string
-	PublicKey  string
-	ProjectID  string
+// PluginForDriver returns the SC plugin name that owns scoped-user
+// minting for the given driver string. Returns ok=false for an
+// unmapped driver — caller should surface a clear error naming the
+// unmapped driver.
+func PluginForDriver(driver string) (string, bool) {
+	p, ok := driverPlugins[driver]
+	return p, ok
 }
 
-// ScopedUserPolicy is what ComputeProcess builds from the component config
-// + the consumer's dependency outputs before calling Atlas REST.
-type ScopedUserPolicy struct {
-	// Username is the scoped user to create ("backup-<consumer-stack>").
-	Username string
-	// Database is the target DB to grant readWrite on (the consumer's own
-	// database, read from the consumer's dependency outputs).
-	Database string
-	// AtlasAdmin is the admin creds to call CreateDatabaseUser with.
-	AtlasAdmin AtlasAdminRef
+// MintScopedUserResult is the deserialised reply from a successful
+// peer-invoke mint call. Shape matches every database plugin's
+// `mint-scoped-user` capability contract (currently only mongodb
+// implements; future postgres/mysql follow the same shape).
+type MintScopedUserResult struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+	// URI carries the scoped user's connection URI — the database
+	// plugin weaves the fresh creds into the cluster's host string.
+	URI string `json:"uri"`
 }
 
-// ProvisionScopedMongoUser creates (or re-creates) a scoped Atlas user
-// per the policy + returns the generated password so the caller can
-// embed it in the tenant record pushed to the backup service.
+// MintScopedUser asks the driver's owning plugin to create a scoped
+// readWrite user. Returns the minted username/password/URI the caller
+// embeds in the tenant.Record.Resources entry.
 //
-// Idempotency: if Atlas returns 409 (user already exists), we delete +
-// retry once. The scoped user is owned by this backup component for this
-// consumer — nothing else should be minting the same name.
-func ProvisionScopedMongoUser(ctx context.Context, pol ScopedUserPolicy) (password string, err error) {
-	if pol.Username == "" || pol.Database == "" {
-		return "", errors.Errorf("ProvisionScopedMongoUser: Username and Database are required (got %q, %q)", pol.Username, pol.Database)
-	}
-	if pol.AtlasAdmin.PrivateKey == "" || pol.AtlasAdmin.PublicKey == "" || pol.AtlasAdmin.ProjectID == "" {
-		return "", errors.Errorf("ProvisionScopedMongoUser: AtlasAdmin.{PrivateKey,PublicKey,ProjectID} all required")
-	}
-
-	cl := atlas.NewClient(pol.AtlasAdmin.PublicKey, pol.AtlasAdmin.PrivateKey)
-	user := atlas.DatabaseUser{
-		Username: pol.Username,
-		Roles: []atlas.Role{
-			{DatabaseName: pol.Database, RoleName: "readWrite"},
-		},
-	}
-	created, err := cl.CreateDatabaseUser(ctx, pol.AtlasAdmin.ProjectID, user)
-	if err == nil {
-		return created.Password, nil
-	}
-	// 409 = already exists → delete + retry once for idempotency.
-	if !strings.Contains(err.Error(), "HTTP 409") {
-		return "", err
-	}
-	if delErr := cl.DeleteDatabaseUser(ctx, pol.AtlasAdmin.ProjectID, pol.Username, "admin"); delErr != nil {
-		return "", errors.Wrapf(err, "409 on create and delete-for-retry also failed: %v", delErr)
-	}
-	created, err = cl.CreateDatabaseUser(ctx, pol.AtlasAdmin.ProjectID, user)
-	if err != nil {
-		return "", errors.Wrap(err, "retry-after-409 failed")
-	}
-	return created.Password, nil
-}
-
-// DeleteScopedMongoUser removes a scoped user from Atlas. Idempotent
-// (404 is nil). Called from PreDestroy on the consumer's teardown.
-func DeleteScopedMongoUser(ctx context.Context, admin AtlasAdminRef, username string) error {
-	if admin.PrivateKey == "" || admin.PublicKey == "" || admin.ProjectID == "" {
-		return errors.Errorf("DeleteScopedMongoUser: AtlasAdmin.{PrivateKey,PublicKey,ProjectID} all required")
-	}
-	cl := atlas.NewClient(admin.PublicKey, admin.PrivateKey)
-	return cl.DeleteDatabaseUser(ctx, admin.ProjectID, username, "admin")
-}
-
-// ScopedUsername returns the deterministic name for a (component, consumer)
-// scoped user. Atlas usernames are limited in character set; the consumer
-// stack name may contain hyphens/underscores already — which Atlas accepts.
-// Cap at 64 chars (Atlas limit).
-func ScopedUsername(consumerStack string) string {
-	name := "backup-" + consumerStack
-	if len(name) > 64 {
-		name = name[:64]
-	}
-	return name
-}
-
-// PopulateDatabasesFromRaw is the exported wrapper over populateDatabasesFromRaw.
-// Used by the plugin's main.go Provision to extract atlasAdmin at parent
-// provision time and export it to stack state for PreDestroy's scoped-user
-// cleanup pass.
-func PopulateDatabasesFromRaw(raw map[string]any) ([]BackupDatabase, *AtlasAdminRef, error) {
-	return populateDatabasesFromRaw(raw)
-}
-
-// PopulateAtlasAdminFromRaw is the exported wrapper over
-// populateAtlasAdminFromRaw. Called by main.go Provision to export
-// atlasAdmin to parent state for PreDestroy's scoped-user cleanup pass.
-func PopulateAtlasAdminFromRaw(raw map[string]any) (*AtlasAdminRef, error) {
-	return populateAtlasAdminFromRaw(raw)
-}
-
-// populateAtlasAdminFromRaw extracts just the `atlasAdmin:` block from a
-// Component's Config.Raw map. Returns nil + no error when atlasAdmin is
-// absent (operator opted out of scoped-user minting).
-//
-// Slice 1d.7 splits atlasAdmin extraction out from the legacy
-// `databases:` extraction: discovery is now from collector env vars,
-// not from an operator-authored databases list. The `databases:` block
-// is deprecated but tolerated for one release (populateDatabasesFromRaw
-// stays available and PopulateDatabasesFromRaw's return is still called
-// by main.go's Provision for the atlasAdmin half; the dbs slice is
-// ignored).
-func populateAtlasAdminFromRaw(raw map[string]any) (*AtlasAdminRef, error) {
-	if raw == nil {
-		return nil, nil
-	}
-	v, ok := raw["atlasAdmin"]
-	if !ok || v == nil {
-		return nil, nil
-	}
-	m, ok := v.(map[string]any)
+// The call fans out via SC core's broker — the owning plugin reads
+// its OWN admin credential (operator-configured on the mongodb/
+// postgres/mysql resource) and never crosses it back onto the wire.
+// This is the whole architectural point: backup is generic, each
+// database plugin keeps ownership of its own creds.
+func MintScopedUser(ctx context.Context, peer *scPlugin.PeerClient, driver, cluster, database, consumerStack string) (*MintScopedUserResult, error) {
+	pluginName, ok := PluginForDriver(driver)
 	if !ok {
-		return nil, errors.Errorf("atlasAdmin: want map, got %T", v)
+		return nil, errors.Errorf("MintScopedUser: no plugin wired for driver %q (expected one of %v) — backup plugin needs the driver → plugin map entry", driver, knownDrivers())
 	}
-	admin := &AtlasAdminRef{}
-	if s, ok := m["privateKey"].(string); ok {
-		admin.PrivateKey = s
+	if cluster == "" || database == "" || consumerStack == "" {
+		return nil, errors.Errorf("MintScopedUser: cluster/database/consumerStack all required (got %q, %q, %q)", cluster, database, consumerStack)
 	}
-	if s, ok := m["publicKey"].(string); ok {
-		admin.PublicKey = s
+	payload, err := json.Marshal(map[string]any{
+		"cluster":       cluster,
+		"database":      database,
+		"roleName":      "readWrite",
+		"consumerStack": consumerStack,
+	})
+	if err != nil {
+		return nil, errors.Wrap(err, "MintScopedUser: marshal payload")
 	}
-	if s, ok := m["projectId"].(string); ok {
-		admin.ProjectID = s
+	reply, err := peer.PluginInvoke(ctx, pluginName, "mint-scoped-user", payload)
+	if err != nil {
+		return nil, errors.Wrapf(err, "MintScopedUser: peer-invoke %s/mint-scoped-user (cluster=%q, database=%q)", pluginName, cluster, database)
 	}
-	return admin, nil
+	var result MintScopedUserResult
+	if err := json.Unmarshal(reply, &result); err != nil {
+		return nil, errors.Wrap(err, "MintScopedUser: decode reply")
+	}
+	if result.Username == "" || result.Password == "" {
+		return nil, errors.New("MintScopedUser: reply missing username or password")
+	}
+	return &result, nil
 }
 
-// populateDatabasesFromRaw extracts the `databases:` + `atlasAdmin:` from
-// a Component's Config.Raw map. Returns nil + empty list if absent (no
-// slice 1d matching to do).
-func populateDatabasesFromRaw(raw map[string]any) ([]BackupDatabase, *AtlasAdminRef, error) {
-	if raw == nil {
-		return nil, nil, nil
+// DeleteScopedUser asks the driver's owning plugin to remove a
+// previously-minted scoped user. Idempotent — a missing user is a
+// no-op (the owning plugin's handler swallows 404).
+//
+// Called from PreDestroy. On parent-stack destroy the owning plugin's
+// credential cache may be empty (its ComputeProcess doesn't fire on
+// destroy) — the call will fail with a cache-miss error from the
+// owning plugin. PreDestroy swallows all errors; orphan users on
+// isolated-backup-destroy are a documented limitation until
+// mongodb-exports-creds-for-predestroy-peer-invoke follow-up lands.
+func DeleteScopedUser(ctx context.Context, peer *scPlugin.PeerClient, driver, cluster, username string) error {
+	pluginName, ok := PluginForDriver(driver)
+	if !ok {
+		return errors.Errorf("DeleteScopedUser: no plugin wired for driver %q", driver)
 	}
-	var dbs []BackupDatabase
-	if v, ok := raw["databases"]; ok && v != nil {
-		rawList, ok := v.([]any)
-		if !ok {
-			return nil, nil, errors.Errorf("databases: want list, got %T", v)
-		}
-		for i, item := range rawList {
-			m, ok := item.(map[string]any)
-			if !ok {
-				return nil, nil, errors.Errorf("databases[%d]: want map, got %T", i, item)
-			}
-			db := BackupDatabase{}
-			if s, ok := m["resource"].(string); ok {
-				db.Resource = s
-			}
-			if s, ok := m["driver"].(string); ok {
-				db.Driver = s
-			}
-			if s, ok := m["cluster"].(string); ok {
-				db.Cluster = s
-			}
-			if db.Resource == "" || db.Driver == "" {
-				return nil, nil, errors.Errorf("databases[%d]: resource + driver required (got resource=%q driver=%q)", i, db.Resource, db.Driver)
-			}
-			if db.Cluster == "" {
-				db.Cluster = db.Resource
-			}
-			dbs = append(dbs, db)
-		}
+	if cluster == "" || username == "" {
+		return errors.Errorf("DeleteScopedUser: cluster/username required (got %q, %q)", cluster, username)
 	}
-	var admin *AtlasAdminRef
-	if v, ok := raw["atlasAdmin"]; ok && v != nil {
-		m, ok := v.(map[string]any)
-		if !ok {
-			return nil, nil, errors.Errorf("atlasAdmin: want map, got %T", v)
-		}
-		admin = &AtlasAdminRef{}
-		if s, ok := m["privateKey"].(string); ok {
-			admin.PrivateKey = s
-		}
-		if s, ok := m["publicKey"].(string); ok {
-			admin.PublicKey = s
-		}
-		if s, ok := m["projectId"].(string); ok {
-			admin.ProjectID = s
-		}
+	payload, err := json.Marshal(map[string]any{
+		"cluster":  cluster,
+		"username": username,
+	})
+	if err != nil {
+		return errors.Wrap(err, "DeleteScopedUser: marshal payload")
 	}
-	// Validate the conjunction: any mongodb entry needs admin.
-	for _, db := range dbs {
-		if db.Driver == "mongodb" && admin == nil {
-			return nil, nil, errors.Errorf("databases[%q].driver = mongodb but atlasAdmin not set", db.Resource)
-		}
+	if _, err := peer.PluginInvoke(ctx, pluginName, "delete-scoped-user", payload); err != nil {
+		return errors.Wrapf(err, "DeleteScopedUser: peer-invoke %s/delete-scoped-user (cluster=%q, username=%q)", pluginName, cluster, username)
 	}
-	return dbs, admin, nil
+	return nil
 }
 
 // pluginOutputOf returns the *api.PluginResourceOutput for a dep name,
 // handling the (name missing) + (Ref wrong type) + (nil Ref) cases.
+// Used by compute.go's readServiceURL to read sibling-published
+// outputs from the consumer's ResourceOutputs map.
 func pluginOutputOf(deps pApi.ResourcesOutputs, name string) *api.PluginResourceOutput {
 	ref, ok := deps[name]
 	if !ok || ref == nil {
@@ -254,8 +149,9 @@ func pluginOutputOf(deps pApi.ResourcesOutputs, name string) *api.PluginResource
 	return pro
 }
 
-// stringOutputValue reads one published output by exact key and returns
-// it as a string. Missing or non-string values return "" + false.
+// stringOutputValue reads one published output by exact key and
+// returns it as a string. Missing or non-string values return "" +
+// false.
 func stringOutputValue(pro *api.PluginResourceOutput, key string) (string, bool) {
 	v, found := pro.Lookup(key)
 	if !found {
@@ -266,4 +162,21 @@ func stringOutputValue(pro *api.PluginResourceOutput, key string) (string, bool)
 		return "", false
 	}
 	return s, true
+}
+
+// knownDrivers returns a deterministic sorted list of driver strings
+// the backup plugin currently routes. Used in error messages so the
+// operator / plugin author sees the exact set.
+func knownDrivers() []string {
+	keys := make([]string, 0, len(driverPlugins))
+	for k := range driverPlugins {
+		keys = append(keys, k)
+	}
+	// Deterministic for readable error text; not performance-critical.
+	for i := 1; i < len(keys); i++ {
+		for j := i; j > 0 && keys[j-1] > keys[j]; j-- {
+			keys[j-1], keys[j] = keys[j], keys[j-1]
+		}
+	}
+	return keys
 }
