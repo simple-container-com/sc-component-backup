@@ -106,12 +106,17 @@ func (p *backupPlugin) SetBroker(b *hplugin.GRPCBroker) { p.broker = b }
 // so operators who don't write these blocks get the plugin's defaults
 // automatically, while operators who DO write them keep their value.
 //
-// Scope note (Tier-2): scalars from Tier-1 + interpolated defaults for
-// `storage.bucket` + `worker.cluster` + `storage.region` via the api's
-// `$$sc:<expr>` sentinel from
-// [[sc-components-defaults-template-interpolation]] (api PR #615).
-// `worker.subnetIds/securityGroupIds` + the whole `atlasAdmin:` block
-// still require follow-ups (parent-output tokens; plugin-peer-invoke).
+// Scope note (Tier-2 + Tier-4): scalars from Tier-1 + interpolated
+// defaults for `storage.bucket` + `worker.cluster` + `storage.region`
+// via the api's `$$sc:<expr>` sentinel (api PR #615). `atlasAdmin`
+// removed in Tier-4: scoped-user mint via peer-invoke (api PR #616).
+//
+// Remaining operator-written: `worker.subnetIds` + `worker.securityGroupIds`
+// — both `[]string`. The scalar `${parent:<resource>.<field>}` resolver
+// landed (api PR #617) BUT returns a scalar `(string, bool)`; defaulting
+// a `[]string` field with a sentinel string is a shape mismatch. A
+// LIST-shaped parent-output token is the follow-up —
+// [[sc-components-defaults-parent-output-list-token]].
 //
 // Marshalled once at init time to avoid re-marshalling on every
 // Schema() RPC.
@@ -145,9 +150,11 @@ var componentDefaultsJSON = func() []byte {
 			"region": "$$sc:${template.region}",
 		},
 		// Worker shape: scalars fixed; cluster name derives from the
-		// component resource name. subnetIds + securityGroupIds still
-		// need parent-output tokens — unblocked once that follow-up
-		// slice lands.
+		// component resource name. subnetIds + securityGroupIds are
+		// `[]string`; the scalar `${parent:…}` resolver (api PR #617)
+		// returns a scalar, so a list-shaped parent-output token is
+		// the follow-up —
+		// [[sc-components-defaults-parent-output-list-token]].
 		"worker": map[string]any{
 			"cpu":                512,
 			"memoryMB":           2048,
