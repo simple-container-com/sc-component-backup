@@ -120,10 +120,33 @@ func TestMintJWT(t *testing.T) {
 func TestReadDeployedServiceURL(t *testing.T) {
 	RegisterTestingT(t)
 
+	// Shape 1: bare string.
 	v, ok := ReadDeployedServiceURL([]byte(`{"_deployed_service":"https://backup.example.com"}`))
 	Expect(ok).To(BeTrue())
 	Expect(v).To(Equal("https://backup.example.com"))
 
+	// Shape 2: {url: ...} map.
+	v, ok = ReadDeployedServiceURL([]byte(`{"_deployed_service":{"url":"https://alt.example.com"}}`))
+	Expect(ok).To(BeTrue())
+	Expect(v).To(Equal("https://alt.example.com"))
+
+	// Shape 3: PluginResourceOutput JSON — the CURRENT SC core
+	// sidecar packs the aws-lambda template's Outputs here.
+	// Scanner finds the `*-function-url` key by suffix.
+	pro := `{"_deployed_service":{"PluginName":"aws","Urn":"urn:pulumi:...","Outputs":{"my-backup--staging-staging-function-url":{"Value":"https://xxxx.lambda-url.eu-central-1.on.aws","Secret":false},"my-backup--staging-staging-lambda-arn":{"Value":"arn:aws:lambda:...","Secret":false}}}}`
+	v, ok = ReadDeployedServiceURL([]byte(pro))
+	Expect(ok).To(BeTrue())
+	Expect(v).To(Equal("https://xxxx.lambda-url.eu-central-1.on.aws"))
+
+	// Shape 3 negative: PluginResourceOutput with no function-url
+	// key — the sidecar's Outputs may hold only lambda-arn
+	// (hypothetical; unlikely in practice but defensive).
+	proNoURL := `{"_deployed_service":{"PluginName":"aws","Outputs":{"foo-lambda-arn":{"Value":"arn:aws:lambda:..."}}}}`
+	v, ok = ReadDeployedServiceURL([]byte(proNoURL))
+	Expect(ok).To(BeFalse())
+	Expect(v).To(BeEmpty())
+
+	// Empty inputs.
 	v, ok = ReadDeployedServiceURL([]byte(`{}`))
 	Expect(ok).To(BeFalse())
 	Expect(v).To(BeEmpty())
