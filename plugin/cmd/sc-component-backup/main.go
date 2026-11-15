@@ -106,19 +106,21 @@ func (p *backupPlugin) SetBroker(b *hplugin.GRPCBroker) { p.broker = b }
 // so operators who don't write these blocks get the plugin's defaults
 // automatically, while operators who DO write them keep their value.
 //
-// Scope note (Tier-2 + Tier-4): scalars from Tier-1 + interpolated
-// defaults for `storage.bucket` + `worker.cluster` + `storage.region`
-// via the api's `$$sc:<expr>` sentinel (api PR #615). `atlasAdmin`
-// removed in Tier-4: scoped-user mint via peer-invoke (api PR #616).
+// Scope note (Tier-2 + Tier-4 + Tier-5): scalars from Tier-1 +
+// interpolated defaults for `storage.bucket` + `worker.cluster` +
+// `storage.region` via the api's `$$sc:<expr>` sentinel (api PR
+// #615). `atlasAdmin` removed in Tier-4: scoped-user mint via
+// peer-invoke (api PR #616).
 //
-// Operator still writes `env.BACKUP_ECS_SUBNETS` +
-// `env.BACKUP_ECS_SECURITY_GROUPS` as comma-separated strings in the
-// `env:` block — the service runtime reads them at task-launch time
-// (see scheduler_tick.go). Deliberately NOT defaulted: VPC placement is
-// an infrastructure-shape decision we don't want to silently fleet-wide.
-// The deprecated `worker.subnetIds/securityGroupIds` fields were
-// removed 2026-11-15 (they were validated but unused, duplicating the
-// env-var contract).
+// Tier-5 (api PR #620 PreProvision + #621 ordering fix): operator
+// no longer writes `env.BACKUP_ECS_SUBNETS` /
+// `env.BACKUP_ECS_SECURITY_GROUPS`. The plugin's PreProvision
+// method looks up the AWS account's default-VPC subnets + creates a
+// per-component Fargate SG, lands `subnets-csv` /
+// `security-groups-csv` as tpl extensions on the shared collector,
+// and the defaults below reference them via `${resource:${name}.…}`.
+// Operator-wins override still works per-key — writing
+// `env.BACKUP_ECS_SUBNETS: "subnet-x,subnet-y"` beats the default.
 //
 // Marshalled once at init time to avoid re-marshalling on every
 // Schema() RPC.
@@ -152,16 +154,30 @@ var componentDefaultsJSON = func() []byte {
 			"region": "$$sc:${template.region}",
 		},
 		// Worker shape: scalars fixed; cluster name derives from the
-		// component resource name. subnetIds + securityGroupIds are
-		// `[]string`; the scalar `${parent:…}` resolver (api PR #617)
-		// returns a scalar, so a list-shaped parent-output token is
-		// the follow-up —
-		// [[sc-components-defaults-parent-output-list-token]].
+		// component resource name. VPC placement
+		// (worker.subnetIds/SGs) lives in `env.BACKUP_ECS_*` below —
+		// the service reads env at RunTask time; see 2026-11-15
+		// struct-field removal note on BackupWorker.
 		"worker": map[string]any{
 			"cpu":                512,
 			"memoryMB":           2048,
 			"ephemeralStorageGB": 50,
 			"cluster":            "$$sc:sc-backup-${name}-cluster",
+		},
+		// Default VPC placement — operator gets no-config Fargate
+		// out of the box. PreProvision (api PR #620, ordering fix
+		// #621) runs the plugin's DiscoverDefaultVPC lookup at
+		// component-dispatch time, lands subnets-csv +
+		// security-groups-csv as tpl extensions on the shared
+		// collector, and SC core's ResolvePlaceholders pass
+		// (deploy.go:202 + the post-PreProvision pass in
+		// dispatchComponentTemplate) substitutes the references
+		// here for their resolved values. Operator can override by
+		// writing env.BACKUP_ECS_SUBNETS/SECURITY_GROUPS directly —
+		// operator-wins per-key via DeepMergeComponentRaw.
+		"env": map[string]any{
+			"BACKUP_ECS_SUBNETS":         "$$sc:${resource:${name}.subnets-csv}",
+			"BACKUP_ECS_SECURITY_GROUPS": "$$sc:${resource:${name}.security-groups-csv}",
 		},
 		// The only `deployTo:` target with a per-plugin dispatch
 		// today. Operator can override to any aws-lambda-shaped
@@ -207,6 +223,16 @@ func (p *backupPlugin) Schema(_ context.Context, _ *scpluginv1.SchemaRequest) (*
 		ComponentDefaults: map[string][]byte{
 			backupApi.ResourceType: componentDefaultsJSON,
 		},
+		// PreProvision opt-in: fires BEFORE dispatchComponentTemplate
+		// so the plugin's own DiscoverDefaultVPC lookup can land
+		// subnets-csv + security-groups-csv tpl extensions on the
+		// shared collector. SC core's post-PreProvision
+		// ResolvePlaceholders pass (api PR #621) then substitutes
+		// `${resource:<name>.subnets-csv}` references in the merged
+		// env for their resolved values. Without this flag SC core
+		// never dials PreProvision — the plugin's lookup never runs
+		// and the Lambda env gets literal tokens.
+		SupportsPreProvision: true,
 		ComponentAllowedOverrides: map[string]*scpluginv1.StringList{
 			// cloudExtras added for slice 1c expansion (design doc §5.3):
 			// the backup Component overlays lambdaRoutingType=function-url
@@ -366,6 +392,92 @@ func (p *backupPlugin) Provision(stdctx context.Context, req *scpluginv1.Provisi
 
 	p.progress.Info("provision", fmt.Sprintf("backup %q registered (service_url=%s)", req.GetResourceName(), serviceURL))
 	return &scpluginv1.ProvisionResponse{Urn: urnStr, Outputs: outputs}, nil
+}
+
+// PreProvision fires BEFORE SC core dispatches the operator-chosen
+// template for a `my-backup` resource. The plugin's Pulumi context
+// is live here (same wire shape as Provision), so cloud-SDK lookups
+// are legal.
+//
+// For `deployTo: lambda`, the plugin looks up the AWS account's
+// default-VPC subnets + creates a per-component Fargate SG (allow
+// outbound to MongoDB/Postgres/MySQL/HTTPS) and returns both as tpl
+// extensions keyed by the component resource's name. SC core's
+// post-PreProvision ResolvePlaceholders pass (api PR #621) then
+// substitutes `${resource:<name>.subnets-csv}` +
+// `${resource:<name>.security-groups-csv}` references in the
+// merged `env` map for their resolved values — the Lambda built by
+// the aws-lambda template receives the resolved comma-separated
+// IDs in BACKUP_ECS_SUBNETS / BACKUP_ECS_SECURITY_GROUPS env vars.
+//
+// For other `deployTo:` values (vm-compose, k8s-run, ecs-fargate),
+// PreProvision early-returns an empty response — VPC lookup is
+// aws-lambda-specific; those branches use their own placement.
+//
+// Design: forge/docs/design/2026-11-15/plugin-preprovision-rpc/.
+func (p *backupPlugin) PreProvision(stdctx context.Context, req *scpluginv1.PreProvisionRequest) (resp *scpluginv1.PreProvisionResponse, err error) {
+	rctx, err := runtime.NewContext(stdctx, req.GetHeader(), runtime.WithLocalEngineFallback(p.progress))
+	if err != nil {
+		return nil, err
+	}
+	defer runtime.Settle(rctx, &resp, &err)
+
+	p.progress.Info("pre-provision", fmt.Sprintf("backup component %q (type %q)", req.GetResourceName(), req.GetResourceType()))
+
+	// Decode ComponentRaw — the merged .Raw post-ComponentDefaults.
+	// A non-lambda deployTo is a valid shape (vm-compose, k8s-run);
+	// we just have nothing to look up.
+	var rawMap map[string]any
+	if raw := req.GetComponentRaw(); len(raw) > 0 {
+		if jerr := json.Unmarshal(raw, &rawMap); jerr != nil {
+			return nil, errors.Wrap(jerr, "decode ComponentRaw")
+		}
+	}
+	dt, _ := rawMap["deployTo"].(string)
+	if dt != "lambda" {
+		p.progress.Info("pre-provision", fmt.Sprintf("backup %q deployTo=%q — no VPC lookup needed, skipping", req.GetResourceName(), dt))
+		return &scpluginv1.PreProvisionResponse{}, nil
+	}
+
+	region := "eu-central-1"
+	if storage, ok := rawMap["storage"].(map[string]any); ok {
+		if r, ok := storage["region"].(string); ok && r != "" {
+			region = r
+		}
+	}
+
+	return runtime.RunPreProvision(
+		stdctx, rctx,
+		api.Stack{Name: req.GetHeader().GetStackName()},
+		api.ResourceInput{Descriptor: &api.ResourceDescriptor{
+			Type: req.GetResourceType(),
+			Name: req.GetResourceName(),
+		}},
+		pApi.ProvisionParams{},
+		func(ctx *sdk.Context, _ api.Stack, _ api.ResourceInput, collector pApi.ComputeContextCollector, _ pApi.ProvisionParams) error {
+			awsProv, perr := awsprov.NewProvider(ctx, fmt.Sprintf("sc-backup-%s-aws-preprovision", req.GetResourceName()), &awsprov.ProviderArgs{
+				Region: sdk.String(region),
+			})
+			if perr != nil {
+				return errors.Wrap(perr, "build aws provider for PreProvision")
+			}
+			discovery, derr := backupInternal.DiscoverDefaultVPC(stdctx, ctx, awsProv, req.GetResourceName())
+			if derr != nil {
+				// Swallow + log: operator can override via explicit
+				// env.BACKUP_ECS_SUBNETS/SECURITY_GROUPS. Returning
+				// error here would fail the whole dispatch; the
+				// defaulting is a UX nice-to-have, not load-bearing.
+				p.progress.Warn("pre-provision", fmt.Sprintf("backup %q DiscoverDefaultVPC: %v — operator must set env.BACKUP_ECS_SUBNETS/SECURITY_GROUPS explicitly", req.GetResourceName(), derr))
+				return nil
+			}
+			collector.AddResourceTplExtension(req.GetResourceName(), map[string]string{
+				"subnets-csv":         discovery.SubnetIDsCSV,
+				"security-groups-csv": discovery.SecurityGroupID,
+			})
+			p.progress.Info("pre-provision", fmt.Sprintf("backup %q default-VPC: subnets=%s SG=%s", req.GetResourceName(), discovery.SubnetIDsCSV, discovery.SecurityGroupID))
+			return nil
+		},
+	)
 }
 
 // ComputeProcess is the push-register call. When a consumer declares
