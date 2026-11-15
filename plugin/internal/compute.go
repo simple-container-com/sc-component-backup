@@ -550,8 +550,26 @@ type TenantResource struct {
 }
 
 // ReadDeployedServiceURL reads the Path A sidecar wrapper's populated
-// `_deployed_service` key off DependencyOutputsJson. Returns empty + false
-// if the key is absent (pre-slice-1a SC core).
+// `_deployed_service` key off DependencyOutputsJson. Returns empty +
+// false if the key is absent (pre-slice-1a SC core).
+//
+// Three shapes supported (added over time as the slice-1a dispatch
+// wire evolved):
+//  1. Bare string value (the simplest shape; pre-sidecar).
+//  2. `{url: <lambda-url>}` map (early sidecar prototypes).
+//  3. `*api.PluginResourceOutput` JSON shape — the CURRENT shape SC
+//     core's `plugin_sidecars.go:244-260` packs: an object with
+//     `PluginName` / `Urn` / `Outputs: {<key>: {Value, Secret}}`
+//     where one of the keys ends in `-function-url` (sc-plugin-aws
+//     aws-lambda template's own export).
+//
+// On a PluginResourceOutput, the function scans `Outputs` for ANY
+// key ending in `-function-url` or `-lambda-url` and returns its
+// `Value` as a string. The scan is suffix-based because the full
+// key is `<stack>-<env>-function-url` and the plugin reader doesn't
+// know the exact stack/env prefix at parse time (parent-stack
+// dispatch uses the component's own name; client-stack dispatch
+// uses the client stack name).
 func ReadDeployedServiceURL(depOutputsJSON []byte) (string, bool) {
 	if len(depOutputsJSON) == 0 {
 		return "", false
@@ -560,12 +578,34 @@ func ReadDeployedServiceURL(depOutputsJSON []byte) (string, bool) {
 	if err := json.Unmarshal(depOutputsJSON, &m); err != nil {
 		return "", false
 	}
+	// Shape 1: bare string.
 	if v, ok := m["_deployed_service"].(string); ok && v != "" {
 		return v, true
 	}
-	// Alternate key the dispatched template might populate:
-	if ds, ok := m["_deployed_service"].(map[string]any); ok {
-		if v, ok := ds["url"].(string); ok && v != "" {
+	// Shape 2 or 3: the map form.
+	ds, ok := m["_deployed_service"].(map[string]any)
+	if !ok {
+		return "", false
+	}
+	// Shape 2: {url: <string>}.
+	if v, ok := ds["url"].(string); ok && v != "" {
+		return v, true
+	}
+	// Shape 3: PluginResourceOutput — scan Outputs for a
+	// `*-function-url` / `*-lambda-url` key.
+	outs, ok := ds["Outputs"].(map[string]any)
+	if !ok {
+		return "", false
+	}
+	for key, raw := range outs {
+		if !strings.HasSuffix(key, "-function-url") && !strings.HasSuffix(key, "-lambda-url") {
+			continue
+		}
+		valObj, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if v, ok := valObj["Value"].(string); ok && v != "" {
 			return v, true
 		}
 	}
