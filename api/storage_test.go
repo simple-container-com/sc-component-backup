@@ -87,10 +87,8 @@ func TestBackupConfigValidate_LambdaFilesystemRefused(t *testing.T) {
 		DeployTo:   "lambda",
 		Image:      "simplecontainer/sc-component-backup:latest",
 		SigningKey: "${secret:k}",
-		Worker: &BackupWorker{
-			Cluster: "x", SubnetIds: []string{"s"}, SecurityGroupIds: []string{"sg"},
-		},
-		Storage: &BackupStorage{Type: "filesystem", Path: "/tmp"},
+		Worker:     &BackupWorker{Cluster: "x"},
+		Storage:    &BackupStorage{Type: "filesystem", Path: "/tmp"},
 	}
 	err := cfg.Validate()
 	if err == nil || !strings.Contains(err.Error(), "incompatible with `deployTo: lambda") {
