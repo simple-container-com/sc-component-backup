@@ -111,12 +111,14 @@ func (p *backupPlugin) SetBroker(b *hplugin.GRPCBroker) { p.broker = b }
 // via the api's `$$sc:<expr>` sentinel (api PR #615). `atlasAdmin`
 // removed in Tier-4: scoped-user mint via peer-invoke (api PR #616).
 //
-// Remaining operator-written: `worker.subnetIds` + `worker.securityGroupIds`
-// — both `[]string`. The scalar `${parent:<resource>.<field>}` resolver
-// landed (api PR #617) BUT returns a scalar `(string, bool)`; defaulting
-// a `[]string` field with a sentinel string is a shape mismatch. A
-// LIST-shaped parent-output token is the follow-up —
-// [[sc-components-defaults-parent-output-list-token]].
+// Operator still writes `env.BACKUP_ECS_SUBNETS` +
+// `env.BACKUP_ECS_SECURITY_GROUPS` as comma-separated strings in the
+// `env:` block — the service runtime reads them at task-launch time
+// (see scheduler_tick.go). Deliberately NOT defaulted: VPC placement is
+// an infrastructure-shape decision we don't want to silently fleet-wide.
+// The deprecated `worker.subnetIds/securityGroupIds` fields were
+// removed 2026-11-15 (they were validated but unused, duplicating the
+// env-var contract).
 //
 // Marshalled once at init time to avoid re-marshalling on every
 // Schema() RPC.

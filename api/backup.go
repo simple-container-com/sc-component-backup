@@ -154,18 +154,24 @@ type BackupDatabase struct {
 	Driver string `json:"driver" yaml:"driver"`
 }
 
-// BackupWorker shapes the ECS Fargate one-shot task that runs the actual
-// mongodump / pg_dump / mariadb-dump when this Component is deployed to
-// aws-lambda. Per design doc §5.3.
+// BackupWorker shapes the ECS Fargate one-shot task-definition that runs
+// the actual mongodump / pg_dump / mariadb-dump when this Component is
+// deployed to aws-lambda. Per design doc §5.3.
 //
-// All fields are operator-declared. The plugin's Provision provisions an
-// `aws:ecs/taskDefinition:TaskDefinition` using these knobs (image is the
-// same as the Lambda's — one Dockerhub image, mode flag at entry).
-// The cluster + subnets + security groups are operator-declared (not
-// provisioned by this plugin) so the operator keeps full control over the
-// VPC + routing posture for the backup worker. Inside the Fargate task, the
-// backup service entrypoint reads `BACKUP_MODE=worker` + the per-tenant env
-// the Lambda injected via `ecs.RunTask` and dumps to S3.
+// Scope note: this struct governs the TASK-DEFINITION sizing + the ECS
+// cluster the plugin provisions for the backup worker. Runtime VPC
+// placement (subnets + security groups) is NOT here — the service runtime
+// reads `env.BACKUP_ECS_SUBNETS` + `env.BACKUP_ECS_SECURITY_GROUPS`
+// directly from the Lambda's env block
+// (service/internal/api/scheduler_tick.go:105), so the operator writes
+// those as comma-separated strings in the `env:` section of their
+// backup component config. A previous shape of this struct carried
+// `SubnetIds []string` + `SecurityGroupIds []string` that were validated
+// but never consumed by either the plugin or the service — the service
+// has always read the env-var form, and the plugin's ProvisionEcsWorker
+// never passed them anywhere. The fields were removed 2026-11-15 to
+// drop the duplication; operators who wrote both get a slightly cleaner
+// yaml, operators who wrote only `env.BACKUP_ECS_*` are unaffected.
 type BackupWorker struct {
 	// CPU is the Fargate vCPU allocation in millicpu steps (256, 512, 1024,
 	// 2048, 4096). Must pair with MemoryMB per the Fargate matrix.
@@ -182,25 +188,11 @@ type BackupWorker struct {
 	// mongodump spool peak of 2× uncompressed DB size.
 	EphemeralStorageGB int `json:"ephemeralStorageGB,omitempty" yaml:"ephemeralStorageGB,omitempty"`
 
-	// Cluster is the ECS cluster ARN (or name) the Fargate task runs on.
-	// Operator-declared; this plugin does NOT create ECS clusters —
-	// clusters are a shared operator resource (e.g. a company-wide
-	// `tasks` cluster) that backup tasks join alongside other
-	// short-lived jobs.
-	// Required for deployTo: lambda.
+	// Cluster is the ECS cluster name the plugin provisions for this
+	// backup component's Fargate task family. Defaulted by the plugin's
+	// ComponentDefaults to `sc-backup-<name>-cluster` — operator rarely
+	// overrides. Required for deployTo: lambda.
 	Cluster string `json:"cluster" yaml:"cluster"`
-
-	// SubnetIds is the VPC subnet list the Fargate task attaches to.
-	// Must have outbound reachability to Atlas / RDS hosts AND to S3 (via
-	// a VPC endpoint OR via NAT gateway).
-	// Required for deployTo: lambda.
-	SubnetIds []string `json:"subnetIds" yaml:"subnetIds"`
-
-	// SecurityGroupIds is the security-group list applied to the task's
-	// ENI. Must allow outbound 27017 (Mongo) / 5432 (Postgres) / 3306
-	// (MySQL) + 443 (S3 + Atlas REST).
-	// Required for deployTo: lambda.
-	SecurityGroupIds []string `json:"securityGroupIds" yaml:"securityGroupIds"`
 }
 
 // BackupAtlasAdmin carries operator-provided Atlas admin API-key ids. Both
@@ -331,14 +323,12 @@ func (c *BackupConfig) Validate() error {
 			return errors.Errorf("`worker` is required for %q when `deployTo: lambda` — Fargate one-shot task shape (cluster + subnets + securityGroups). See design doc §5.3.", ResourceType)
 		}
 		if c.Worker.Cluster == "" {
-			return errors.Errorf("`worker.cluster` is required (ECS cluster ARN or name the Fargate task runs on)")
+			return errors.Errorf("`worker.cluster` is required (ECS cluster name the plugin provisions for the Fargate task; defaulted by ComponentDefaults to `sc-backup-<name>-cluster`)")
 		}
-		if len(c.Worker.SubnetIds) == 0 {
-			return errors.Errorf("`worker.subnetIds` is required (at least one subnet)")
-		}
-		if len(c.Worker.SecurityGroupIds) == 0 {
-			return errors.Errorf("`worker.securityGroupIds` is required (at least one security group)")
-		}
+		// Runtime VPC placement is read from env.BACKUP_ECS_SUBNETS +
+		// env.BACKUP_ECS_SECURITY_GROUPS (comma-separated), set by the
+		// operator in the `env:` block. Deliberately NOT a worker field
+		// (see BackupWorker's doc note on the 2026-11-15 removal).
 	}
 	// Storage: optional for back-compat (service-side env falls back to
 	// S3_* legacy vars for one release), but when PRESENT must be
