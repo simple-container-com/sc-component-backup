@@ -270,6 +270,24 @@ func (p *backupPlugin) Schema(_ context.Context, _ *scpluginv1.SchemaRequest) (*
 				//     Backup component is driver-agnostic.
 			}},
 		},
+		// Generic secret-env map (api PR #630 → v>=TBD): tell SC core
+		// which env var the template plugin should bind each
+		// `${secret:...}` field to on the dispatched service. Replaces
+		// the per-field hardcoded signingKey → SERVICE_JWT_SECRET block
+		// in sc-plugin-aws's aws-lambda template component_raw overlay
+		// (previously the only wired field; operatorPassword silently
+		// never reached the Lambda env until live-caught 2026-11-16 on
+		// backup-smoke-tier4's SPA 'No password set yet').
+		//
+		// Template plugins (sc-plugin-aws + successors) read this via
+		// pApi.GetComponentSecretEnvMap(resourceType) and translate each
+		// populated `.Raw[field]` to `cfg.Secrets[envName]`.
+		ComponentSecretEnvMap: map[string]*scpluginv1.StringMap{
+			backupApi.ResourceType: {Entries: map[string]string{
+				"signingKey":       "SERVICE_JWT_SECRET",
+				"operatorPassword": "BACKUP_OPERATOR_PASSWORD",
+			}},
+		},
 	}, nil
 }
 
