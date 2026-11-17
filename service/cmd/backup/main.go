@@ -75,7 +75,7 @@ func main() {
 	// resolved value too or every push-register is 401.
 	{
 		resolveCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		resolved, err := resolveAWSSecretARN(resolveCtx, jwtSecret)
+		resolved, err := resolveAWSSecretARN(resolveCtx, "SERVICE_JWT_SECRET", jwtSecret)
 		cancel()
 		if err != nil {
 			slog.Error("failed to resolve SERVICE_JWT_SECRET from SecretsManager", "err", err)
@@ -86,6 +86,32 @@ func main() {
 	if len(jwtSecret) < 32 {
 		slog.Error("SERVICE_JWT_SECRET must be at least 32 bytes (HS256 floor)")
 		os.Exit(2)
+	}
+	// Resolve BACKUP_OPERATOR_PASSWORD on the same ARN pattern. The SPA
+	// login handler reads the operator password via `os.Getenv` out of
+	// NewSessionConfigFromEnv — pushing the resolved value BACK into
+	// the env keeps that reader untouched and keeps the responsibility
+	// for resolution in one place (here, at startup). Empty env is
+	// allowed at this layer; the login handler surfaces its own
+	// "BACKUP_OPERATOR_PASSWORD not set on the server" 403 when a
+	// login attempt lands on an empty value.
+	//
+	// Live-caught 2026-11-18 on the first fleet-roll of
+	// backup.simple-forge.com: service compared against the ARN string
+	// and every operator login failed with `wrong password` (the ARN
+	// string is 115 chars; no human-typeable password matches).
+	if pw := os.Getenv("BACKUP_OPERATOR_PASSWORD"); pw != "" {
+		resolveCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		resolved, err := resolveAWSSecretARN(resolveCtx, "BACKUP_OPERATOR_PASSWORD", pw)
+		cancel()
+		if err != nil {
+			slog.Error("failed to resolve BACKUP_OPERATOR_PASSWORD from SecretsManager", "err", err)
+			os.Exit(2)
+		}
+		if err := os.Setenv("BACKUP_OPERATOR_PASSWORD", resolved); err != nil {
+			slog.Error("failed to set resolved BACKUP_OPERATOR_PASSWORD env", "err", err)
+			os.Exit(2)
+		}
 	}
 	port := envOr("PORT", "8080")
 
