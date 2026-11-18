@@ -194,6 +194,14 @@ var componentDefaultsJSON = func() []byte {
 			// from `running` to `succeeded` until the startup
 			// watchdog sweeps it.
 			"BACKUP_AGENT_URL": "$$sc:${resource:${name}.backup-agent-url}",
+			// Default-VPC subnets have an IGW route but no NAT;
+			// without a public IP the Fargate task can't reach
+			// CloudWatch/S3/ECR and dies before it starts.
+			// PreProvision lands "true" in the default-VPC code
+			// path; operator can override by setting the env
+			// explicitly in server.yaml if they have a NAT + VPC
+			// endpoints.
+			"BACKUP_ECS_ASSIGN_PUBLIC_IP": "$$sc:${resource:${name}.assign-public-ip}",
 		},
 		// The only `deployTo:` target with a per-plugin dispatch
 		// today. Operator can override to any aws-lambda-shaped
@@ -548,8 +556,19 @@ func (p *backupPlugin) PreProvision(stdctx context.Context, req *scpluginv1.PreP
 			}
 			tpl["subnets-csv"] = discovery.SubnetIDsCSV
 			tpl["security-groups-csv"] = discovery.SecurityGroupID
+			// Default-VPC subnets have an IGW route but no NAT; a
+			// Fargate task without a public IP therefore cannot
+			// reach CloudWatch Logs (or S3 / ECR / etc.) and dies
+			// with "ResourceInitializationError: failed to validate
+			// logger args: ... There is a connection issue between
+			// the task and Amazon CloudWatch" at start. Public IP
+			// is free for ephemeral one-shot tasks and is the right
+			// default for the auto-discovered default-VPC shape;
+			// operators running inside a private subnet with a NAT
+			// + VPC endpoints can override via env.BACKUP_ECS_ASSIGN_PUBLIC_IP=false.
+			tpl["assign-public-ip"] = "true"
 			collector.AddResourceTplExtension(req.GetResourceName(), tpl)
-			p.progress.Info("pre-provision", fmt.Sprintf("backup %q default-VPC: subnets=%s SG=%s", req.GetResourceName(), discovery.SubnetIDsCSV, discovery.SecurityGroupID))
+			p.progress.Info("pre-provision", fmt.Sprintf("backup %q default-VPC: subnets=%s SG=%s assign-public-ip=true", req.GetResourceName(), discovery.SubnetIDsCSV, discovery.SecurityGroupID))
 			return nil
 		},
 	)
