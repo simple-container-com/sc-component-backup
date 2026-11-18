@@ -41,6 +41,7 @@ import (
 	sdkservice "github.com/simple-container-com/go-aws-lambda-sdk/pkg/service"
 
 	"github.com/simple-container-com/sc-component-backup/service/internal/api"
+	"github.com/simple-container-com/sc-component-backup/service/internal/backup/alerts"
 	"github.com/simple-container-com/sc-component-backup/service/internal/backup/scheduler"
 	"github.com/simple-container-com/sc-component-backup/service/internal/ui"
 )
@@ -167,6 +168,20 @@ func main() {
 		Runs:     metaStore.Runs(),
 		Projects: metaStore.Projects(),
 	}
+	// Alerts feature 2 (SPA+API gap top-to-bottom roll, 2026-11-18):
+	// dismissal store persists per-id dismissals + a before-cutoff
+	// high-water mark. Synthesizer walks recent failed/cancelled runs
+	// across tenants. The Overview handler filters alerts through the
+	// store state before rendering.
+	//
+	// In-memory impl for v1 — dismissals don't survive a Lambda cold
+	// start. MongoDismissals ships alongside for when
+	// BACKUP_PROJECTS_MODE=mongo is enabled (same lifecycle as the
+	// other Mongo stores — follow-up to wire the switch).
+	alertsDismissals := alerts.NewInMemoryDismissals()
+	alertsCfg := &api.AlertsConfig{Dismissals: alertsDismissals}
+	overviewCfg.AlertsDismissals = alertsDismissals
+	overviewCfg.AlertsSynthesizer = alerts.Synthesizer{}
 
 	// Unauthenticated endpoints — healthz + the session probe + login/logout.
 	router.Get("/healthz", api.Healthz)
@@ -240,6 +255,14 @@ func main() {
 		// Both sit behind the JWT middleware (operator session).
 		r.Get("/api/v1/projects/{name}/archives", archivesCfg.Archives)
 		r.Get("/api/v1/download", downloadCfg.Download)
+
+		// SPA+API gap feature 2 (2026-11-18): alerts dismissal. The
+		// read side lives on /api/v1/overview — alerts are derived
+		// from recent runs, not stored. These two routes record the
+		// operator's dismissal state (per-id + a "clear all" cutoff
+		// high-water mark) so the Overview filter can hide them.
+		r.Post("/api/v1/alerts/{id}/dismiss", alertsCfg.DismissOne)
+		r.Post("/api/v1/alerts/dismiss-all", alertsCfg.DismissAll)
 	})
 
 	// Embedded SPA.
