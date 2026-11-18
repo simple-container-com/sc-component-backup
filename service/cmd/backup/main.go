@@ -42,6 +42,7 @@ import (
 
 	"github.com/simple-container-com/sc-component-backup/service/internal/api"
 	"github.com/simple-container-com/sc-component-backup/service/internal/backup/alerts"
+	"github.com/simple-container-com/sc-component-backup/service/internal/backup/notify"
 	"github.com/simple-container-com/sc-component-backup/service/internal/backup/scheduler"
 	"github.com/simple-container-com/sc-component-backup/service/internal/ui"
 )
@@ -183,6 +184,21 @@ func main() {
 	overviewCfg.AlertsDismissals = alertsDismissals
 	overviewCfg.AlertsSynthesizer = alerts.Synthesizer{}
 
+	// Feature 3 (SPA+API gap top-to-bottom, 2026-11-18): Telegram
+	// notifications. Settings store persists bot token + chat id;
+	// handlers validate against Telegram's Bot API + ship a test
+	// message. In-memory for v1 — token survives Lambda warm reuse
+	// but not cold starts. MongoStore ships alongside for the
+	// BACKUP_PROJECTS_MODE=mongo switch (follow-up).
+	notifyStore := notify.NewInMemoryStore()
+	telegramClient := notify.NewTelegramClient()
+	settingsCfg := &api.SettingsConfig{
+		Store:           notifyStore,
+		Telegram:        telegramClient,
+		StorageLocation: archiveLocation,
+		MaxParallel:     1,
+	}
+
 	// Unauthenticated endpoints — healthz + the session probe + login/logout.
 	router.Get("/healthz", api.Healthz)
 	router.Get("/api/v1/session", sessionCfg.Session)
@@ -263,6 +279,16 @@ func main() {
 		// high-water mark) so the Overview filter can hide them.
 		r.Post("/api/v1/alerts/{id}/dismiss", alertsCfg.DismissOne)
 		r.Post("/api/v1/alerts/dismiss-all", alertsCfg.DismissAll)
+
+		// SPA+API gap feature 3 (2026-11-18): Telegram notifications
+		// + settings read. The storage block in AppSettings mirrors
+		// the archive location; the notify.telegram slot carries
+		// chat_id + a token_set flag (never the token itself).
+		r.Get("/api/v1/settings", settingsCfg.Settings)
+		r.Post("/api/v1/settings/test-notify", settingsCfg.TestNotify)
+		r.Post("/api/v1/settings/telegram/check", settingsCfg.TelegramCheck)
+		r.Put("/api/v1/settings/telegram", settingsCfg.TelegramSave)
+		r.Delete("/api/v1/settings/telegram", settingsCfg.TelegramDisable)
 	})
 
 	// Embedded SPA.
