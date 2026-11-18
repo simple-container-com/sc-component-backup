@@ -186,6 +186,14 @@ var componentDefaultsJSON = func() []byte {
 			// write them — the plugin owns both names.
 			"BACKUP_ECS_CLUSTER_NAME": "$$sc:${resource:${name}.cluster-name}",
 			"BACKUP_ECS_TASK_FAMILY":  "$$sc:${resource:${name}.task-family}",
+			// Self-URL the Fargate worker POSTs its completion
+			// callback to. Derived from `ingress.hostname` at
+			// PreProvision time — when the operator declares a
+			// public hostname, this lands automatically. Without
+			// it the Fargate-dispatched Run Now row never flips
+			// from `running` to `succeeded` until the startup
+			// watchdog sweeps it.
+			"BACKUP_AGENT_URL": "$$sc:${resource:${name}.backup-agent-url}",
 		},
 		// The only `deployTo:` target with a per-plugin dispatch
 		// today. Operator can override to any aws-lambda-shaped
@@ -504,6 +512,20 @@ func (p *backupPlugin) PreProvision(stdctx context.Context, req *scpluginv1.PreP
 			tpl := map[string]string{
 				"cluster-name": fmt.Sprintf("sc-backup-%s-cluster", req.GetResourceName()),
 				"task-family":  fmt.Sprintf("sc-backup-%s-worker", req.GetResourceName()),
+			}
+
+			// Self-URL for the Fargate worker's completion callback —
+			// derive from `ingress.hostname` (the operator-declared
+			// public hostname for the Component). Without this the
+			// deployed Lambda has no way to tell the worker where to
+			// POST /api/v1/internal/runs/{id}/complete, and the SPA
+			// row never flips from `running` to `succeeded` on a
+			// Fargate-dispatched Run Now (startup watchdog catches it
+			// eventually, but the UX is wrong).
+			if ingress, ok := rawMap["ingress"].(map[string]any); ok {
+				if host, ok := ingress["hostname"].(string); ok && host != "" {
+					tpl["backup-agent-url"] = "https://" + host
+				}
 			}
 
 			awsProv, perr := awsprov.NewProvider(ctx, fmt.Sprintf("sc-backup-%s-aws-preprovision", req.GetResourceName()), &awsprov.ProviderArgs{

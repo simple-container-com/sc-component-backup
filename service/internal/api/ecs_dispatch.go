@@ -88,13 +88,26 @@ func ReadFargateDispatchConfigFromEnv() (*FargateDispatchConfig, error) {
 	if err != nil {
 		return nil, err
 	}
-	s3Bucket, err := required("BACKUP_S3_BUCKET")
-	if err != nil {
-		return nil, err
+	// BACKUP_S3_BUCKET / BACKUP_S3_REGION fall back to STORAGE_BUCKET /
+	// STORAGE_REGION — the plugin's generic storage-block → env
+	// translation (sc-plugin-aws component_raw.go) lays those two down
+	// automatically from `storage.bucket` + `storage.region`, so an
+	// operator who declared the storage block gets the Fargate worker
+	// env for free. Explicit BACKUP_S3_* wins for tests + non-Lambda
+	// shapes where the storage block isn't used.
+	s3Bucket := strings.TrimSpace(os.Getenv("BACKUP_S3_BUCKET"))
+	if s3Bucket == "" {
+		s3Bucket = strings.TrimSpace(os.Getenv("STORAGE_BUCKET"))
 	}
-	s3Region, err := required("BACKUP_S3_REGION")
-	if err != nil {
-		return nil, err
+	if s3Bucket == "" {
+		return nil, fmt.Errorf("env BACKUP_S3_BUCKET or STORAGE_BUCKET required")
+	}
+	s3Region := strings.TrimSpace(os.Getenv("BACKUP_S3_REGION"))
+	if s3Region == "" {
+		s3Region = strings.TrimSpace(os.Getenv("STORAGE_REGION"))
+	}
+	if s3Region == "" {
+		return nil, fmt.Errorf("env BACKUP_S3_REGION or STORAGE_REGION required")
 	}
 	assignIP := ecstypes.AssignPublicIpDisabled
 	if strings.EqualFold(os.Getenv("BACKUP_ECS_ASSIGN_PUBLIC_IP"), "true") {
