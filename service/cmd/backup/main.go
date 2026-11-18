@@ -140,6 +140,16 @@ func main() {
 
 	sch := scheduler.New(scheduler.Config{}, metaStore.Tenants(), metaStore.Runs(), archiveStore, logger, nil)
 
+	// Reconcile stuck "running" rows at startup. A Lambda that OOM'd
+	// mid-run (or was replaced for any other reason) leaves the row
+	// stuck forever because the in-process UpdateBackup call never
+	// fires — the SPA then shows a permanent spinner. Cutoff is 2 ×
+	// BackupTimeout so an honest slow run never gets reclassified.
+	// Best-effort: failures log + continue.
+	if n := scheduler.ReconcileStuckRuns(context.Background(), metaStore.Runs(), logger, time.Now().UTC(), 0); n > 0 {
+		logger.Info("startup watchdog reclassified stuck runs", "count", n)
+	}
+
 	router := chi.NewRouter()
 	router.Use(middleware.RequestID)
 	router.Use(middleware.RealIP)
