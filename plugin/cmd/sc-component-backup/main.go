@@ -178,6 +178,14 @@ var componentDefaultsJSON = func() []byte {
 		"env": map[string]any{
 			"BACKUP_ECS_SUBNETS":         "$$sc:${resource:${name}.subnets-csv}",
 			"BACKUP_ECS_SECURITY_GROUPS": "$$sc:${resource:${name}.security-groups-csv}",
+			// Deterministic ECS resource names — PreProvision lands
+			// them as tpl extensions (main.go:491). scheduler_tick.go
+			// reads them to call ecs.RunTask; without these two the
+			// Lambda's Fargate dispatch path 500s on "env
+			// BACKUP_ECS_CLUSTER_NAME required". Operator doesn't
+			// write them — the plugin owns both names.
+			"BACKUP_ECS_CLUSTER_NAME": "$$sc:${resource:${name}.cluster-name}",
+			"BACKUP_ECS_TASK_FAMILY":  "$$sc:${resource:${name}.task-family}",
 		},
 		// The only `deployTo:` target with a per-plugin dispatch
 		// today. Operator can override to any aws-lambda-shaped
@@ -473,6 +481,20 @@ func (p *backupPlugin) PreProvision(stdctx context.Context, req *scpluginv1.PreP
 		}},
 		pApi.ProvisionParams{},
 		func(ctx *sdk.Context, _ api.Stack, _ api.ResourceInput, collector pApi.ComputeContextCollector, _ pApi.ProvisionParams) error {
+			// Deterministic ECS resource names — mirrors
+			// ecs_provision.go:152-153. Pulumi.Export under these
+			// same names happens in Provision; the tpl-extension
+			// here lets the componentDefaults placeholder
+			// `${resource:<name>.cluster-name}` /
+			// `.task-family` resolve at dispatch time so the
+			// deployed Lambda's scheduler-tick handler can call
+			// `ecs.RunTask` without the operator spelling the
+			// names out in server.yaml env:.
+			tpl := map[string]string{
+				"cluster-name": fmt.Sprintf("sc-backup-%s-cluster", req.GetResourceName()),
+				"task-family":  fmt.Sprintf("sc-backup-%s-worker", req.GetResourceName()),
+			}
+
 			awsProv, perr := awsprov.NewProvider(ctx, fmt.Sprintf("sc-backup-%s-aws-preprovision", req.GetResourceName()), &awsprov.ProviderArgs{
 				Region: sdk.String(region),
 			})
@@ -485,13 +507,15 @@ func (p *backupPlugin) PreProvision(stdctx context.Context, req *scpluginv1.PreP
 				// env.BACKUP_ECS_SUBNETS/SECURITY_GROUPS. Returning
 				// error here would fail the whole dispatch; the
 				// defaulting is a UX nice-to-have, not load-bearing.
+				// The cluster-name/task-family tpl extensions ship
+				// regardless — they need no AWS call.
 				p.progress.Warn("pre-provision", fmt.Sprintf("backup %q DiscoverDefaultVPC: %v — operator must set env.BACKUP_ECS_SUBNETS/SECURITY_GROUPS explicitly", req.GetResourceName(), derr))
+				collector.AddResourceTplExtension(req.GetResourceName(), tpl)
 				return nil
 			}
-			collector.AddResourceTplExtension(req.GetResourceName(), map[string]string{
-				"subnets-csv":         discovery.SubnetIDsCSV,
-				"security-groups-csv": discovery.SecurityGroupID,
-			})
+			tpl["subnets-csv"] = discovery.SubnetIDsCSV
+			tpl["security-groups-csv"] = discovery.SecurityGroupID
+			collector.AddResourceTplExtension(req.GetResourceName(), tpl)
 			p.progress.Info("pre-provision", fmt.Sprintf("backup %q default-VPC: subnets=%s SG=%s", req.GetResourceName(), discovery.SubnetIDsCSV, discovery.SecurityGroupID))
 			return nil
 		},
