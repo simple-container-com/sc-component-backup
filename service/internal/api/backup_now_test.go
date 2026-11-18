@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -201,4 +202,91 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// TestBackupNow_StorageBucketFallback — Lambda env often has
+// STORAGE_BUCKET / STORAGE_REGION (laid down by the plugin's
+// generic storage-block → env translation) but not BACKUP_S3_*.
+// ReadFargateDispatchConfigFromEnv should accept the STORAGE_* form
+// as a fallback so operators don't have to spell both out.
+func TestBackupNow_StorageBucketFallback(t *testing.T) {
+	// Set the Fargate-adjacent env but ONLY the STORAGE_* names.
+	env := map[string]string{
+		"BACKUP_ECS_CLUSTER_NAME": "sc-backup-test-cluster",
+		"BACKUP_ECS_TASK_FAMILY":  "sc-backup-test-worker",
+		"BACKUP_ECS_SUBNETS":      "subnet-a",
+		"STORAGE_BUCKET":          "store-bucket",
+		"STORAGE_REGION":          "eu-west-1",
+	}
+	prev := map[string]string{}
+	for k, v := range env {
+		prev[k] = os.Getenv(k)
+		_ = os.Setenv(k, v)
+	}
+	// Explicitly unset the BACKUP_S3_* keys to make sure the fallback
+	// path is exercised.
+	for _, k := range []string{"BACKUP_S3_BUCKET", "BACKUP_S3_REGION"} {
+		prev[k] = os.Getenv(k)
+		_ = os.Unsetenv(k)
+	}
+	defer func() {
+		for k, v := range prev {
+			if v == "" {
+				_ = os.Unsetenv(k)
+			} else {
+				_ = os.Setenv(k, v)
+			}
+		}
+	}()
+
+	fcfg, err := ReadFargateDispatchConfigFromEnv()
+	if err != nil {
+		t.Fatalf("want fallback to resolve, got err: %v", err)
+	}
+	if fcfg.S3Bucket != "store-bucket" {
+		t.Errorf("S3Bucket: got %q, want store-bucket", fcfg.S3Bucket)
+	}
+	if fcfg.S3Region != "eu-west-1" {
+		t.Errorf("S3Region: got %q, want eu-west-1", fcfg.S3Region)
+	}
+}
+
+// TestBackupNow_FargateEnvMisconfigured_500 — BACKUP_ECS_CLUSTER_NAME
+// is set but a sibling env is missing. Handler must fail LOUDLY with
+// a 500 rather than silently fall back to the broken in-process path.
+func TestBackupNow_FargateEnvMisconfigured_500(t *testing.T) {
+	// Cluster set, but NO task-family / subnets / bucket.
+	prev := os.Getenv("BACKUP_ECS_CLUSTER_NAME")
+	_ = os.Setenv("BACKUP_ECS_CLUSTER_NAME", "sc-backup-test-cluster")
+	// Clear the others.
+	toClear := []string{"BACKUP_ECS_TASK_FAMILY", "BACKUP_ECS_SUBNETS", "BACKUP_S3_BUCKET", "STORAGE_BUCKET", "BACKUP_S3_REGION", "STORAGE_REGION"}
+	oldVals := map[string]string{}
+	for _, k := range toClear {
+		oldVals[k] = os.Getenv(k)
+		_ = os.Unsetenv(k)
+	}
+	defer func() {
+		if prev == "" {
+			_ = os.Unsetenv("BACKUP_ECS_CLUSTER_NAME")
+		} else {
+			_ = os.Setenv("BACKUP_ECS_CLUSTER_NAME", prev)
+		}
+		for k, v := range oldVals {
+			if v != "" {
+				_ = os.Setenv(k, v)
+			}
+		}
+	}()
+
+	ten, runs := seedTenantWithDB(t)
+	cfg := BackupNowConfig{Tenants: ten, Runs: runs}
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/tenants/alpha/backup-now", nil)
+	backupNowRouter(cfg).ServeHTTP(rr, req)
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("want 500, got %d; body=%q", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "Fargate env misconfigured") {
+		t.Errorf("want 'Fargate env misconfigured' in body, got %q", rr.Body.String())
+	}
 }

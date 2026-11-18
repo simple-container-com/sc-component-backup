@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -95,10 +96,18 @@ func NewBackupNowHandler(cfg BackupNowConfig) http.Handler {
 			return
 		}
 
-		// Fargate path — when the Lambda has an ECS cluster wired, dispatch
-		// via RunTask so the dump doesn't run in-process (OOM at 128MB
-		// default, Lambda freeze on async goroutines).
-		if fcfg, err := ReadFargateDispatchConfigFromEnv(); err == nil {
+		// Fargate path — when BACKUP_ECS_CLUSTER_NAME is set we're in
+		// Lambda mode and MUST dispatch via RunTask (the in-process
+		// scheduler.RunOnce path OOMs at 128MB default and Lambda freezes
+		// async goroutines). A missing sibling env is a configuration
+		// bug — fail loud rather than silently fall back to the broken
+		// in-process shape.
+		if strings.TrimSpace(os.Getenv("BACKUP_ECS_CLUSTER_NAME")) != "" {
+			fcfg, err := ReadFargateDispatchConfigFromEnv()
+			if err != nil {
+				http.Error(w, `{"error":"Fargate env misconfigured: `+jsonEscape(err.Error())+`"}`, http.StatusInternalServerError)
+				return
+			}
 			run, taskArn, dispatchErr := dispatchViaFargate(r.Context(), cfg, fcfg, t, resource)
 			if dispatchErr != nil {
 				http.Error(w, `{"error":"`+jsonEscape(dispatchErr.Error())+`"}`, http.StatusInternalServerError)
