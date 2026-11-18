@@ -229,7 +229,21 @@ func main() {
 			Archive: archiveStore,
 		}).ServeHTTP)
 		r.Get("/api/v1/backups", api.NewBackupsListHandler(metaStore.Runs()).ServeHTTP)
-		r.Post("/api/v1/tenants/{stack}/backup-now", api.NewBackupNowHandler(sch, metaStore.Tenants()).ServeHTTP)
+		r.Post("/api/v1/tenants/{stack}/backup-now", api.NewBackupNowHandler(api.BackupNowConfig{
+			Sch:          sch,
+			Tenants:      metaStore.Tenants(),
+			Runs:         metaStore.Runs(),
+			MintWorker:   api.MintWorkerJWT([]byte(jwtSecret)),
+			AgentURL:     strings.TrimRight(os.Getenv("BACKUP_AGENT_URL"), "/"),
+			PathTemplate: "", // scheduler default; shared string
+		}).ServeHTTP)
+		// Internal callback — the Fargate worker POSTs here on exit
+		// with status + size + s3 path + error. Service-token authed
+		// (JWTMiddleware above) with the op="worker" JWT minted by
+		// backup-now's MintWorker when it fired RunTask.
+		r.Post("/api/v1/internal/runs/{id}/complete", api.InternalRunComplete(api.InternalRunCompleteConfig{
+			Runs: metaStore.Runs(),
+		}).ServeHTTP)
 		r.Post("/api/v1/tenants/{stack}/restore", api.NewRestoreHandler(sch, metaStore.Runs()).ServeHTTP)
 		r.Get("/api/v1/restores/{id}", api.NewRestoreStatusHandler(metaStore.Runs()).ServeHTTP)
 

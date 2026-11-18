@@ -21,10 +21,13 @@ package main
 // runs long-lived and dumps in-process — worker mode is unused.
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -79,6 +82,7 @@ func runWorker(ctx context.Context) int {
 	d, err := driver.ByName(driverName)
 	if err != nil {
 		slog.Error("unknown driver", "driver", driverName, "err", err)
+		postCompleteCallback(ctx, workerCallbackPayload{Status: "failed", Error: "unknown driver: " + driverName})
 		return 2
 	}
 
@@ -95,6 +99,7 @@ func runWorker(ctx context.Context) int {
 	})
 	if err != nil {
 		slog.Error("s3 store init failed", "err", err)
+		postCompleteCallback(ctx, workerCallbackPayload{Status: "failed", Error: "s3 init: " + err.Error()})
 		return 1
 	}
 
@@ -128,10 +133,88 @@ func runWorker(ctx context.Context) int {
 	n, err := s3.Put(ctx, s3Key, pr)
 	if err != nil {
 		slog.Error("upload failed", "err", err, "elapsed", time.Since(start).String())
+		postCompleteCallback(ctx, workerCallbackPayload{
+			Status: "failed",
+			Error:  "upload: " + err.Error(),
+		})
 		return 1
 	}
 	slog.Info("upload finished", "elapsed", time.Since(start).String(), "key", s3Key, "bytes", n)
+	// Callback to the Lambda — flips the BackupRun row from `running` to
+	// `succeeded` with the final byte count + S3 key. Env comes from the
+	// RunTask overrides in ecs_dispatch.go.
+	postCompleteCallback(ctx, workerCallbackPayload{
+		Status: "ok",
+		Bytes:  n,
+		S3Path: s3Key,
+	})
 	return 0
+}
+
+// workerCallbackPayload mirrors api.InternalRunCompleteRequest. Kept a
+// local type because the worker binary intentionally does not import
+// the service's HTTP handlers (same package would make the worker
+// link in every handler's deps).
+type workerCallbackPayload struct {
+	Status string `json:"status"`
+	Bytes  int64  `json:"bytes,omitempty"`
+	S3Path string `json:"s3_path,omitempty"`
+	Error  string `json:"error,omitempty"`
+}
+
+// postCompleteCallback POSTs the run outcome back to the Lambda. Env
+// required: BACKUP_AGENT_URL, BACKUP_AGENT_TOKEN, BACKUP_RUN_ID. When
+// any is missing (legacy dispatch path that didn't inject them, or a
+// test harness) the worker logs + skips — the stuck-run watchdog
+// reclassifies the row at next Lambda startup as the fallback.
+//
+// Best-effort with a short timeout + log-only error: a Fargate task
+// still exited 0 if the dump + upload succeeded; a failed callback
+// means the SPA shows the row as `running` until the watchdog runs,
+// NOT a corrupted archive.
+func postCompleteCallback(ctx context.Context, body workerCallbackPayload) {
+	agentURL := strings.TrimRight(os.Getenv("BACKUP_AGENT_URL"), "/")
+	token := os.Getenv("BACKUP_AGENT_TOKEN")
+	runID := os.Getenv("BACKUP_RUN_ID")
+	if agentURL == "" || token == "" || runID == "" {
+		slog.Info(
+			"worker callback skipped — missing env",
+			"agent_url_set", agentURL != "",
+			"token_set", token != "",
+			"run_id_set", runID != "",
+		)
+		return
+	}
+	payload, err := json.Marshal(body)
+	if err != nil {
+		slog.Error("worker callback marshal failed", "err", err)
+		return
+	}
+	cbCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(
+		cbCtx, http.MethodPost,
+		agentURL+"/api/v1/internal/runs/"+runID+"/complete",
+		bytes.NewReader(payload),
+	)
+	if err != nil {
+		slog.Error("worker callback build failed", "err", err)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		slog.Error("worker callback POST failed", "err", err, "url", agentURL)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		slog.Error("worker callback non-2xx", "status", resp.StatusCode, "body", string(respBody))
+		return
+	}
+	slog.Info("worker callback ok", "status", resp.StatusCode, "run_id", runID, "payload_status", body.Status)
 }
 
 func mustEnv(name string) string {
