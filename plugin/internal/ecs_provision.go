@@ -34,6 +34,7 @@ import (
 	"fmt"
 
 	"github.com/pkg/errors"
+	"github.com/pulumi/pulumi-aws/sdk/v6/go/aws/cloudwatch"
 	"github.com/pulumi/pulumi-aws/sdk/v6/go/aws/ecs"
 	"github.com/pulumi/pulumi-aws/sdk/v6/go/aws/iam"
 	sdk "github.com/pulumi/pulumi/sdk/v3/go/pulumi"
@@ -252,6 +253,26 @@ func ProvisionEcsWorker(ctx *sdk.Context, in EcsProvisionInput) (*EcsProvisionOu
 	// Container definition for the task. One container named "worker"
 	// (matches scheduler_tick.go's ContainerOverride.Name reference).
 	// Command is empty (image's ENTRYPOINT is /app/backup); env flips mode.
+	// Pulumi-create the log group rather than relying on the ECS
+	// `awslogs-create-group: true` auto-create: the managed policy
+	// `AmazonECSTaskExecutionRolePolicy` grants `logs:CreateLogStream`
+	// + `logs:PutLogEvents` but NOT `logs:CreateLogGroup`, so the
+	// first-ever task on a fresh cluster stops with
+	// `ResourceInitializationError: failed to validate logger args: The
+	// task cannot find the Amazon CloudWatch log group defined in the
+	// task definition` (live-caught 2026-11-18 on backup-my-backup's
+	// first Fargate Run Now). Explicit creation makes the dependency
+	// graph correct + avoids granting the broader CreateLogGroup
+	// permission on the task-execution role.
+	logGroupName := fmt.Sprintf("/ecs/sc-backup-%s-worker", in.ComponentResourceName)
+	logGroup, err := cloudwatch.NewLogGroup(ctx, logGroupName, &cloudwatch.LogGroupArgs{
+		Name:            sdk.String(logGroupName),
+		RetentionInDays: sdk.Int(14),
+	}, sdk.Provider(in.AwsProvider))
+	if err != nil {
+		return nil, errors.Wrap(err, "cloudwatch.NewLogGroup (worker)")
+	}
+
 	containerDef := []map[string]any{
 		{
 			"name":  "worker",
@@ -263,10 +284,9 @@ func ProvisionEcsWorker(ctx *sdk.Context, in EcsProvisionInput) (*EcsProvisionOu
 			"logConfiguration": map[string]any{
 				"logDriver": "awslogs",
 				"options": map[string]string{
-					"awslogs-group":         fmt.Sprintf("/ecs/sc-backup-%s-worker", in.ComponentResourceName),
+					"awslogs-group":         logGroupName,
 					"awslogs-region":        in.Region,
 					"awslogs-stream-prefix": "worker",
-					"awslogs-create-group":  "true",
 				},
 			},
 		},
@@ -288,7 +308,7 @@ func ProvisionEcsWorker(ctx *sdk.Context, in EcsProvisionInput) (*EcsProvisionOu
 		ExecutionRoleArn:     execRole.Arn,
 		TaskRoleArn:          taskRole.Arn,
 		ContainerDefinitions: sdk.String(string(containerDefJSON)),
-	}, sdk.Provider(in.AwsProvider), sdk.DependsOn([]sdk.Resource{cluster}))
+	}, sdk.Provider(in.AwsProvider), sdk.DependsOn([]sdk.Resource{cluster, logGroup}))
 	if err != nil {
 		return nil, errors.Wrap(err, "ecs.NewTaskDefinition")
 	}
