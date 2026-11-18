@@ -18,6 +18,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
@@ -127,26 +128,43 @@ func NewS3Store(ctx context.Context, cfg S3Config) (*S3Store, error) {
 // future streaming-dump path either enables TLS, or buffers upstream).
 func (s *S3Store) Put(ctx context.Context, path string, body io.Reader) (int64, error) {
 	path = strings.TrimPrefix(path, "/")
-	var ioBody io.Reader = body
-	var declaredSize int64 = -1
+	// Seekable → PutObject with declared Content-Length (in-process path:
+	// `bytes.NewReader(buf.Bytes())` in scheduler.RunOnce).
 	if br, ok := body.(*bytes.Reader); ok {
-		declaredSize = int64(br.Len())
-		ioBody = br // SDK will see io.ReadSeeker + Content-Length
-	} else {
-		ioBody = &countingReader{r: body}
+		declaredSize := int64(br.Len())
+		_, err := s.client.PutObject(ctx, &s3.PutObjectInput{
+			Bucket: aws.String(s.cfg.Bucket),
+			Key:    aws.String(path),
+			Body:   br,
+		})
+		if err != nil {
+			return 0, fmt.Errorf("s3 put %q: %w", path, err)
+		}
+		return declaredSize, nil
 	}
-	_, err := s.client.PutObject(ctx, &s3.PutObjectInput{
+	// Unknown-length stream (Fargate worker piping mongodump stdout) —
+	// S3 PutObject refuses with "411 MissingContentLength" because the
+	// SDK can't buffer the whole body before sending. The multipart
+	// Uploader handles unknown-length streams natively: it splits the
+	// Reader into parts as it reads, uploads each part, and completes
+	// the multipart upload on EOF. No Content-Length required.
+	cr := &countingReader{r: body}
+	uploader := manager.NewUploader(s.client, func(u *manager.Uploader) {
+		// 10 MiB parts strike a balance between request count (low
+		// enough for small DBs to finish in one or two parts) and
+		// memory (each in-flight part buffers up to PartSize bytes
+		// in the Uploader). Default concurrency (5) is fine.
+		u.PartSize = 10 * 1024 * 1024
+	})
+	_, err := uploader.Upload(ctx, &s3.PutObjectInput{
 		Bucket: aws.String(s.cfg.Bucket),
 		Key:    aws.String(path),
-		Body:   ioBody,
+		Body:   cr,
 	})
 	if err != nil {
 		return 0, fmt.Errorf("s3 put %q: %w", path, err)
 	}
-	if declaredSize >= 0 {
-		return declaredSize, nil
-	}
-	return ioBody.(*countingReader).n, nil
+	return cr.n, nil
 }
 
 func (s *S3Store) Get(ctx context.Context, path string) (io.ReadCloser, error) {
