@@ -162,6 +162,27 @@ func (s *MongoRunStore) ListBackupsByTenant(ctx context.Context, tenantStack str
 	return rows, nil
 }
 
+// ListAllBackups returns runs across every tenant, newest first. The
+// {startedAt:-1} index covers the sort so this is a bounded scan. A
+// positive limit caps the Lambda-side slice; the index on startedAt
+// keeps the server-side scan to the newest N rows.
+func (s *MongoRunStore) ListAllBackups(ctx context.Context, limit int) ([]backup.BackupRun, error) {
+	opts := options.Find().SetSort(bson.D{{Key: "startedAt", Value: -1}})
+	if limit > 0 {
+		opts = opts.SetLimit(int64(limit))
+	}
+	cursor, err := s.backups.Find(ctx, bson.M{}, opts)
+	if err != nil {
+		return nil, errors.Wrap(err, "mongo find backup_runs (all)")
+	}
+	defer cursor.Close(ctx)
+	var rows []backup.BackupRun
+	if err := cursor.All(ctx, &rows); err != nil {
+		return nil, errors.Wrap(err, "mongo cursor all backup_runs (all)")
+	}
+	return rows, nil
+}
+
 // PutRestore inserts a fresh RestoreRun row or replaces an existing
 // one by `_id`. Mirrors PutBackup.
 func (s *MongoRunStore) PutRestore(ctx context.Context, run backup.RestoreRun) error {

@@ -93,6 +93,36 @@ func (s *mysqlRunStore) ListBackupsByTenant(ctx context.Context, tenantStack str
 	return out, nil
 }
 
+func (s *mysqlRunStore) ListAllBackups(ctx context.Context, limit int) ([]backup.BackupRun, error) {
+	q := `SELECT data FROM backup_runs ORDER BY started_at DESC`
+	args := []any{}
+	if limit > 0 {
+		q += ` LIMIT ?`
+		args = append(args, limit)
+	}
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("mysql runs list-all: %w", err)
+	}
+	defer rows.Close()
+	var out []backup.BackupRun
+	for rows.Next() {
+		var raw sql.RawBytes
+		if err := rows.Scan(&raw); err != nil {
+			return nil, fmt.Errorf("mysql runs list-all scan: %w", err)
+		}
+		var r backup.BackupRun
+		if err := json.Unmarshal(raw, &r); err != nil {
+			return nil, fmt.Errorf("mysql runs list-all unmarshal: %w", err)
+		}
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("mysql runs list-all rows: %w", err)
+	}
+	return out, nil
+}
+
 func (s *mysqlRunStore) PutRestore(ctx context.Context, run backup.RestoreRun) error {
 	raw, err := json.Marshal(run)
 	if err != nil {

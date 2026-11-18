@@ -66,6 +66,33 @@ func (r colocRuns) ListBackupsByTenant(ctx context.Context, tenantStack string) 
 	return out, nil
 }
 
+// ListAllBackups walks every tenant's runs prefix and merges. S3 LIST
+// is O(#rows) per tenant and there is no server-side cross-prefix sort;
+// we sort client-side after reading. For cross-tenant /history on a
+// colocated-meta deployment this is fine while total row count stays
+// in the low thousands — the Mongo-backed store is preferred for
+// scale. Unlike ListBackupsByTenant, we call `List` with just the
+// runs root prefix so we visit every tenant folder in one shot.
+func (r colocRuns) ListAllBackups(ctx context.Context, limit int) ([]backup.BackupRun, error) {
+	rows, err := r.s.archive.List(ctx, metaPrefix+"runs/")
+	if err != nil {
+		return nil, err
+	}
+	out := make([]backup.BackupRun, 0, len(rows))
+	for _, obj := range rows {
+		var run backup.BackupRun
+		if ok, err := r.s.getJSON(ctx, obj.Path, &run); err != nil || !ok {
+			continue
+		}
+		out = append(out, run)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].StartedAt.After(out[j].StartedAt) })
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
 func (r colocRuns) PutRestore(ctx context.Context, run backup.RestoreRun) error {
 	return r.s.putJSON(ctx, restoreRunKey(run), run)
 }
