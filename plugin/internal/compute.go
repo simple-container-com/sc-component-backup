@@ -149,6 +149,35 @@ func (p *Processor) Process(ctx *sdk.Context, _ api.Stack, input api.ResourceInp
 		}
 	}
 
+	// Discovery found nothing. The operator explicitly listed this
+	// component in `uses:`, so "no databases" is far more likely to be a
+	// discovery miss (a no-op/cached sibling resource, a `uses:` ordering
+	// change, plugin version skew) than a genuine stateless consumer.
+	//
+	// Registering anyway would push a resource-less record. The service
+	// now defends against that (tenants_register.go preserves existing
+	// resources), but the plugin should not send a registration it knows
+	// carries no information: an older service build would overwrite a
+	// live scoped-user URI and silently stop backing the tenant up.
+	//
+	// Live-caught 2026-11-18 on forge-conductor — an unrelated deploy
+	// wiped the resources of the fleet's largest DB (1.78 GB).
+	//
+	// WARN + skip rather than fail the deploy: a genuinely stateless
+	// consumer that lists the component must not be blocked from
+	// deploying, and the warning is visible in the deploy log.
+	if len(record.Resources) == 0 {
+		if p.cfg.Progress != nil {
+			p.cfg.Progress.Warn("compute-process", fmt.Sprintf(
+				"component %q: no database siblings discovered for tenant %q — SKIPPING registration so an existing record is not overwritten. If this consumer does have a DB, check that %q is listed LAST in its `uses:` (discovery only sees env from preceding entries).",
+				resName, stackName, resName,
+			))
+		}
+		collector.AddEnvVariableIfNotExist(backupAgentURLVar, serviceURL, resType, resName, stackName)
+		collector.AddSecretEnvVariableIfNotExist(backupTokenVar, tenantToken, resType, resName, stackName)
+		return &api.ResourceOutput{Ref: sdk.String(fmt.Sprintf("backup-compute:%s:%s", resType, resName)).ToStringOutput()}, nil
+	}
+
 	if err := p.pushRegister(ctx.Context(), serviceURL, tenantToken, record); err != nil {
 		// The consumer's deploy fails, with a diagnosable error naming
 		// the component as the blocker (per §P3 non-silent-skip rule).

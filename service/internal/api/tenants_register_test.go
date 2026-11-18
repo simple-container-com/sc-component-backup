@@ -5,6 +5,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -117,4 +118,134 @@ func TestTenantsRegister_Unsigned(t *testing.T) {
 	mux.ServeHTTP(rr, req)
 
 	Expect(rr.Code).To(Equal(http.StatusUnauthorized))
+}
+
+// TestTenantsRegister_EmptyResourcesPreservesExisting is the regression
+// guard for the 2026-11-18 forge-conductor incident: an UNRELATED deploy
+// re-ran ComputeProcess, discovery came up empty, and the blind Upsert
+// replaced a record carrying a live scoped-user URI with one carrying
+// nothing — silently making the fleet's largest DB (1.78 GB)
+// unbackupable, with `backup-now` answering 400 and no alert anywhere.
+func TestTenantsRegister_EmptyResourcesPreservesExisting(t *testing.T) {
+	RegisterTestingT(t)
+
+	store := tenant.NewInMemoryStore()
+	mux := http.NewServeMux()
+	mux.Handle("POST /api/v1/tenants/register", JWTMiddleware([]byte(testKey))(TenantsRegister(store)))
+
+	// A good record already exists, as a working consumer would have.
+	good := tenant.Record{
+		StackName: "live-consumer",
+		Version:   "v1",
+		Resources: []tenant.Resource{{
+			Type: "mongodb",
+			Name: "live-consumer",
+			Connection: map[string]string{
+				"driver":   "mongodb",
+				"uri":      "mongodb://peer-live-consumer:secret@host/live-consumer",
+				"database": "live-consumer",
+				"cluster":  "mongodb",
+			},
+		}},
+		CreatedAt: time.Now().UTC().Add(-2 * time.Hour),
+	}
+	Expect(store.Upsert(context.Background(), good)).To(Succeed())
+
+	// A later deploy registers with NO resources (discovery miss).
+	body, _ := json.Marshal(map[string]any{
+		"stackName": "live-consumer",
+		"version":   "v2",
+		"resources": []any{},
+	})
+	req := httptest.NewRequest("POST", "/api/v1/tenants/register", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+mintTestJWT(t, "live-consumer"))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+	Expect(rr.Code).To(Equal(http.StatusOK))
+
+	got, found, err := store.Get(req.Context(), "live-consumer")
+	Expect(err).ToNot(HaveOccurred())
+	Expect(found).To(BeTrue())
+
+	// The resources survived — the tenant is still backupable.
+	Expect(got.Resources).To(HaveLen(1), "empty-resources registration must not wipe a live record")
+	Expect(got.Resources[0].Connection["database"]).To(Equal("live-consumer"))
+	Expect(got.Resources[0].Connection["uri"]).To(ContainSubstring("peer-live-consumer"))
+	// CreatedAt is preserved so the tenant's age isn't reset by the skew.
+	Expect(got.CreatedAt).To(Equal(good.CreatedAt))
+	// Everything else still updates.
+	Expect(got.Version).To(Equal("v2"))
+	Expect(got.LastSeenAt).To(BeTemporally(">", good.CreatedAt))
+}
+
+// TestTenantsRegister_EmptyResourcesOnFreshTenantStillRegisters — the
+// preserve rule must not block a genuinely new, genuinely stateless
+// consumer from registering.
+func TestTenantsRegister_EmptyResourcesOnFreshTenantStillRegisters(t *testing.T) {
+	RegisterTestingT(t)
+
+	store := tenant.NewInMemoryStore()
+	mux := http.NewServeMux()
+	mux.Handle("POST /api/v1/tenants/register", JWTMiddleware([]byte(testKey))(TenantsRegister(store)))
+
+	body, _ := json.Marshal(map[string]any{
+		"stackName": "stateless-consumer",
+		"version":   "v1",
+		"resources": []any{},
+	})
+	req := httptest.NewRequest("POST", "/api/v1/tenants/register", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+mintTestJWT(t, "stateless-consumer"))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+	Expect(rr.Code).To(Equal(http.StatusOK))
+
+	got, found, err := store.Get(req.Context(), "stateless-consumer")
+	Expect(err).ToNot(HaveOccurred())
+	Expect(found).To(BeTrue())
+	Expect(got.Resources).To(BeEmpty())
+}
+
+// TestTenantsRegister_NonEmptyResourcesStillReplace — a registration
+// that DOES carry resources replaces the old set (rotated credentials,
+// added/removed databases must propagate).
+func TestTenantsRegister_NonEmptyResourcesStillReplace(t *testing.T) {
+	RegisterTestingT(t)
+
+	store := tenant.NewInMemoryStore()
+	mux := http.NewServeMux()
+	mux.Handle("POST /api/v1/tenants/register", JWTMiddleware([]byte(testKey))(TenantsRegister(store)))
+
+	Expect(store.Upsert(context.Background(), tenant.Record{
+		StackName: "rotating-consumer",
+		Version:   "v1",
+		Resources: []tenant.Resource{{
+			Type:       "mongodb",
+			Name:       "rotating-consumer",
+			Connection: map[string]string{"driver": "mongodb", "uri": "mongodb://old:old@host/db", "database": "db"},
+		}},
+	})).To(Succeed())
+
+	body, _ := json.Marshal(map[string]any{
+		"stackName": "rotating-consumer",
+		"version":   "v2",
+		"resources": []map[string]any{{
+			"type": "mongodb",
+			"name": "rotating-consumer",
+			"connection": map[string]string{
+				"driver": "mongodb", "uri": "mongodb://new:new@host/db", "database": "db",
+			},
+		}},
+	})
+	req := httptest.NewRequest("POST", "/api/v1/tenants/register", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+mintTestJWT(t, "rotating-consumer"))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+	Expect(rr.Code).To(Equal(http.StatusOK))
+
+	got, _, _ := store.Get(req.Context(), "rotating-consumer")
+	Expect(got.Resources).To(HaveLen(1))
+	Expect(got.Resources[0].Connection["uri"]).To(ContainSubstring("new:new"), "rotated credentials must propagate")
 }
