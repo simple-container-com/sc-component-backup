@@ -162,6 +162,19 @@ func (s *MongoRunStore) ListBackupsByTenant(ctx context.Context, tenantStack str
 	return rows, nil
 }
 
+// DeleteBackupsByTenant drops every backup-run row for the given
+// tenant. The {tenantStack:1} index covers the filter.
+func (s *MongoRunStore) DeleteBackupsByTenant(ctx context.Context, tenantStack string) (int, error) {
+	if tenantStack == "" {
+		return 0, nil
+	}
+	res, err := s.backups.DeleteMany(ctx, bson.M{"tenantStack": tenantStack})
+	if err != nil {
+		return 0, errors.Wrap(err, "mongo delete many backup_runs by tenant")
+	}
+	return int(res.DeletedCount), nil
+}
+
 // ListAllBackups returns runs across every tenant, newest first. The
 // {startedAt:-1} index covers the sort so this is a bounded scan. A
 // positive limit caps the Lambda-side slice; the index on startedAt

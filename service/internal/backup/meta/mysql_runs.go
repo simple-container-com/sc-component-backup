@@ -93,6 +93,18 @@ func (s *mysqlRunStore) ListBackupsByTenant(ctx context.Context, tenantStack str
 	return out, nil
 }
 
+func (s *mysqlRunStore) DeleteBackupsByTenant(ctx context.Context, tenantStack string) (int, error) {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM backup_runs WHERE tenant_stack = ?`, tenantStack)
+	if err != nil {
+		return 0, fmt.Errorf("mysql runs delete-by-tenant: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("mysql runs delete-by-tenant rows: %w", err)
+	}
+	return int(n), nil
+}
+
 func (s *mysqlRunStore) ListAllBackups(ctx context.Context, limit int) ([]backup.BackupRun, error) {
 	q := `SELECT data FROM backup_runs ORDER BY started_at DESC`
 	args := []any{}

@@ -35,6 +35,12 @@ type RunStore interface {
 	// Lambda past its memory budget. The SPA's global /history view is
 	// the primary caller.
 	ListAllBackups(ctx context.Context, limit int) ([]backup.BackupRun, error)
+	// DeleteBackupsByTenant physically drops every backup-run row for
+	// the given tenant. Returns the count of rows removed. Idempotent
+	// — an empty tenant returns 0 with no error. Intended for orphan
+	// cleanup after a consumer stack is destroyed (no destroy event
+	// reaches the backup plugin bus; see pre_destroy.go:22).
+	DeleteBackupsByTenant(ctx context.Context, tenantStack string) (int, error)
 
 	PutRestore(ctx context.Context, run backup.RestoreRun) error
 	UpdateRestore(ctx context.Context, run backup.RestoreRun) error

@@ -95,6 +95,18 @@ func (s *postgresRunStore) ListBackupsByTenant(ctx context.Context, tenantStack 
 	return out, nil
 }
 
+func (s *postgresRunStore) DeleteBackupsByTenant(ctx context.Context, tenantStack string) (int, error) {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM backup_runs WHERE tenant_stack = $1`, tenantStack)
+	if err != nil {
+		return 0, fmt.Errorf("postgres runs delete-by-tenant: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("postgres runs delete-by-tenant rows: %w", err)
+	}
+	return int(n), nil
+}
+
 func (s *postgresRunStore) ListAllBackups(ctx context.Context, limit int) ([]backup.BackupRun, error) {
 	q := `SELECT data::text FROM backup_runs ORDER BY started_at DESC`
 	args := []any{}

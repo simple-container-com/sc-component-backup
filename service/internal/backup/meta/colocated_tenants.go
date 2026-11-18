@@ -64,4 +64,8 @@ func (t colocTenants) SoftDelete(ctx context.Context, stackName string) error {
 	return t.s.putJSON(ctx, tenantKey(stackName), rec)
 }
 
+func (t colocTenants) HardDelete(ctx context.Context, stackName string) error {
+	return t.s.archive.Delete(ctx, tenantKey(stackName))
+}
+
 func (t colocTenants) Close(_ context.Context) error { return nil }

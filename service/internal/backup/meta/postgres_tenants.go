@@ -103,4 +103,11 @@ func (s *postgresTenantStore) SoftDelete(ctx context.Context, stackName string) 
 	return nil
 }
 
+func (s *postgresTenantStore) HardDelete(ctx context.Context, stackName string) error {
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM tenants WHERE stack_name = $1`, stackName); err != nil {
+		return fmt.Errorf("postgres tenants hard-delete: %w", err)
+	}
+	return nil
+}
+
 func (s *postgresTenantStore) Close(_ context.Context) error { return nil }

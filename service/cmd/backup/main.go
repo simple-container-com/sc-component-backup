@@ -213,6 +213,11 @@ func main() {
 		// stays intact — register uses op=register claim).
 		r.Post("/api/v1/tenants/register", api.TenantsRegister(metaStore.Tenants()))
 		r.Get("/api/v1/tenants", api.TenantsList(metaStore.Tenants()))
+		r.Delete("/api/v1/tenants/{name}", api.TenantsDelete(api.TenantsDeleteConfig{
+			Tenants: metaStore.Tenants(),
+			Runs:    metaStore.Runs(),
+			Archive: archiveStore,
+		}).ServeHTTP)
 		r.Get("/api/v1/backups", api.NewBackupsListHandler(metaStore.Runs()).ServeHTTP)
 		r.Post("/api/v1/tenants/{stack}/backup-now", api.NewBackupNowHandler(sch, metaStore.Tenants()).ServeHTTP)
 		r.Post("/api/v1/tenants/{stack}/restore", api.NewRestoreHandler(sch, metaStore.Runs()).ServeHTTP)

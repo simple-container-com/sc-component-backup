@@ -75,6 +75,19 @@ func (s *InMemoryRunStore) ListAllBackups(_ context.Context, limit int) ([]backu
 	return out, nil
 }
 
+func (s *InMemoryRunStore) DeleteBackupsByTenant(_ context.Context, tenantStack string) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for id, r := range s.backups {
+		if r.TenantStack == tenantStack {
+			delete(s.backups, id)
+			n++
+		}
+	}
+	return n, nil
+}
+
 func (s *InMemoryRunStore) PutRestore(_ context.Context, run backup.RestoreRun) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
