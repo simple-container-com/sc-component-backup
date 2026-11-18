@@ -101,4 +101,11 @@ func (s *mysqlTenantStore) SoftDelete(ctx context.Context, stackName string) err
 	return nil
 }
 
+func (s *mysqlTenantStore) HardDelete(ctx context.Context, stackName string) error {
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM tenants WHERE stack_name = ?`, stackName); err != nil {
+		return fmt.Errorf("mysql tenants hard-delete: %w", err)
+	}
+	return nil
+}
+
 func (s *mysqlTenantStore) Close(_ context.Context) error { return nil }

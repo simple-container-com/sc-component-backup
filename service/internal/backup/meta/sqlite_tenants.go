@@ -106,5 +106,12 @@ func (s *sqliteTenantStore) SoftDelete(ctx context.Context, stackName string) er
 	return nil
 }
 
+func (s *sqliteTenantStore) HardDelete(ctx context.Context, stackName string) error {
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM tenants WHERE stack_name = ?`, stackName); err != nil {
+		return fmt.Errorf("sqlite tenants hard-delete: %w", err)
+	}
+	return nil
+}
+
 // Close is a no-op — the parent sqliteStore owns *sql.DB.
 func (s *sqliteTenantStore) Close(_ context.Context) error { return nil }

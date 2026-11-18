@@ -66,6 +66,27 @@ func (r colocRuns) ListBackupsByTenant(ctx context.Context, tenantStack string) 
 	return out, nil
 }
 
+// DeleteBackupsByTenant removes every run JSON under the tenant's
+// runs prefix. Returns the count removed. Idempotent — a missing
+// prefix returns 0 with no error. Caller is responsible for
+// separately removing the archive objects themselves; these are the
+// retention metadata rows, not the archives.
+func (r colocRuns) DeleteBackupsByTenant(ctx context.Context, tenantStack string) (int, error) {
+	prefix := metaPrefix + "runs/" + retention.Enc(tenantStack) + "/"
+	rows, err := r.s.archive.List(ctx, prefix)
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, obj := range rows {
+		if err := r.s.archive.Delete(ctx, obj.Path); err != nil {
+			continue
+		}
+		n++
+	}
+	return n, nil
+}
+
 // ListAllBackups walks every tenant's runs prefix and merges. S3 LIST
 // is O(#rows) per tenant and there is no server-side cross-prefix sort;
 // we sort client-side after reading. For cross-tenant /history on a

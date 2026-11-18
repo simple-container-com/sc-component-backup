@@ -21,6 +21,12 @@ type Store interface {
 	List(ctx context.Context) ([]Record, error)
 	Get(ctx context.Context, stackName string) (Record, bool, error)
 	SoftDelete(ctx context.Context, stackName string) error
+	// HardDelete physically drops the row. Unlike SoftDelete, the row
+	// is unrecoverable afterwards. Intended for orphan cleanup — a
+	// consumer stack destroyed but its tenant row + archives left behind
+	// because the plugin bus has no "consumer destroyed" event. Missing
+	// row is not an error (idempotent).
+	HardDelete(ctx context.Context, stackName string) error
 	Close(ctx context.Context) error
 }
 
@@ -112,6 +118,16 @@ func (s *MongoStore) SoftDelete(ctx context.Context, stackName string) error {
 	return nil
 }
 
+// HardDelete physically drops the row. Idempotent — a missing row is
+// not an error; the operator's intent (be rid of it) is satisfied.
+func (s *MongoStore) HardDelete(ctx context.Context, stackName string) error {
+	_, err := s.collection.DeleteOne(ctx, bson.M{"stackName": stackName})
+	if err != nil {
+		return errors.Wrap(err, "mongo delete one")
+	}
+	return nil
+}
+
 // Close disconnects the Mongo client.
 func (s *MongoStore) Close(ctx context.Context) error {
 	return s.client.Disconnect(ctx)
@@ -162,6 +178,13 @@ func (s *InMemoryStore) SoftDelete(_ context.Context, stackName string) error {
 		r.SoftDeleted = true
 		s.rows[stackName] = r
 	}
+	return nil
+}
+
+func (s *InMemoryStore) HardDelete(_ context.Context, stackName string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.rows, stackName)
 	return nil
 }
 
