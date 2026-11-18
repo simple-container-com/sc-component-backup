@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/simple-container-com/sc-component-backup/service/internal/backup"
+	"github.com/simple-container-com/sc-component-backup/service/internal/backup/alerts"
 	"github.com/simple-container-com/sc-component-backup/service/internal/backup/scheduler"
 	"github.com/simple-container-com/sc-component-backup/service/internal/tenant"
 )
@@ -74,7 +75,7 @@ type StorageStatus struct {
 }
 
 type Alert struct {
-	ID      int    `json:"id"`
+	ID      int64  `json:"id"`
 	TS      string `json:"ts"`
 	Level   string `json:"level"`
 	Project string `json:"project"`
@@ -86,6 +87,13 @@ type OverviewConfig struct {
 	Tenants         tenant.Store
 	Runs            scheduler.RunStore
 	StorageLocation string // e.g. "s3://bucket/prefix" — for the Storage block
+	// Alerts is the dismissal store + synthesizer. When nil, the
+	// Overview handler emits an empty alerts list (pre-feature-2
+	// behavior); non-nil → it walks recent runs, synthesizes
+	// alerts for failed/cancelled ones, and filters out dismissed
+	// ones before rendering.
+	AlertsDismissals  alerts.Dismissals
+	AlertsSynthesizer alerts.Synthesizer
 }
 
 // Overview returns the aggregate home-page response.
@@ -111,6 +119,33 @@ func (c *OverviewConfig) Overview(w http.ResponseWriter, r *http.Request) {
 	}
 	// Alphabetical for stable rendering.
 	sort.Slice(resp.Projects, func(i, j int) bool { return resp.Projects[i].Name < resp.Projects[j].Name })
+
+	// Alerts: synthesize from recent failed/cancelled runs, filter
+	// via the dismissal store. A nil Dismissals store (older
+	// deployments / local-dev smoke) keeps the empty-list behavior.
+	// A failure in the alerts path should NOT take the overview
+	// down — log + render with an empty alert feed.
+	if c.AlertsDismissals != nil {
+		tenantNames := make([]string, 0, len(tenants))
+		for _, t := range tenants {
+			tenantNames = append(tenantNames, t.StackName)
+		}
+		if state, serr := c.AlertsDismissals.State(r.Context()); serr == nil {
+			if items, eerr := c.AlertsSynthesizer.Emit(r.Context(), tenantNames, c.Runs, state); eerr == nil {
+				out := make([]Alert, 0, len(items))
+				for _, a := range items {
+					out = append(out, Alert{
+						ID:      a.ID,
+						TS:      a.TS,
+						Level:   string(a.Level),
+						Project: a.Project,
+						Text:    a.Text,
+					})
+				}
+				resp.Alerts = out
+			}
+		}
+	}
 	writeJSON(w, http.StatusOK, resp)
 }
 
