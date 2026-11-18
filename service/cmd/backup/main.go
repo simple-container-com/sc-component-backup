@@ -161,6 +161,12 @@ func main() {
 	testConnCfg := &api.TestConnectionConfig{Projects: metaStore.Projects(), Timeout: 10 * time.Second}
 	cancelCfg := &api.CancelConfig{Runs: metaStore.Runs()}
 	statsCfg := &api.StatsConfig{Snapshots: metaStore.Snapshots(), Runs: metaStore.Runs()}
+	downloadCfg := &api.DownloadConfig{Archive: archiveStore}
+	archivesCfg := &api.ArchivesConfig{
+		Tenants:  metaStore.Tenants(),
+		Runs:     metaStore.Runs(),
+		Projects: metaStore.Projects(),
+	}
 
 	// Unauthenticated endpoints — healthz + the session probe + login/logout.
 	router.Get("/healthz", api.Healthz)
@@ -219,6 +225,21 @@ func main() {
 		// (worker-side signal plumbing is a 1e.4 follow-up).
 		r.Post("/api/v1/test-connection", testConnCfg.TestConnection)
 		r.Post("/api/v1/projects/{name}/cancel", cancelCfg.Cancel)
+
+		// SPA SPA+API gap feature 1 (2026-11-18): archive inventory +
+		// presigned-URL download for the SPA's ArchivesTab.
+		//   - `GET /api/v1/projects/{name}/archives` groups the tenant's
+		//     successful backup runs by target database + attaches
+		//     retention keep-reasons so the operator sees what's
+		//     protecting each archive.
+		//   - `GET /api/v1/download?key=X` 302-redirects to a signed
+		//     GET URL on the archive store (short TTL). Browser follows
+		//     the redirect and downloads directly from S3 / FSStore —
+		//     the Lambda doesn't stream the body, so there's no 6 MB
+		//     API Gateway cap and no double egress.
+		// Both sit behind the JWT middleware (operator session).
+		r.Get("/api/v1/projects/{name}/archives", archivesCfg.Archives)
+		r.Get("/api/v1/download", downloadCfg.Download)
 	})
 
 	// Embedded SPA.
