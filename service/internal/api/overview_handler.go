@@ -60,6 +60,25 @@ type RunSummary struct {
 	DbOK       int      `json:"db_ok"`
 	DbFailed   int      `json:"db_failed"`
 	Bytes      int64    `json:"bytes"`
+	// Per-database result rows. The SPA's HistoryTab/DbTable iterate
+	// this directly on run-row expand — `[...run.databases].sort(...)`
+	// throws "e is not iterable" when the field is absent. Today the
+	// backup engine runs one database per BackupRun, so this is always
+	// exactly one entry (synthesized from the run itself). Multi-DB
+	// runs (slice 1e.3) will emit a true array.
+	Databases []DbRun `json:"databases"`
+}
+
+// DbRun is one per-database result row inside a RunSummary. Shape
+// matches the SPA's `DbRun` in service/internal/ui/src/api/types.ts.
+type DbRun struct {
+	Database string  `json:"database"`
+	Status   string  `json:"status"`
+	Bytes    int64   `json:"bytes"`
+	Seconds  int     `json:"seconds"`
+	Attempts int     `json:"attempts"`
+	Error    *string `json:"error"`
+	Key      *string `json:"key"`
 }
 
 type RunningOp struct {
@@ -221,6 +240,7 @@ func backupRunToSummary(r backup.BackupRun) RunSummary {
 		StartedAt: r.StartedAt.UTC().Format(time.RFC3339),
 		Warnings:  []string{},
 		Bytes:     r.SizeBytes,
+		Databases: []DbRun{},
 	}
 	if !r.FinishedAt.IsZero() {
 		s := r.FinishedAt.UTC().Format(time.RFC3339)
@@ -238,7 +258,62 @@ func backupRunToSummary(r backup.BackupRun) RunSummary {
 	if r.Status == backup.StatusFailed {
 		rs.DbFailed = 1
 	}
+	// Synthesize the single per-database row from this run so the
+	// SPA's DbTable never spreads undefined. ResourceName is the DB
+	// name as the scheduler saw it; fall back to the driver name when
+	// an older row was written before the resource name was tracked.
+	db := DbRun{
+		Database: r.ResourceName,
+		Status:   mapDbStatus(r.Status),
+		Bytes:    r.SizeBytes,
+		Seconds:  computeDbSeconds(r.StartedAt, r.FinishedAt),
+		Attempts: 1,
+	}
+	if db.Database == "" {
+		db.Database = r.Driver
+	}
+	if r.Error != "" {
+		e := r.Error
+		db.Error = &e
+	}
+	if r.S3Path != "" {
+		k := r.S3Path
+		db.Key = &k
+	}
+	rs.Databases = append(rs.Databases, db)
 	return rs
+}
+
+// mapDbStatus maps a BackupRun.Status to the SPA's DbRun.status enum
+// (ok|unchanged|failed|partial|running|interrupted|skipped). Values
+// without a per-database counterpart fall back to the run-level status
+// string.
+func mapDbStatus(s backup.Status) string {
+	switch s {
+	case backup.StatusSucceeded:
+		return "ok"
+	case backup.StatusFailed:
+		return "failed"
+	case backup.StatusCancelled:
+		return "interrupted"
+	case backup.StatusRunning, backup.StatusPending:
+		return "running"
+	default:
+		return string(s)
+	}
+}
+
+// computeDbSeconds returns the run duration in seconds, or 0 for a
+// run still in flight (FinishedAt is the time.Time zero value).
+func computeDbSeconds(started, finished time.Time) int {
+	if finished.IsZero() {
+		return 0
+	}
+	d := finished.Sub(started)
+	if d < 0 {
+		return 0
+	}
+	return int(d.Seconds())
 }
 
 func mapTrigger(src string) string {
