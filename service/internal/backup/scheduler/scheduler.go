@@ -29,6 +29,12 @@ type RunStore interface {
 	UpdateBackup(ctx context.Context, run backup.BackupRun) error
 	GetBackup(ctx context.Context, id string) (backup.BackupRun, error)
 	ListBackupsByTenant(ctx context.Context, tenantStack string) ([]backup.BackupRun, error)
+	// ListAllBackups returns runs across every tenant, newest first.
+	// `limit <= 0` means "no cap"; callers that page through the
+	// result SHOULD pass a cap so a growing collection doesn't push a
+	// Lambda past its memory budget. The SPA's global /history view is
+	// the primary caller.
+	ListAllBackups(ctx context.Context, limit int) ([]backup.BackupRun, error)
 
 	PutRestore(ctx context.Context, run backup.RestoreRun) error
 	UpdateRestore(ctx context.Context, run backup.RestoreRun) error

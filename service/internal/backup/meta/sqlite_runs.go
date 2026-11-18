@@ -98,6 +98,36 @@ func (s *sqliteRunStore) ListBackupsByTenant(ctx context.Context, tenantStack st
 	return out, nil
 }
 
+func (s *sqliteRunStore) ListAllBackups(ctx context.Context, limit int) ([]backup.BackupRun, error) {
+	q := `SELECT data FROM backup_runs ORDER BY started_at DESC`
+	args := []any{}
+	if limit > 0 {
+		q += ` LIMIT ?`
+		args = append(args, limit)
+	}
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite runs list-all: %w", err)
+	}
+	defer rows.Close()
+	var out []backup.BackupRun
+	for rows.Next() {
+		var raw string
+		if err := rows.Scan(&raw); err != nil {
+			return nil, fmt.Errorf("sqlite runs list-all scan: %w", err)
+		}
+		var r backup.BackupRun
+		if err := json.Unmarshal([]byte(raw), &r); err != nil {
+			return nil, fmt.Errorf("sqlite runs list-all unmarshal: %w", err)
+		}
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("sqlite runs list-all rows: %w", err)
+	}
+	return out, nil
+}
+
 func (s *sqliteRunStore) PutRestore(ctx context.Context, run backup.RestoreRun) error {
 	raw, err := json.Marshal(run)
 	if err != nil {

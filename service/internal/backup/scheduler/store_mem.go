@@ -61,6 +61,20 @@ func (s *InMemoryRunStore) ListBackupsByTenant(_ context.Context, tenantStack st
 	return out, nil
 }
 
+func (s *InMemoryRunStore) ListAllBackups(_ context.Context, limit int) ([]backup.BackupRun, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]backup.BackupRun, 0, len(s.backups))
+	for _, r := range s.backups {
+		out = append(out, r)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].StartedAt.After(out[j].StartedAt) })
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
 func (s *InMemoryRunStore) PutRestore(_ context.Context, run backup.RestoreRun) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
