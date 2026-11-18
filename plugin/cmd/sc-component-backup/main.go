@@ -271,6 +271,17 @@ func (p *backupPlugin) Schema(_ context.Context, _ *scpluginv1.SchemaRequest) (*
 			backupApi.ResourceType: {Values: []string{
 				"image", "env", "ingressRoutes", "imagePullSecretRef", "cloudExtras",
 				"worker", "storage", "metadata", "operatorPassword",
+				// Compute-shape overrides for the dispatched aws-lambda
+				// template. The default Lambda memory (128 MB) OOMs any
+				// mongodump bigger than a handful of MB on the in-process
+				// scheduler.RunOnce path (requestId 06a3aa57 on
+				// backup.simple-forge.com, forge-notifier adoption
+				// 2026-11-18). Design doc §P1 v1.5 names "memory/timeout/
+				// vpc/iam" as the operator-wins compute shape; these two
+				// keys are the half that was never landed on the allowlist.
+				// Follow-up: route Run Now through Fargate so Lambda
+				// memory stops mattering.
+				"maxMemory", "timeout",
 				// Removed in Tier-4 (sc-components-plugin-peer-invoke):
 				//   - databases: discovery is auto now (slice 1d.7, api v2026.11.59)
 				//   - atlasAdmin: creds live on the mongodb resource;
