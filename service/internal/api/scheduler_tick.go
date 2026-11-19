@@ -83,6 +83,25 @@ func NewSchedulerTickHandler(cfg SchedulerTickConfig) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 
+		// Scheduler or operator only.
+		//
+		// Validity alone is not enough: every tenant's plugin holds a
+		// `register` token so it can push-register itself, and this
+		// route spawns an ECS Fargate task per due tenant. Accepting any
+		// valid token would let any single consumer stack spend money
+		// across the whole fleet on demand — and with ?force=true, dump
+		// every database at once.
+		//
+		// It also bounds the credential sitting in the EventBridge
+		// rule's input, readable by anyone with events:DescribeRule in
+		// the account: a scheduler token can fire the tick and nothing
+		// else.
+		if claims := ClaimsFromContext(ctx); claims == nil ||
+			(claims.Op != OpScheduler && claims.Op != OpOperator) {
+			http.Error(w, `{"error":"token op must be 'scheduler' or 'operator'"}`, http.StatusForbidden)
+			return
+		}
+
 		// Lazy-init the ECS client (only when Ecs wasn't injected). Done
 		// once per warm container.
 		if ecsCli == nil {

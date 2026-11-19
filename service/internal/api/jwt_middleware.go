@@ -19,10 +19,30 @@ type claimsKey struct{}
 // Claims is the shape the plugin's mintJWT (in plugin/internal/compute.go)
 // produces. Verified against the HS256 key injected as SERVICE_JWT_SECRET.
 type Claims struct {
+	// Op is the token's purpose:
+	//
+	//	"register"  a plugin push-registering one tenant
+	//	"operator"  a logged-in human
+	//	"scheduler" the deploy template's own timer, firing the tick
+	//
+	// Checked per route, not just for validity. Every tenant's plugin
+	// holds a "register" token, and the scheduler tick spawns an ECS
+	// Fargate task per due tenant — so a route that accepted any valid
+	// token would let any consumer stack spend money across the whole
+	// fleet on demand.
 	Op     string `json:"op"`
 	Tenant string `json:"tenant"`
 	jwt.RegisteredClaims
 }
+
+// Token purposes. Constants because they are compared across two repos
+// — the service checks them, the plugin mints them — and a typo on
+// either side fails as a 401 with nothing naming the mismatch.
+const (
+	OpRegister  = "register"
+	OpOperator  = "operator"
+	OpScheduler = "scheduler"
+)
 
 // SessionCookieName is the HttpOnly cookie the SPA's login flow sets +
 // subsequent /api/v1/* calls read. Scoped to sc-component-backup —
