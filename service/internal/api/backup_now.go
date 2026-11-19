@@ -108,7 +108,7 @@ func NewBackupNowHandler(cfg BackupNowConfig) http.Handler {
 				http.Error(w, `{"error":"Fargate env misconfigured: `+jsonEscape(err.Error())+`"}`, http.StatusInternalServerError)
 				return
 			}
-			run, taskArn, dispatchErr := dispatchViaFargate(r.Context(), cfg, fcfg, t, resource)
+			run, taskArn, dispatchErr := dispatchViaFargate(r.Context(), cfg, fcfg, t, resource, "operator")
 			if dispatchErr != nil {
 				http.Error(w, `{"error":"`+jsonEscape(dispatchErr.Error())+`"}`, http.StatusInternalServerError)
 				return
@@ -157,7 +157,18 @@ func NewBackupNowHandler(cfg BackupNowConfig) http.Handler {
 // and fires RunTask. The row is persisted BEFORE RunTask so a worker
 // that dies before its first callback still appears in /runs — the
 // watchdog later reclassifies it as cancelled.
-func dispatchViaFargate(ctx context.Context, cfg BackupNowConfig, fcfg *FargateDispatchConfig, t tenant.Record, resource tenant.Resource) (backup.BackupRun, string, error) {
+// dispatchViaFargate creates the run row, mints the worker's callback
+// credential and fires the one-shot task.
+//
+// `trigger` is recorded on the row and prefixes StartedBy: "operator"
+// for Run Now, "schedule" for the scheduler tick. Both go through HERE,
+// deliberately — the tick used to build its own task override, and that
+// duplicate drifted until it was broken in two ways the working path
+// was not: it read BACKUP_S3_BUCKET where the platform emits
+// STORAGE_BUCKET, and it injected none of RUN_ID / AGENT_URL /
+// AGENT_TOKEN, so the worker could never report completion and every
+// tenant stayed permanently "never backed up".
+func dispatchViaFargate(ctx context.Context, cfg BackupNowConfig, fcfg *FargateDispatchConfig, t tenant.Record, resource tenant.Resource, trigger string) (backup.BackupRun, string, error) {
 	if cfg.Runs == nil {
 		return backup.BackupRun{}, "", fmt.Errorf("Fargate dispatch: run store not wired")
 	}
@@ -183,7 +194,7 @@ func dispatchViaFargate(ctx context.Context, cfg BackupNowConfig, fcfg *FargateD
 		Driver:        driverName,
 		StartedAt:     now,
 		Status:        backup.StatusRunning,
-		TriggerSource: "operator",
+		TriggerSource: trigger,
 		S3Path:        s3Key, // provisional; worker confirms on complete
 	}
 	if err := cfg.Runs.PutBackup(ctx, run); err != nil {
@@ -212,7 +223,7 @@ func dispatchViaFargate(ctx context.Context, cfg BackupNowConfig, fcfg *FargateD
 		Resource:   resource,
 		S3Key:      s3Key,
 	})
-	taskArn, err := RunWorkerTask(ctx, ecsCli, fcfg, overrides, "backup-now:"+t.StackName)
+	taskArn, err := RunWorkerTask(ctx, ecsCli, fcfg, overrides, trigger+":"+t.StackName)
 	if err != nil {
 		// Mark the run failed so a worker that never started doesn't
 		// leave the row stuck for the watchdog.
