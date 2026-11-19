@@ -243,14 +243,31 @@ func buildTaskOverrides(t tenant.Record, res tenant.Resource, now time.Time) *ec
 		kv("BACKUP_TENANT_URI", res.Connection["uri"]),
 		kv("BACKUP_TENANT_DATABASE", res.Connection["database"]),
 		kv("BACKUP_TENANT_TLS_CA_PEM", res.Connection["tls_ca_pem"]),
-		kv("BACKUP_S3_BUCKET", os.Getenv("BACKUP_S3_BUCKET")),
-		kv("BACKUP_S3_REGION", os.Getenv("BACKUP_S3_REGION")),
+		// The worker demands BACKUP_S3_*, the platform emits STORAGE_*.
+		//
+		// sc-plugin-aws's generic storage block puts STORAGE_BUCKET /
+		// STORAGE_REGION / STORAGE_TYPE on the deployed service, and the
+		// SERVICE was taught to read those — but this override builder
+		// still reached for the old BACKUP_S3_* names via raw os.Getenv,
+		// so every scheduled run handed the worker an empty bucket and
+		// it refused to start:
+		//
+		//	ERROR required worker env missing name=BACKUP_S3_BUCKET
+		//	container worker exit 2
+		//
+		// Latent until 2026-11-19 because ONLY the scheduled path goes
+		// through here — Run Now builds its task from the service's
+		// already-resolved storage config — and the scheduled path had
+		// never executed. Exactly the class of bug a dead scheduler
+		// hides.
+		kv("BACKUP_S3_BUCKET", firstEnv("BACKUP_S3_BUCKET", "STORAGE_BUCKET")),
+		kv("BACKUP_S3_REGION", firstEnv("BACKUP_S3_REGION", "STORAGE_REGION", "AWS_REGION")),
 		kv("BACKUP_S3_KEY", s3Prefix+"/"+ts+".archive.gz"),
 	}
-	if ak := os.Getenv("BACKUP_S3_ACCESS_KEY"); ak != "" {
+	if ak := firstEnv("BACKUP_S3_ACCESS_KEY", "STORAGE_ACCESS_KEY"); ak != "" {
 		env = append(env, kv("BACKUP_S3_ACCESS_KEY", ak))
 	}
-	if sk := os.Getenv("BACKUP_S3_SECRET_KEY"); sk != "" {
+	if sk := firstEnv("BACKUP_S3_SECRET_KEY", "STORAGE_SECRET_KEY"); sk != "" {
 		env = append(env, kv("BACKUP_S3_SECRET_KEY", sk))
 	}
 	return &ecstypes.TaskOverride{
@@ -298,4 +315,20 @@ func envOr(name, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// firstEnv returns the first non-empty value among names.
+//
+// Exists because the same fact has two spellings: the component-native
+// BACKUP_S3_* that predates the platform's generic storage block, and
+// the STORAGE_* that sc-plugin-aws emits today. Preferring the explicit
+// BACKUP_S3_* keeps an operator override working; falling back to
+// STORAGE_* is what makes a default deploy work at all.
+func firstEnv(names ...string) string {
+	for _, n := range names {
+		if v := strings.TrimSpace(os.Getenv(n)); v != "" {
+			return v
+		}
+	}
+	return ""
 }
