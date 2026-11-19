@@ -298,6 +298,31 @@ func (p *backupPlugin) Schema(_ context.Context, _ *scpluginv1.SchemaRequest) (*
 				// Follow-up: route Run Now through Fargate so Lambda
 				// memory stops mattering.
 				"maxMemory", "timeout",
+				// Grandfather for the aws-lambda template's
+				// per-Component resource naming (sc-plugin-aws#28). This
+				// component was deployed before that scoping existed, so
+				// its live resources are named from the parent stack
+				// alone; switching it over is a pure rename, and Pulumi
+				// matches by name, so the plan is an independent create
+				// plus a DELETE of each live resource — including the
+				// Lambda serving backup.simple-forge.com. SC core's
+				// destructive-rename guard refuses that plan, correctly
+				// (forge run 44466834062, 14 resources).
+				//
+				// Declaring `legacyResourceNames: true` keeps this
+				// component's names as they are; a second Component on
+				// the same parent stack gets scoped names and no longer
+				// collides with it. Here only because SC core dual-uses
+				// this list as allowed-top-level-keys for the component
+				// config — the key is read by the TEMPLATE plugin, not
+				// by this one.
+				//
+				// Dropping it later is a deliberate choice to take the
+				// replace: new Function URL (SC core rewires the
+				// hostname in the same update) and a fresh log group.
+				// Nothing stateful moves — the archives and the tenant
+				// registry live in the S3 bucket, a separate resource.
+				"legacyResourceNames",
 				// Removed in Tier-4 (sc-components-plugin-peer-invoke):
 				//   - databases: discovery is auto now (slice 1d.7, api v2026.11.59)
 				//   - atlasAdmin: creds live on the mongodb resource;
