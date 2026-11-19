@@ -358,3 +358,54 @@ func TestSchedulerTick_RejectsNonSchedulerOps(t *testing.T) {
 		}
 	}
 }
+
+// TestBuildTaskOverrides_FallsBackToStorageEnv is the regression guard
+// for a bug only the scheduled path could hit.
+//
+// The worker demands BACKUP_S3_BUCKET; sc-plugin-aws's generic storage
+// block emits STORAGE_BUCKET. The service was taught to read STORAGE_*,
+// but this override builder still reached for BACKUP_S3_* — so every
+// scheduled run handed the worker an empty bucket and it exited 2 with
+// `required worker env missing name=BACKUP_S3_BUCKET`.
+//
+// It stayed latent because ONLY the scheduled path builds a task here —
+// Run Now uses the service's already-resolved storage config — and the
+// scheduled path had never executed. A dead scheduler hides exactly
+// this class of bug, which is why it is worth a test rather than a
+// one-line fix.
+func TestBuildTaskOverrides_FallsBackToStorageEnv(t *testing.T) {
+	rec := tenant.Record{StackName: "forge-storage--staging"}
+	res := tenant.Resource{Name: "db", Connection: map[string]string{"driver": "mongodb"}}
+	now := time.Date(2026, 11, 19, 12, 0, 0, 0, time.UTC)
+
+	envOf := func(ov *ecstypes.TaskOverride) map[string]string {
+		out := map[string]string{}
+		for _, kv := range ov.ContainerOverrides[0].Environment {
+			out[*kv.Name] = *kv.Value
+		}
+		return out
+	}
+
+	// What a real deploy looks like: STORAGE_* present, BACKUP_S3_* not.
+	for _, n := range []string{"BACKUP_S3_BUCKET", "BACKUP_S3_REGION"} {
+		t.Setenv(n, "")
+	}
+	t.Setenv("STORAGE_BUCKET", "backup-archives--staging")
+	t.Setenv("STORAGE_REGION", "eu-central-1")
+
+	got := envOf(buildTaskOverrides(rec, res, now))
+	if got["BACKUP_S3_BUCKET"] != "backup-archives--staging" {
+		t.Errorf("BACKUP_S3_BUCKET = %q, want the STORAGE_BUCKET fallback", got["BACKUP_S3_BUCKET"])
+	}
+	if got["BACKUP_S3_REGION"] != "eu-central-1" {
+		t.Errorf("BACKUP_S3_REGION = %q, want the STORAGE_REGION fallback", got["BACKUP_S3_REGION"])
+	}
+
+	// An explicit BACKUP_S3_* still wins, so an operator override is
+	// not silently ignored.
+	t.Setenv("BACKUP_S3_BUCKET", "explicit-bucket")
+	got = envOf(buildTaskOverrides(rec, res, now))
+	if got["BACKUP_S3_BUCKET"] != "explicit-bucket" {
+		t.Errorf("BACKUP_S3_BUCKET = %q, want the explicit value to win", got["BACKUP_S3_BUCKET"])
+	}
+}
