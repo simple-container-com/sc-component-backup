@@ -14,13 +14,25 @@ import "time"
 // Backup.ScheduleHint, Monitoring.MetricsEndpoint, etc. The backup just
 // records the shape.
 type Record struct {
-	StackName   string     `bson:"stackName" json:"stackName"`
-	Version     string     `bson:"version" json:"version"`
-	Resources   []Resource `bson:"resources" json:"resources"`
-	OrgID       string     `bson:"orgId,omitempty" json:"orgId,omitempty"`
-	CreatedAt   time.Time  `bson:"createdAt" json:"createdAt"`
-	LastSeenAt  time.Time  `bson:"lastSeenAt" json:"lastSeenAt"`
-	SoftDeleted bool       `bson:"softDeleted,omitempty" json:"softDeleted,omitempty"`
+	StackName  string     `bson:"stackName" json:"stackName"`
+	Version    string     `bson:"version" json:"version"`
+	Resources  []Resource `bson:"resources" json:"resources"`
+	OrgID      string     `bson:"orgId,omitempty" json:"orgId,omitempty"`
+	CreatedAt  time.Time  `bson:"createdAt" json:"createdAt"`
+	LastSeenAt time.Time  `bson:"lastSeenAt" json:"lastSeenAt"`
+
+	// IntervalMinutes is how often this tenant is backed up.
+	//
+	// Zero means "use the service default" (api.DefaultIntervalMinutes,
+	// 4 h) — NOT "never". Zero is what every record written before this
+	// field existed carries, and reading it as disabled would silently
+	// stop backing up every already-registered tenant.
+	//
+	// Due-ness is computed against the RUN HISTORY rather than a
+	// `lastRunAt` stored here, so there is no second source of truth to
+	// drift and no migration for existing records.
+	IntervalMinutes int  `bson:"intervalMinutes,omitempty" json:"intervalMinutes,omitempty"`
+	SoftDeleted     bool `bson:"softDeleted,omitempty" json:"softDeleted,omitempty"`
 }
 
 // Resource describes one sibling resource the consumer has (DB, S3, …).

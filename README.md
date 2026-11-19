@@ -44,9 +44,64 @@ operator's server.yaml                  operator's client.yaml (per service)
    `POST`s a tenant row to the Backup service's
    `/api/v1/tenants/register`. The consumer gets `BACKUP_AGENT_URL`
    and `BACKUP_TOKEN` injected into its env.
-3. The Backup service's scheduler runs the registered tenants on the
-   cadence declared in each tenant row — `mongodump`/`pg_dump` to
+3. A timer POSTs `/api/v1/scheduler/tick`. The handler walks the
+   registered tenants, fires an ECS Fargate one-shot per tenant that is
+   DUE, and reports the rest under `skipped` with a reason —
+   `mongodump`/`pg_dump` to
    `s3://<bucket>/<consumer-stack>/<db>/<ts>.archive.gz`.
+
+   Due-ness is `now - lastSuccessAt >= IntervalMinutes`, read from the
+   run history rather than a stored marker, so there is no second source
+   of truth to drift. `IntervalMinutes: 0` means **use the default**
+   (4 h), not "never" — zero is what records written before the field
+   carry. Only SUCCEEDED runs count, so a failing tenant stays due
+   rather than being marked done by having been attempted.
+
+### The timer is operator config, and without it nothing runs
+
+The service does not schedule itself: a Lambda cannot hold a ticker (the
+runtime freezes background goroutines when the handler returns), so the
+timer must be a platform resource. Declare it on the component:
+
+```yaml
+    schedulerToken: "${secret:backup-scheduler-token}"
+    cloudExtras:
+      lambdaSchedules:
+        - name: bk-tick                # <= 14 chars, rejected at APPLY
+          expression: "rate(30 minutes)"
+          request: |-
+            {
+              "requestId": "scheduled-backup",
+              "httpMethod": "POST",
+              "path": "/api/v1/scheduler/tick",
+              "requestContext": {
+                "http": {
+                  "path": "/api/v1/scheduler/tick",
+                  "method": "POST",
+                  "protocol": "HTTP/1.1"
+                }
+              },
+              "body": "{}",
+              "headers": {
+                "Authorization": "Bearer ${secret:backup-scheduler-token}"
+              }
+            }
+```
+
+**Tick every 30 minutes, back up every 4 hours.** The tick is cheap — it
+lists tenants and fires only the due ones — and a finer tick than the
+interval is what makes a missed fire self-heal instead of doubling the
+gap to 8 h.
+
+It lives in operator config rather than the component's defaults because
+SC resolves `${secret:NAME}` inside a schedule request but not the
+`${resource:...}` form, and a generic component cannot hardcode one
+stack's secret name.
+
+> This was missing until 2026-11-19, and the gap was invisible: no rule
+> existed, the handler was a no-op without `?force=true`, and the SPA
+> displayed "every hour" from a stored value nothing read. Every archive
+> in the bucket was from a manual Run Now.
 
 ## Three Go modules
 

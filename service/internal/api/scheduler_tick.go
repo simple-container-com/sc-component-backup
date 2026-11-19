@@ -60,6 +60,11 @@ type EcsClient interface {
 // their own ECS/time overrides.
 type SchedulerTickConfig struct {
 	Tenants tenant.Store
+	// Runs is the backup-run history, read to decide whether a tenant
+	// is due. Nil means every tenant reads as never-backed-up and so
+	// always due — safe for a smoke, wrong for production, which is why
+	// main.go wires it.
+	Runs runLister
 	// Ecs is injected for tests; when nil in production, the handler
 	// builds one from the AWS SDK's default config chain on first tick.
 	Ecs EcsClient
@@ -112,8 +117,16 @@ func NewSchedulerTickHandler(cfg SchedulerTickConfig) http.Handler {
 			assignPublicIP = ecstypes.AssignPublicIpEnabled
 		}
 
-		// force=true fires all tenants. v1 has no cron per tenant; a
-		// scheduled tick with no force query param is a no-op today.
+		// force=true fires every tenant regardless of when it was last
+		// backed up — the operator's "do it now" path.
+		//
+		// WITHOUT force, the tick used to `continue` on every tenant and
+		// do nothing at all. That is why no scheduled backup had ever
+		// run: the timer was missing AND the handler was a no-op, so
+		// wiring the timer alone would have changed nothing. Every
+		// archive in the bucket on 2026-11-19 was from a manual Run Now
+		// the day before, while the SPA displayed "every hour" from a
+		// stored value nothing read.
 		force := r.URL.Query().Get("force") == "true"
 
 		tenants, err := cfg.Tenants.List(ctx)
@@ -131,10 +144,22 @@ func NewSchedulerTickHandler(cfg SchedulerTickConfig) http.Handler {
 		fired := []firedTask{}
 
 		now := cfg.Now()
+		skipped := []map[string]string{}
 		for _, t := range tenants {
 			if !force {
-				// v1: no cron rules yet; without force=true, skip.
-				continue
+				due, why := tenantIsDue(ctx, cfg.Runs, t.StackName, t.IntervalMinutes, now)
+				if !due {
+					// Reported, not silent. A tenant that is skipped for
+					// a good reason and a tenant that is skipped because
+					// the scheduler is broken look identical from the
+					// outside, and the second case is what went
+					// unnoticed for a day.
+					skipped = append(skipped, map[string]string{
+						"tenantStack": t.StackName,
+						"reason":      why,
+					})
+					continue
+				}
 			}
 			for _, res := range t.Resources {
 				if res.Connection["driver"] == "" {
@@ -174,6 +199,12 @@ func NewSchedulerTickHandler(cfg SchedulerTickConfig) http.Handler {
 			"tenants":    len(tenants),
 			"fired":      fired,
 			"firedCount": len(fired),
+			// Why each tenant was NOT fired. Without this a tick that
+			// fires nothing is indistinguishable from a tick that is
+			// broken, which is exactly how a dead scheduler stayed
+			// invisible.
+			"skipped":      skipped,
+			"skippedCount": len(skipped),
 		})
 	})
 }

@@ -253,7 +253,12 @@ func main() {
 		// operator-driven call runs every tenant regardless of
 		// schedule. Nil Ecs here → handler builds its own client from
 		// the AWS SDK default config chain at first-tick time.
-		r.Post("/api/v1/scheduler/tick", api.NewSchedulerTickHandler(api.SchedulerTickConfig{Tenants: metaStore.Tenants()}).ServeHTTP)
+		// Runs is what makes the due-check real: without it every tenant
+		// reads as never-backed-up and fires on every tick.
+		r.Post("/api/v1/scheduler/tick", api.NewSchedulerTickHandler(api.SchedulerTickConfig{
+			Tenants: metaStore.Tenants(),
+			Runs:    metaStore.Runs(),
+		}).ServeHTTP)
 
 		// SPA-facing read-only surface (slice 1e.2 2026-11-13). Mutating
 		// project CRUD + settings + stats endpoints stay TODO (slice 1e.3).

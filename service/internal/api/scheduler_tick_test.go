@@ -6,6 +6,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -16,6 +17,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ecs"
 	ecstypes "github.com/aws/aws-sdk-go-v2/service/ecs/types"
 
+	"github.com/simple-container-com/sc-component-backup/service/internal/backup"
 	"github.com/simple-container-com/sc-component-backup/service/internal/tenant"
 )
 
@@ -49,47 +51,135 @@ func setupTickEnv(t *testing.T) func() {
 	}
 }
 
-func TestSchedulerTick_NoForce_FiresNoTasks(t *testing.T) {
+// fakeRuns is the run-history slice the due-check reads.
+type fakeRuns struct {
+	byTenant map[string][]backup.BackupRun
+	err      error
+}
+
+func (f *fakeRuns) ListBackupsByTenant(_ context.Context, stack string) ([]backup.BackupRun, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.byTenant[stack], nil
+}
+
+// TestSchedulerTick_NoForce_FiresOnlyDueTenants replaces a test that
+// asserted the BUG as the spec.
+//
+// It used to be TestSchedulerTick_NoForce_FiresNoTasks — "no-force
+// should fire zero tasks" — which is exactly what the handler did:
+// `if !force { continue }` on every tenant, with a comment saying v1 had
+// no cron. So the scheduler could never back anything up unattended, and
+// the test locked that in. Every archive in the bucket on 2026-11-19 was
+// from a manual Run Now the day before, while the SPA showed "every
+// hour" from a stored value nothing read.
+//
+// The contract now: without force, a tenant fires when it is DUE.
+func TestSchedulerTick_NoForce_FiresOnlyDueTenants(t *testing.T) {
 	restore := setupTickEnv(t)
 	defer restore()
 
-	store := tenant.NewInMemoryStore()
-	_ = store.Upsert(context.Background(), tenant.Record{
-		StackName: "smoke-tenant",
-		Resources: []tenant.Resource{
-			{Name: "mongo", Connection: map[string]string{"driver": "mongodb", "uri": "mongodb://h/", "database": "db1"}},
+	now := time.Date(2026, 11, 19, 12, 0, 0, 0, time.UTC)
+	mongo := []tenant.Resource{
+		{Name: "mongo", Connection: map[string]string{"driver": "mongodb", "uri": "mongodb://h/", "database": "db1"}},
+	}
+
+	for name, tc := range map[string]struct {
+		record    tenant.Record
+		history   []backup.BackupRun
+		wantFired int
+	}{
+		// Never backed up: due immediately. This is the case that makes
+		// an existing fleet start getting backups at all.
+		"never backed up": {
+			record:    tenant.Record{StackName: "t", Resources: mongo},
+			wantFired: 1,
 		},
-	})
+		// Succeeded 5 h ago against a 4 h interval: due.
+		"older than interval": {
+			record: tenant.Record{StackName: "t", Resources: mongo, IntervalMinutes: 240},
+			history: []backup.BackupRun{
+				{TenantStack: "t", Status: backup.StatusSucceeded, FinishedAt: now.Add(-5 * time.Hour)},
+			},
+			wantFired: 1,
+		},
+		// Succeeded 1 h ago against a 4 h interval: NOT due. The whole
+		// point — a 30-minute tick must not dump every tenant every time.
+		"within interval": {
+			record: tenant.Record{StackName: "t", Resources: mongo, IntervalMinutes: 240},
+			history: []backup.BackupRun{
+				{TenantStack: "t", Status: backup.StatusSucceeded, FinishedAt: now.Add(-1 * time.Hour)},
+			},
+			wantFired: 0,
+		},
+		// Zero interval is "use the default", NOT "never" — it is what
+		// every record written before the field existed carries, and
+		// reading it as disabled would silently stop backing up the
+		// whole already-registered fleet.
+		"zero interval uses default": {
+			record: tenant.Record{StackName: "t", Resources: mongo},
+			history: []backup.BackupRun{
+				{TenantStack: "t", Status: backup.StatusSucceeded, FinishedAt: now.Add(-1 * time.Hour)},
+			},
+			wantFired: 0,
+		},
+		// A failing tenant stays due. Attempting is not succeeding, and
+		// a broken backup must keep being retried rather than be marked
+		// done by having been tried.
+		"only failures": {
+			record: tenant.Record{StackName: "t", Resources: mongo, IntervalMinutes: 240},
+			history: []backup.BackupRun{
+				{TenantStack: "t", Status: backup.StatusFailed, FinishedAt: now.Add(-1 * time.Minute)},
+			},
+			wantFired: 1,
+		},
+	} {
+		store := tenant.NewInMemoryStore()
+		_ = store.Upsert(context.Background(), tc.record)
 
-	var fired int
-	h := NewSchedulerTickHandler(SchedulerTickConfig{
-		Tenants: store,
-		Ecs: &fakeEcs{runTask: func(context.Context, *ecs.RunTaskInput, ...func(*ecs.Options)) (*ecs.RunTaskOutput, error) {
-			fired++
-			return &ecs.RunTaskOutput{}, nil
-		}},
-		Now: func() time.Time { return time.Date(2026, 11, 13, 0, 0, 0, 0, time.UTC) },
-	})
+		fired := 0
+		h := NewSchedulerTickHandler(SchedulerTickConfig{
+			Tenants: store,
+			Runs:    &fakeRuns{byTenant: map[string][]backup.BackupRun{"t": tc.history}},
+			Ecs: &fakeEcs{runTask: func(context.Context, *ecs.RunTaskInput, ...func(*ecs.Options)) (*ecs.RunTaskOutput, error) {
+				fired++
+				return &ecs.RunTaskOutput{}, nil
+			}},
+			Now: func() time.Time { return now },
+		})
 
-	req := httptest.NewRequest("POST", "/api/v1/scheduler/tick", nil)
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("POST", "/api/v1/scheduler/tick", nil))
+		if rec.Code != http.StatusAccepted {
+			t.Fatalf("%s: code %d, body %s", name, rec.Code, rec.Body.String())
+		}
+		if fired != tc.wantFired {
+			t.Errorf("%s: fired %d, want %d (body %s)", name, fired, tc.wantFired, rec.Body.String())
+		}
 
-	if rec.Code != http.StatusAccepted {
-		t.Fatalf("code %d, body %s", rec.Code, rec.Body.String())
+		// A skipped tenant must say WHY. A tick that fires nothing and a
+		// tick that is broken look identical otherwise, which is how the
+		// dead scheduler stayed unnoticed.
+		var resp map[string]any
+		_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+		if tc.wantFired == 0 {
+			if n, _ := resp["skippedCount"].(float64); n != 1 {
+				t.Errorf("%s: skippedCount = %v, want 1", name, resp["skippedCount"])
+			}
+		}
 	}
-	if fired != 0 {
-		t.Errorf("no-force should fire zero tasks; fired %d", fired)
-	}
-	var resp map[string]any
-	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
-		t.Fatalf("decode body: %v", err)
-	}
-	if resp["firedCount"].(float64) != 0 {
-		t.Errorf("firedCount: %v", resp["firedCount"])
-	}
-	if resp["tenants"].(float64) != 1 {
-		t.Errorf("tenants: %v", resp["tenants"])
+}
+
+// TestSchedulerTick_StoreErrorMeansDue — an unreadable history must err
+// toward an extra backup, never toward skipping. The opposite would
+// silently stop backups whenever the store hiccuped.
+func TestSchedulerTick_StoreErrorMeansDue(t *testing.T) {
+	due, _ := tenantIsDue(context.Background(),
+		&fakeRuns{err: errors.New("store down")}, "t", 240,
+		time.Date(2026, 11, 19, 12, 0, 0, 0, time.UTC))
+	if !due {
+		t.Error("a store error must read as due")
 	}
 }
 
