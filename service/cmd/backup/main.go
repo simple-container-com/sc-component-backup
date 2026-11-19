@@ -255,9 +255,18 @@ func main() {
 		// the AWS SDK default config chain at first-tick time.
 		// Runs is what makes the due-check real: without it every tenant
 		// reads as never-backed-up and fires on every tick.
+		// Same dispatch wiring as Run Now above — deliberately, because
+		// the two go through one path now. MintWorker + AgentURL are
+		// what let the Fargate worker report completion; without them
+		// no run is ever recorded succeeded, every tenant stays due
+		// forever, and a 30-minute tick dumps the whole fleet 48 times
+		// a day.
 		r.Post("/api/v1/scheduler/tick", api.NewSchedulerTickHandler(api.SchedulerTickConfig{
-			Tenants: metaStore.Tenants(),
-			Runs:    metaStore.Runs(),
+			Tenants:      metaStore.Tenants(),
+			Runs:         metaStore.Runs(),
+			MintWorker:   api.MintWorkerJWT([]byte(jwtSecret)),
+			AgentURL:     strings.TrimRight(os.Getenv("BACKUP_AGENT_URL"), "/"),
+			PathTemplate: "", // scheduler default; shared string
 		}).ServeHTTP)
 
 		// SPA-facing read-only surface (slice 1e.2 2026-11-13). Mutating

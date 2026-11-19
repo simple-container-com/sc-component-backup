@@ -7,9 +7,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -18,6 +20,7 @@ import (
 	ecstypes "github.com/aws/aws-sdk-go-v2/service/ecs/types"
 
 	"github.com/simple-container-com/sc-component-backup/service/internal/backup"
+	"github.com/simple-container-com/sc-component-backup/service/internal/backup/scheduler"
 	"github.com/simple-container-com/sc-component-backup/service/internal/tenant"
 )
 
@@ -51,17 +54,24 @@ func setupTickEnv(t *testing.T) func() {
 	}
 }
 
-// fakeRuns is the run-history slice the due-check reads.
-type fakeRuns struct {
-	byTenant map[string][]backup.BackupRun
-	err      error
-}
-
-func (f *fakeRuns) ListBackupsByTenant(_ context.Context, stack string) ([]backup.BackupRun, error) {
-	if f.err != nil {
-		return nil, f.err
+// runsWith returns a real in-memory RunStore seeded with history.
+//
+// The real store rather than a hand-rolled fake: scheduler.RunStore is
+// eight methods, and the tick now WRITES to it as well as reading —
+// a stub that only answers ListBackupsByTenant would pass while the
+// dispatch path silently failed to persist its run row.
+func runsWith(stack string, runs ...backup.BackupRun) scheduler.RunStore {
+	st := scheduler.NewInMemoryRunStore()
+	for i, r := range runs {
+		if r.ID == "" {
+			r.ID = fmt.Sprintf("%s-%d", stack, i)
+		}
+		if r.TenantStack == "" {
+			r.TenantStack = stack
+		}
+		_ = st.PutBackup(context.Background(), r)
 	}
-	return f.byTenant[stack], nil
+	return st
 }
 
 // TestSchedulerTick_NoForce_FiresOnlyDueTenants replaces a test that
@@ -152,8 +162,10 @@ func TestSchedulerTick_NoForce_FiresOnlyDueTenants(t *testing.T) {
 
 		fired := 0
 		h := NewSchedulerTickHandler(SchedulerTickConfig{
-			Tenants: store,
-			Runs:    &fakeRuns{byTenant: map[string][]backup.BackupRun{"t": tc.history}},
+			Tenants:    store,
+			Runs:       runsWith("t", tc.history...),
+			MintWorker: func(string, string, time.Duration) (string, error) { return "worker-jwt", nil },
+			AgentURL:   "https://backup.example.com",
 			Ecs: &fakeEcs{runTask: func(context.Context, *ecs.RunTaskInput, ...func(*ecs.Options)) (*ecs.RunTaskOutput, error) {
 				fired++
 				return &ecs.RunTaskOutput{}, nil
@@ -183,12 +195,21 @@ func TestSchedulerTick_NoForce_FiresOnlyDueTenants(t *testing.T) {
 	}
 }
 
+// erroringRuns satisfies only the narrow runLister the due-check reads,
+// which is the point: an unreadable history must not be able to make a
+// tenant look done.
+type erroringRuns struct{ err error }
+
+func (e *erroringRuns) ListBackupsByTenant(context.Context, string) ([]backup.BackupRun, error) {
+	return nil, e.err
+}
+
 // TestSchedulerTick_StoreErrorMeansDue — an unreadable history must err
 // toward an extra backup, never toward skipping. The opposite would
 // silently stop backups whenever the store hiccuped.
 func TestSchedulerTick_StoreErrorMeansDue(t *testing.T) {
 	due, _ := tenantIsDue(context.Background(),
-		&fakeRuns{err: errors.New("store down")}, "t", 240,
+		&erroringRuns{err: errors.New("store down")}, "t", 240,
 		time.Date(2026, 11, 19, 12, 0, 0, 0, time.UTC))
 	if !due {
 		t.Error("a store error must read as due")
@@ -210,8 +231,16 @@ func TestSchedulerTick_Force_FiresOnePerTenantResource(t *testing.T) {
 	})
 
 	var inputs []*ecs.RunTaskInput
+	// Runs + MintWorker + AgentURL are REQUIRED now: dispatch goes
+	// through the shared path, which persists a run row and mints the
+	// worker's callback credential before firing. Omitting them is how
+	// the scheduled path used to "work" while producing runs nothing
+	// could ever mark succeeded.
 	h := NewSchedulerTickHandler(SchedulerTickConfig{
-		Tenants: store,
+		Tenants:    store,
+		Runs:       scheduler.NewInMemoryRunStore(),
+		MintWorker: func(string, string, time.Duration) (string, error) { return "worker-jwt", nil },
+		AgentURL:   "https://backup.example.com",
 		Ecs: &fakeEcs{runTask: func(_ context.Context, in *ecs.RunTaskInput, _ ...func(*ecs.Options)) (*ecs.RunTaskOutput, error) {
 			inputs = append(inputs, in)
 			return &ecs.RunTaskOutput{Tasks: []ecstypes.Task{{TaskArn: aws.String("arn:task:" + aws.ToString(in.StartedBy))}}}, nil
@@ -257,16 +286,29 @@ func TestSchedulerTick_Force_FiresOnePerTenantResource(t *testing.T) {
 	if env["BACKUP_S3_BUCKET"] != "bucket-x" {
 		t.Errorf("BACKUP_S3_BUCKET: %q", env["BACKUP_S3_BUCKET"])
 	}
-	// S3 key shape: <stack>/<resource>/<ts>.archive.gz; colons replaced
-	// with hyphens.
-	wantKey := "smoke-tenant/mongo/2026-11-13T10-20-30Z.archive.gz"
-	if env["BACKUP_S3_KEY"] != wantKey {
-		t.Errorf("BACKUP_S3_KEY: got %q, want %q", env["BACKUP_S3_KEY"], wantKey)
+	// S3 key now comes from the SHARED PathTemplate, so a scheduled
+	// archive lands at the same key shape as an operator-triggered one.
+	// They used to differ — the tick wrote <stack>/<resource>/<ts> while
+	// Run Now wrote the date-partitioned form — which would have broken
+	// any lifecycle rule keyed on the date path.
+	if !strings.HasPrefix(env["BACKUP_S3_KEY"], "smoke-tenant/") ||
+		!strings.HasSuffix(env["BACKUP_S3_KEY"], ".archive.gz") ||
+		!strings.Contains(env["BACKUP_S3_KEY"], "mongo") {
+		t.Errorf("BACKUP_S3_KEY: %q", env["BACKUP_S3_KEY"])
 	}
 
-	// Started-by carries the tenant stack — easier operator-side triage
-	// of failed tasks.
-	if aws.ToString(mongoIn.StartedBy) != "scheduler-tick:smoke-tenant" {
+	// The worker's callback wiring — without these three it can never
+	// report completion, so no run is recorded succeeded and every
+	// tenant stays due forever.
+	for _, k := range []string{"BACKUP_RUN_ID", "BACKUP_AGENT_URL", "BACKUP_AGENT_TOKEN"} {
+		if env[k] == "" {
+			t.Errorf("%s is empty — the worker cannot report completion", k)
+		}
+	}
+
+	// Started-by carries the trigger + tenant stack, for operator-side
+	// triage of failed tasks.
+	if aws.ToString(mongoIn.StartedBy) != "schedule:smoke-tenant" {
 		t.Errorf("startedBy: %q", aws.ToString(mongoIn.StartedBy))
 	}
 }
@@ -333,8 +375,10 @@ func TestSchedulerTick_RejectsNonSchedulerOps(t *testing.T) {
 	} {
 		fired := 0
 		h := NewSchedulerTickHandler(SchedulerTickConfig{
-			Tenants: store,
-			Runs:    &fakeRuns{},
+			Tenants:    store,
+			Runs:       scheduler.NewInMemoryRunStore(),
+			MintWorker: func(string, string, time.Duration) (string, error) { return "worker-jwt", nil },
+			AgentURL:   "https://backup.example.com",
 			Ecs: &fakeEcs{runTask: func(context.Context, *ecs.RunTaskInput, ...func(*ecs.Options)) (*ecs.RunTaskOutput, error) {
 				fired++
 				return &ecs.RunTaskOutput{}, nil
@@ -359,53 +403,63 @@ func TestSchedulerTick_RejectsNonSchedulerOps(t *testing.T) {
 	}
 }
 
-// TestBuildTaskOverrides_FallsBackToStorageEnv is the regression guard
-// for a bug only the scheduled path could hit.
+// TestScheduledDispatch_UsesStorageEnvFallback is the regression guard
+// for the bug only the scheduled path could hit.
 //
 // The worker demands BACKUP_S3_BUCKET; sc-plugin-aws's generic storage
-// block emits STORAGE_BUCKET. The service was taught to read STORAGE_*,
-// but this override builder still reached for BACKUP_S3_* — so every
-// scheduled run handed the worker an empty bucket and it exited 2 with
+// block emits STORAGE_BUCKET. The tick used to build its own task
+// override reading the old names via raw os.Getenv, so every scheduled
+// run handed the worker an empty bucket and it exited 2 with
 // `required worker env missing name=BACKUP_S3_BUCKET`.
 //
-// It stayed latent because ONLY the scheduled path builds a task here —
-// Run Now uses the service's already-resolved storage config — and the
-// scheduled path had never executed. A dead scheduler hides exactly
-// this class of bug, which is why it is worth a test rather than a
-// one-line fix.
-func TestBuildTaskOverrides_FallsBackToStorageEnv(t *testing.T) {
-	rec := tenant.Record{StackName: "forge-storage--staging"}
-	res := tenant.Resource{Name: "db", Connection: map[string]string{"driver": "mongodb"}}
-	now := time.Date(2026, 11, 19, 12, 0, 0, 0, time.UTC)
-
-	envOf := func(ov *ecstypes.TaskOverride) map[string]string {
-		out := map[string]string{}
-		for _, kv := range ov.ContainerOverrides[0].Environment {
-			out[*kv.Name] = *kv.Value
-		}
-		return out
-	}
-
-	// What a real deploy looks like: STORAGE_* present, BACKUP_S3_* not.
+// The fix was not to add a fallback there but to DELETE that duplicate:
+// the shared dispatch config already had this fallback, documented, and
+// Run Now had been using it all along. The duplicate existed only on a
+// path that had never run, which is why it could drift unnoticed.
+//
+// This asserts the shared reader is what resolves it.
+func TestScheduledDispatch_UsesStorageEnvFallback(t *testing.T) {
 	for _, n := range []string{"BACKUP_S3_BUCKET", "BACKUP_S3_REGION"} {
 		t.Setenv(n, "")
 	}
+	t.Setenv("BACKUP_ECS_CLUSTER_NAME", "c")
+	t.Setenv("BACKUP_ECS_TASK_FAMILY", "f")
+	t.Setenv("BACKUP_ECS_SUBNETS", "subnet-a")
 	t.Setenv("STORAGE_BUCKET", "backup-archives--staging")
 	t.Setenv("STORAGE_REGION", "eu-central-1")
 
-	got := envOf(buildTaskOverrides(rec, res, now))
-	if got["BACKUP_S3_BUCKET"] != "backup-archives--staging" {
-		t.Errorf("BACKUP_S3_BUCKET = %q, want the STORAGE_BUCKET fallback", got["BACKUP_S3_BUCKET"])
+	cfg, err := ReadFargateDispatchConfigFromEnv()
+	if err != nil {
+		t.Fatalf("config: %v", err)
 	}
-	if got["BACKUP_S3_REGION"] != "eu-central-1" {
-		t.Errorf("BACKUP_S3_REGION = %q, want the STORAGE_REGION fallback", got["BACKUP_S3_REGION"])
+	if cfg.S3Bucket != "backup-archives--staging" {
+		t.Errorf("S3Bucket = %q, want the STORAGE_BUCKET fallback", cfg.S3Bucket)
 	}
 
-	// An explicit BACKUP_S3_* still wins, so an operator override is
-	// not silently ignored.
-	t.Setenv("BACKUP_S3_BUCKET", "explicit-bucket")
-	got = envOf(buildTaskOverrides(rec, res, now))
-	if got["BACKUP_S3_BUCKET"] != "explicit-bucket" {
-		t.Errorf("BACKUP_S3_BUCKET = %q, want the explicit value to win", got["BACKUP_S3_BUCKET"])
+	// And the override actually carries the worker's callback wiring —
+	// the OTHER half the duplicate was missing. Without these three the
+	// worker cannot report completion, no run is recorded as succeeded,
+	// and every tenant stays due forever.
+	ov := BuildWorkerTaskOverrides(cfg, WorkerTaskSpec{
+		RunID:      "run-1",
+		AgentURL:   "https://backup.example.com",
+		AgentToken: "tok",
+		Tenant:     tenant.Record{StackName: "t"},
+		Resource:   tenant.Resource{Name: "db", Connection: map[string]string{"driver": "mongodb"}},
+		S3Key:      "t/db/ts.archive.gz",
+	})
+	got := map[string]string{}
+	for _, kv := range ov.ContainerOverrides[0].Environment {
+		got[*kv.Name] = *kv.Value
+	}
+	for k, want := range map[string]string{
+		"BACKUP_S3_BUCKET":   "backup-archives--staging",
+		"BACKUP_RUN_ID":      "run-1",
+		"BACKUP_AGENT_URL":   "https://backup.example.com",
+		"BACKUP_AGENT_TOKEN": "tok",
+	} {
+		if got[k] != want {
+			t.Errorf("%s = %q, want %q", k, got[k], want)
+		}
 	}
 }
