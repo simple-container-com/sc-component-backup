@@ -426,10 +426,14 @@ func rewriteMongoURICreds(uri, username, password string) (string, error) {
 //     `unset-pre-slice-1a` (SC core's component-dispatch sidecar
 //     doesn't populate `_deployed_service` yet), which we treat as
 //     "not found" and fall through.
-//     b. `<parentStackName>-<parentEnv>-function-url` — the aws-lambda
-//     template's own export, published by sc-plugin-aws when the
-//     component dispatches `deployTo: lambda`. This is the working
-//     URL today (live-caught on backup-smoke-1d, 2026-11-14).
+//     b. `<parentStackName>-<resName>-<parentEnv>-function-url`, then
+//     the legacy `<parentStackName>-<parentEnv>-function-url` — the
+//     aws-lambda template's own export, published by sc-plugin-aws
+//     when the component dispatches `deployTo: lambda`. This is the
+//     working URL today (live-caught on backup-smoke-1d, 2026-11-14).
+//     The scoped spelling landed when the template started naming
+//     per-Component so a parent stack could host more than one; see
+//     the comment at the lookup for why scoped is tried first.
 //  3. `_test_service_url` override on Config.Raw — unit tests that
 //     don't construct dep fixtures or open StackReferences.
 //
@@ -464,11 +468,36 @@ func (p *Processor) readServiceURL(input api.ResourceInput, deps pApi.ResourcesO
 		// (SC core's component-dispatch sidecar doesn't propagate
 		// `_deployed_service` to the plugin's Provision input yet).
 		if parent != nil && parent.StackName != "" && parent.StackEnv != "" {
-			key := parent.StackName + "-" + parent.StackEnv + "-function-url"
-			if s, found, err := parentStringOutput(parentRef, key); err != nil {
-				return "", errors.Wrapf(err, "parent-stack lookup for %q", key)
-			} else if found && !isUnsetServiceURL(s) {
-				return s, nil
+			// Two candidate keys, component-scoped FIRST.
+			//
+			// sc-plugin-aws used to name the aws-lambda template's
+			// export from the stack name alone, which is why the
+			// legacy key is `<parentStack>-<env>-function-url`. That
+			// meant a parent stack could host exactly ONE Component
+			// dispatched into aws-lambda: a second one collided on
+			// every resource name, loudest on the ECR repository
+			// (`Duplicate resource URN ... ::infra-infra`), and
+			// silently on this very export — a map set, so the last
+			// Component provisioned would have overwritten the first's
+			// URL and both would have resolved to the same service.
+			// Live-caught 2026-11-19 adding sc-observatory alongside
+			// this component on forge/infra (forge run 44463662474).
+			//
+			// The template now scopes those names per Component, so the
+			// export this resource's own dispatch publishes is
+			// `<parentStack>-<resName>-<env>-function-url`. The legacy
+			// key is kept as a second candidate so an operator running
+			// an older sc-plugin-aws still resolves — the two can never
+			// both be right for the same resource, and preferring the
+			// scoped one means a multi-Component parent stack picks the
+			// right URL instead of whichever dispatch happened to be
+			// last.
+			for _, key := range parentFunctionURLKeys(parent.StackName, resName, parent.StackEnv) {
+				if s, found, err := parentStringOutput(parentRef, key); err != nil {
+					return "", errors.Wrapf(err, "parent-stack lookup for %q", key)
+				} else if found && !isUnsetServiceURL(s) {
+					return s, nil
+				}
 			}
 		}
 	}
@@ -639,4 +668,24 @@ func ReadDeployedServiceURL(depOutputsJSON []byte) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// parentFunctionURLKeys returns the parent-stack output keys that may
+// hold this component's deployed Function URL, most specific first.
+//
+// Extracted as a pure function so the preference ORDER is pinned by a
+// test. Order is the whole point: on a parent stack hosting more than
+// one Component, the legacy un-scoped key holds whichever dispatch ran
+// last, so trying it first would hand one Component the other's URL
+// with no error anywhere.
+func parentFunctionURLKeys(parentStackName, resName, parentEnv string) []string {
+	return []string{
+		// Published by sc-plugin-aws once the aws-lambda template names
+		// per-Component.
+		parentStackName + "-" + resName + "-" + parentEnv + "-function-url",
+		// Legacy: the template named every resource from the stack name
+		// alone, which allowed exactly one Component per parent stack.
+		// Kept so an older sc-plugin-aws still resolves.
+		parentStackName + "-" + parentEnv + "-function-url",
+	}
 }

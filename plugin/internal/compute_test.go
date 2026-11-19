@@ -155,3 +155,34 @@ func TestReadDeployedServiceURL(t *testing.T) {
 	Expect(ok).To(BeFalse())
 	Expect(v).To(BeEmpty())
 }
+
+// TestParentFunctionURLKeys pins the candidate order for the
+// parent-stack Function URL lookup.
+//
+// The component-scoped key MUST come first. Before sc-plugin-aws named
+// aws-lambda resources per-Component, the template exported this under
+// `<parentStack>-<env>-function-url` — one key for the whole stack. A
+// parent stack hosting two Components therefore had both dispatches
+// writing that one key, last writer winning, so preferring it would
+// silently resolve one Component's service URL to the other's Lambda.
+// No error, no log line: every consumer would push-register its tenant
+// record into the wrong service.
+//
+// The legacy key stays as the second candidate so an operator on an
+// older sc-plugin-aws still resolves.
+func TestParentFunctionURLKeys(t *testing.T) {
+	RegisterTestingT(t)
+
+	keys := parentFunctionURLKeys("infra", "my-backup", "staging")
+	Expect(keys).To(HaveLen(2))
+	Expect(keys[0]).To(Equal("infra-my-backup-staging-function-url"))
+	Expect(keys[1]).To(Equal("infra-staging-function-url"))
+
+	// A second Component on the same parent stack must not share the
+	// scoped key — that collision is the bug this ordering fixes.
+	other := parentFunctionURLKeys("infra", "my-observatory", "staging")
+	Expect(other[0]).NotTo(Equal(keys[0]))
+	// ...while both still fall back to the same legacy key, which is
+	// exactly why it cannot be tried first.
+	Expect(other[1]).To(Equal(keys[1]))
+}
