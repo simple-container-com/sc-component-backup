@@ -76,6 +76,18 @@ func (f *fakeRuns) ListBackupsByTenant(_ context.Context, stack string) ([]backu
 // hour" from a stored value nothing read.
 //
 // The contract now: without force, a tenant fires when it is DUE.
+// tickRequest builds a tick request carrying scheduler claims.
+//
+// The handler requires `op` in {scheduler, operator} — validity alone is
+// not enough, because every tenant's plugin holds a `register` token and
+// this route spawns a Fargate task per due tenant. Tests go through the
+// same gate rather than around it, so a change to that rule fails here
+// rather than in production.
+func tickRequest(target string) *http.Request {
+	req := httptest.NewRequest("POST", target, nil)
+	return req.WithContext(context.WithValue(req.Context(), claimsKey{}, &Claims{Op: OpScheduler}))
+}
+
 func TestSchedulerTick_NoForce_FiresOnlyDueTenants(t *testing.T) {
 	restore := setupTickEnv(t)
 	defer restore()
@@ -150,7 +162,7 @@ func TestSchedulerTick_NoForce_FiresOnlyDueTenants(t *testing.T) {
 		})
 
 		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, httptest.NewRequest("POST", "/api/v1/scheduler/tick", nil))
+		h.ServeHTTP(rec, tickRequest("/api/v1/scheduler/tick"))
 		if rec.Code != http.StatusAccepted {
 			t.Fatalf("%s: code %d, body %s", name, rec.Code, rec.Body.String())
 		}
@@ -207,7 +219,7 @@ func TestSchedulerTick_Force_FiresOnePerTenantResource(t *testing.T) {
 		Now: func() time.Time { return time.Date(2026, 11, 13, 10, 20, 30, 0, time.UTC) },
 	})
 
-	req := httptest.NewRequest("POST", "/api/v1/scheduler/tick?force=true", nil)
+	req := tickRequest("/api/v1/scheduler/tick?force=true")
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 
@@ -276,11 +288,73 @@ func TestSchedulerTick_MissingEnvReturns500(t *testing.T) {
 		defer os.Setenv(k, prev)
 	}
 
-	req := httptest.NewRequest("POST", "/api/v1/scheduler/tick", nil)
+	req := tickRequest("/api/v1/scheduler/tick")
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusInternalServerError {
 		t.Errorf("code %d, body %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestSchedulerTick_RejectsNonSchedulerOps is the authorization gate.
+//
+// This route spawns an ECS Fargate task per due tenant, and with
+// ?force=true dumps every database at once. Every tenant's plugin holds
+// a `register` token so it can push-register itself — so a tick that
+// accepted any valid token would let any single consumer stack spend
+// money across the whole fleet on demand.
+//
+// It also bounds the credential in the EventBridge rule's input, which
+// is readable by anyone with events:DescribeRule in the account.
+func TestSchedulerTick_RejectsNonSchedulerOps(t *testing.T) {
+	restore := setupTickEnv(t)
+	defer restore()
+
+	store := tenant.NewInMemoryStore()
+	_ = store.Upsert(context.Background(), tenant.Record{
+		StackName: "t",
+		Resources: []tenant.Resource{
+			{Name: "mongo", Connection: map[string]string{"driver": "mongodb", "uri": "mongodb://h/", "database": "db1"}},
+		},
+	})
+
+	for name, tc := range map[string]struct {
+		claims *Claims
+		want   int
+	}{
+		"scheduler": {claims: &Claims{Op: OpScheduler}, want: http.StatusAccepted},
+		"operator":  {claims: &Claims{Op: OpOperator}, want: http.StatusAccepted},
+		// The one that matters: a tenant's own token must not fire it.
+		"register": {claims: &Claims{Op: OpRegister, Tenant: "t"}, want: http.StatusForbidden},
+		"unknown":  {claims: &Claims{Op: "nope"}, want: http.StatusForbidden},
+		// The handler must not assume the middleware ran.
+		"no claims": {claims: nil, want: http.StatusForbidden},
+	} {
+		fired := 0
+		h := NewSchedulerTickHandler(SchedulerTickConfig{
+			Tenants: store,
+			Runs:    &fakeRuns{},
+			Ecs: &fakeEcs{runTask: func(context.Context, *ecs.RunTaskInput, ...func(*ecs.Options)) (*ecs.RunTaskOutput, error) {
+				fired++
+				return &ecs.RunTaskOutput{}, nil
+			}},
+			Now: func() time.Time { return time.Date(2026, 11, 19, 12, 0, 0, 0, time.UTC) },
+		})
+
+		req := httptest.NewRequest("POST", "/api/v1/scheduler/tick?force=true", nil)
+		if tc.claims != nil {
+			req = req.WithContext(context.WithValue(req.Context(), claimsKey{}, tc.claims))
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+
+		if rec.Code != tc.want {
+			t.Errorf("%s: code %d, want %d (body %s)", name, rec.Code, tc.want, rec.Body.String())
+		}
+		// A refused caller must not have spawned anything.
+		if tc.want == http.StatusForbidden && fired != 0 {
+			t.Errorf("%s: fired %d tasks despite being refused", name, fired)
+		}
 	}
 }

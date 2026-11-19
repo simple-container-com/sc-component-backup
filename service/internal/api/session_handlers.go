@@ -155,7 +155,7 @@ func (c *SessionConfig) Logout(w http.ResponseWriter, _ *http.Request) {
 func (c *SessionConfig) mintOperatorJWT() (string, error) {
 	now := time.Now()
 	claims := &Claims{
-		Op: "operator",
+		Op: OpOperator,
 		RegisteredClaims: jwt.RegisteredClaims{
 			Issuer:    "sc-component-backup",
 			Subject:   "operator",

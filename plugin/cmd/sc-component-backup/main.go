@@ -323,6 +323,13 @@ func (p *backupPlugin) Schema(_ context.Context, _ *scpluginv1.SchemaRequest) (*
 				// Nothing stateful moves — the archives and the tenant
 				// registry live in the S3 bucket, a separate resource.
 				"legacyResourceNames",
+				// The `op: "scheduler"` token the EventBridge rule
+				// presents on the tick. SC core dual-uses this list as
+				// the allowed-top-level-keys validator, so without the
+				// entry the whole stack is refused at parse time with
+				// `unknown or disallowed top-level key "schedulerToken"`
+				// — live-caught on forge preview run 44514355119.
+				"schedulerToken",
 				// Removed in Tier-4 (sc-components-plugin-peer-invoke):
 				//   - databases: discovery is auto now (slice 1d.7, api v2026.11.59)
 				//   - atlasAdmin: creds live on the mongodb resource;
