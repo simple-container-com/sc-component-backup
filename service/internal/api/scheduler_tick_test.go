@@ -20,6 +20,7 @@ import (
 	ecstypes "github.com/aws/aws-sdk-go-v2/service/ecs/types"
 
 	"github.com/simple-container-com/sc-component-backup/service/internal/backup"
+	"github.com/simple-container-com/sc-component-backup/service/internal/backup/project"
 	"github.com/simple-container-com/sc-component-backup/service/internal/backup/scheduler"
 	"github.com/simple-container-com/sc-component-backup/service/internal/tenant"
 )
@@ -461,5 +462,47 @@ func TestScheduledDispatch_UsesStorageEnvFallback(t *testing.T) {
 		if got[k] != want {
 			t.Errorf("%s = %q, want %q", k, got[k], want)
 		}
+	}
+}
+
+// TestResolveIntervalMinutes_ProjectConfigWins is the fix for what an
+// operator actually saw: the SPA said "every hour" above "last success
+// 4 h ago".
+//
+// The project config's `interval` is the value the SPA displays and an
+// operator edits — and the scheduler was ignoring it entirely, using
+// its own default. Meanwhile the API answered a hardcoded "1h" for any
+// project with no stored config, so the two defaults disagreed and
+// NEITHER was chosen by anyone.
+func TestResolveIntervalMinutes_ProjectConfigWins(t *testing.T) {
+	ctx := context.Background()
+	rec := tenant.Record{StackName: "forge-conductor--staging"}
+
+	// Nothing configured anywhere → the shared default, which the API's
+	// display default now also uses.
+	if got := resolveIntervalMinutes(ctx, nil, rec); got != project.DefaultIntervalMinutes {
+		t.Errorf("no config: got %d, want %d", got, project.DefaultIntervalMinutes)
+	}
+
+	// The plugin-set tenant value is used when there is no project
+	// config.
+	withTenant := rec
+	withTenant.IntervalMinutes = 90
+	if got := resolveIntervalMinutes(ctx, nil, withTenant); got != 90 {
+		t.Errorf("tenant interval: got %d, want 90", got)
+	}
+
+	// An operator-edited project config BEATS both — this is the case
+	// that was broken.
+	store := project.NewInMemoryStore()
+	if _, err := store.Create(ctx, project.Config{
+		Name:     rec.StackName,
+		Engine:   "mongodb",
+		Interval: "1h",
+	}); err != nil {
+		t.Fatalf("seed project: %v", err)
+	}
+	if got := resolveIntervalMinutes(ctx, store, withTenant); got != 60 {
+		t.Errorf("project interval 1h: got %d, want 60", got)
 	}
 }

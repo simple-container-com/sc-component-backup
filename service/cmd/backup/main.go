@@ -264,6 +264,7 @@ func main() {
 		r.Post("/api/v1/scheduler/tick", api.NewSchedulerTickHandler(api.SchedulerTickConfig{
 			Tenants:      metaStore.Tenants(),
 			Runs:         metaStore.Runs(),
+			Projects:     metaStore.Projects(),
 			MintWorker:   api.MintWorkerJWT([]byte(jwtSecret)),
 			AgentURL:     strings.TrimRight(os.Getenv("BACKUP_AGENT_URL"), "/"),
 			PathTemplate: "", // scheduler default; shared string
