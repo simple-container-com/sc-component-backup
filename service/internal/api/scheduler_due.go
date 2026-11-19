@@ -5,19 +5,25 @@ package api
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"github.com/simple-container-com/sc-component-backup/service/internal/backup"
+	"github.com/simple-container-com/sc-component-backup/service/internal/backup/project"
+	"github.com/simple-container-com/sc-component-backup/service/internal/tenant"
 )
 
-// DefaultIntervalMinutes is how often a tenant is backed up when it
-// declares nothing.
+// DefaultIntervalMinutes is how often a tenant is backed up when
+// nothing is configured.
 //
-// Four hours, matching the cadence the parent stack's schedule is set
-// to. Deliberately not "hourly": the fleet's largest tenant dumps 1.8 GB
-// per run, so an hourly default would mean ~150 GB/day of archives for
-// six tenants before anyone had asked for it.
-const DefaultIntervalMinutes = 240
+// Aliases project.DefaultIntervalMinutes so the scheduler and the API's
+// display default cannot drift. They used to be separate: the API
+// answered a hardcoded "1h" for any project without a stored config
+// while this was 240, so the SPA promised hourly backups and the engine
+// did four-hourly. An operator reading "every hour" above "last success
+// 4 h ago" was being told two different things, neither of them chosen
+// by anyone.
+const DefaultIntervalMinutes = project.DefaultIntervalMinutes
 
 // runLister is the slice of RunStore the due-check needs. Narrow on
 // purpose so the check is testable without standing up the whole store.
@@ -86,4 +92,33 @@ func tenantIsDue(ctx context.Context, runs runLister, stack string, intervalMinu
 		return true, "last success " + elapsed.Round(time.Minute).String() + " ago"
 	}
 	return false, "next due in " + (want - elapsed).Round(time.Minute).String()
+}
+
+// resolveIntervalMinutes decides how often this tenant is backed up.
+//
+// Order, most operator-explicit first:
+//
+//  1. the project config's `interval` — the value the SPA displays and
+//     an operator edits. THIS is the one that was being ignored.
+//  2. the tenant record's IntervalMinutes, set by the plugin.
+//  3. the shared default.
+//
+// An unparseable stored interval falls back rather than failing the
+// whole tick: one malformed project config must not stop every other
+// tenant's backup. The project endpoint is where a typo should be
+// rejected, at write time, with the operator looking at it.
+func resolveIntervalMinutes(ctx context.Context, projects project.Store, t tenant.Record) int {
+	if projects != nil {
+		if cfg, ok, err := projects.Get(ctx, t.StackName); err == nil && ok && strings.TrimSpace(cfg.Interval) != "" {
+			if d, parsed := project.IntervalOrDefault(cfg.Interval); parsed {
+				if m := int(d / time.Minute); m > 0 {
+					return m
+				}
+			}
+		}
+	}
+	if t.IntervalMinutes > 0 {
+		return t.IntervalMinutes
+	}
+	return DefaultIntervalMinutes
 }

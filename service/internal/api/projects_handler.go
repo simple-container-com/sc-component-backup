@@ -326,8 +326,14 @@ func (c *ProjectsConfig) RunsForProject(w http.ResponseWriter, r *http.Request) 
 func mergedResponse(rec tenant.Record, hasTenant bool, cfg project.Config, hasProject bool) ProjectResponseJSON {
 	resp := ProjectResponseJSON{
 		Config: ProjectConfigJSON{
-			Databases:         "all",
-			Interval:          "1h",
+			Databases: "all",
+			// The SAME default the scheduler applies. This was a
+			// hardcoded "1h" while the engine used four-hourly, so the
+			// SPA told every operator their services were backed up
+			// hourly and none of them were. A display default that does
+			// not match the engine is worse than no default: it reads as
+			// configuration.
+			Interval:          project.DefaultInterval,
 			Timeout:           "1h",
 			Retention:         RetentionJSON{Last: 7},
 			Retries:           1,

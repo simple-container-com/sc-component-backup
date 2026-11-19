@@ -29,6 +29,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ecs"
 	ecstypes "github.com/aws/aws-sdk-go-v2/service/ecs/types"
 
+	"github.com/simple-container-com/sc-component-backup/service/internal/backup/project"
 	"github.com/simple-container-com/sc-component-backup/service/internal/backup/scheduler"
 	"github.com/simple-container-com/sc-component-backup/service/internal/tenant"
 )
@@ -64,6 +65,11 @@ type SchedulerTickConfig struct {
 	// tenant reads as never-backed-up and so always due — safe for a
 	// smoke, wrong for production, which is why main.go wires it.
 	Runs scheduler.RunStore
+	// Projects is the operator-edited per-project config, read for the
+	// backup INTERVAL. Without it every tenant falls back to the
+	// default, which is how the SPA came to display "every hour" (its
+	// own hardcoded default) while the engine ran four-hourly.
+	Projects project.Store
 	// MintWorker mints the worker's callback credential. Without it the
 	// worker cannot report completion, no run is ever recorded as
 	// succeeded, and every tenant stays due forever — which at a
@@ -156,7 +162,7 @@ func NewSchedulerTickHandler(cfg SchedulerTickConfig) http.Handler {
 		skipped := []map[string]string{}
 		for _, t := range tenants {
 			if !force {
-				due, why := tenantIsDue(ctx, cfg.Runs, t.StackName, t.IntervalMinutes, now)
+				due, why := tenantIsDue(ctx, cfg.Runs, t.StackName, resolveIntervalMinutes(ctx, cfg.Projects, t), now)
 				if !due {
 					// Reported, not silent. A tenant skipped for a good
 					// reason and a tenant skipped because the scheduler
