@@ -52,6 +52,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 
 	hclog "github.com/hashicorp/go-hclog"
@@ -330,6 +331,9 @@ func (p *backupPlugin) Schema(_ context.Context, _ *scpluginv1.SchemaRequest) (*
 				// `unknown or disallowed top-level key "schedulerToken"`
 				// — live-caught on forge preview run 44514355119.
 				"schedulerToken",
+				// Which consumer environments may register as tenants.
+				// Empty/absent allows all — the pre-filter behaviour.
+				"tenantEnvironments",
 				// Removed in Tier-4 (sc-components-plugin-peer-invoke):
 				//   - databases: discovery is auto now (slice 1d.7, api v2026.11.59)
 				//   - atlasAdmin: creds live on the mongodb resource;
@@ -656,6 +660,33 @@ func (p *backupPlugin) ComputeProcess(stdctx context.Context, req *scpluginv1.Co
 	if componentRaw == nil {
 		componentRaw = map[string]any{}
 	}
+	// Environment gate — BEFORE the scoped-user mint and before any
+	// registration.
+	//
+	// An SC parent stack can be cloned into short-lived isolated stacks
+	// (the Forge fleet spins one per agent-workflow run). Those blocks
+	// inherit the base config with a YAML merge key, and a merge key
+	// cannot DELETE an inherited entry — so an isolated deploy inherits
+	// `uses: [… my-backup]` with no way to opt out from the YAML side.
+	//
+	// The cost of letting it through is not cosmetic: the tenant row
+	// carries a live Atlas URI, so the scheduler dumps a throwaway
+	// database every interval — one Fargate task and one S3 archive per
+	// run, for a stack destroyed hours ago. It also mints a scoped
+	// Atlas user per isolated deploy, which is a credential nobody
+	// reaps.
+	//
+	// Gated here rather than in the service so the ephemeral deploy
+	// never gets a user minted for it either.
+	consumerEnv := consumerEnvironment(req, parent)
+	if allowed := backupInternal.TenantEnvironmentsFromConfig(componentRaw); !backupInternal.EnvMayRegister(allowed, consumerEnv) {
+		p.progress.Info("compute-process", fmt.Sprintf(
+			"skipping tenant registration for %q: environment %q is not in tenantEnvironments %v",
+			req.GetHeader().GetStackName(), consumerEnv, allowed,
+		))
+		return &scpluginv1.ComputeProcessResponse{}, nil
+	}
+
 	input := runtime.ResourceInputForComputeProcess(req, parent, componentRaw)
 
 	// Tier-4 (sc-components-plugin-peer-invoke) wiring: the mint-scoped-user
@@ -754,4 +785,27 @@ func main() {
 			Output: os.Stderr,
 		}),
 	})
+}
+
+// consumerEnvironment resolves the environment the CONSUMER is being
+// deployed to.
+//
+// The header is authoritative; ParentInfo.StackEnv covers a dispatch
+// shape that leaves it empty, and the stack name's `--<env>` suffix is
+// the last resort.
+func consumerEnvironment(req *scpluginv1.ComputeProcessRequest, parent *pApi.ParentInfo) string {
+	if e := strings.TrimSpace(req.GetHeader().GetEnvironment()); e != "" {
+		return e
+	}
+	if parent != nil {
+		if e := strings.TrimSpace(parent.StackEnv); e != "" {
+			return e
+		}
+	}
+	if stack := req.GetHeader().GetStackName(); stack != "" {
+		if i := strings.LastIndex(stack, "--"); i >= 0 && i+2 < len(stack) {
+			return stack[i+2:]
+		}
+	}
+	return ""
 }
