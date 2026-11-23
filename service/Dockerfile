@@ -19,7 +19,7 @@
 # `docker build` is run at smoke time (local or on the target VPS) with
 # `docker load` of the resulting image.
 
-ARG GOLANG_VERSION=1.26-alpine
+ARG GOLANG_VERSION=1.27-alpine
 ARG NODE_VERSION=20-alpine
 # Plain amazonlinux:2023 (NOT lambda/provided:al2023) so the container's
 # own ENTRYPOINT runs directly without lambda-entrypoint.sh demanding a
