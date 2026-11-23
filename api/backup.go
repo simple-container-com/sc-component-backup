@@ -4,7 +4,10 @@
 package backup
 
 import (
+	"strings"
+
 	"github.com/pkg/errors"
+
 	"github.com/simple-container-com/api/pkg/api"
 )
 
@@ -131,6 +134,35 @@ type BackupConfig struct {
 	// sc-component-backup-pluggable-storage §5.2 for the per-backend
 	// operator profiles.
 	Metadata *BackupMetadata `json:"metadata,omitempty" yaml:"metadata,omitempty"`
+
+	// Notify points this component at an sc-component-notifier instance,
+	// so a failed backup reaches Telegram (or a signed webhook) instead
+	// of waiting to be noticed in the SPA.
+	//
+	// Optional. Absent means notifications are off — every existing
+	// stack keeps deploying unchanged on the release that adds this.
+	// PRESENT but unresolvable fails the provision: a publisher that
+	// deploys with notifications silently off is the worst available
+	// outcome, because the operator believes they are covered.
+	//
+	// The plugin also accepts the shorthand `notify: "https://host"`,
+	// which this typed struct cannot express (a YAML union). Both are
+	// resolved by plugin/internal/notify.go, which is the code that
+	// actually runs — the `sc` binary never links this module.
+	Notify *BackupNotify `json:"notify,omitempty" yaml:"notify,omitempty"`
+
+	// NotifyToken is a `${secret:...}` reference to the notifier-minted
+	// publisher credential (`op: "event"`, scoped to this tenant).
+	//
+	// A SEPARATE top-level field and deliberately NOT nested under
+	// Notify: it reaches the service as a SecretsManager-backed secret,
+	// which only happens for a top-level field registered in the
+	// plugin's ComponentSecretEnvMap. SC core's applyComponentSecretEnvMap
+	// reads `merged[field]` and nothing nested, so a token written
+	// inside the `notify:` block could never be delivered that way.
+	//
+	// Required whenever Notify is set — see Validate.
+	NotifyToken string `json:"notifyToken,omitempty" yaml:"notifyToken,omitempty"`
 
 	// api.Credentials embedded inline so a resource can optionally carry
 	// a `${auth:...}` reference. Rarely needed for a component (templates
@@ -263,6 +295,34 @@ type BackupMetadata struct {
 	Path string `json:"path,omitempty" yaml:"path,omitempty"`
 }
 
+// BackupNotify is the `notify:` block — where this component publishes
+// operator-relevant events.
+//
+// ORDERING IS LOAD-BEARING: the notifier resource must be declared
+// BEFORE this component in server.yaml, the same class of trap as
+// `uses:` ordering.
+type BackupNotify struct {
+	// URL is the notifier service's base URL. Either an explicit
+	// hostname, or — preferred, because it survives a redeploy that
+	// moves the notifier — a reference the OPERATOR writes:
+	//
+	//	notify:
+	//	  url: "$sc:${resource:my-notifier.self-url}"
+	//
+	// Written by the operator rather than derived by this plugin on
+	// purpose: a plugin cannot read a sibling resource's declaration
+	// (PreProvisionRequest carries only the component's own config), and
+	// a `${resource:…}` reference that a plugin emits is not re-resolved
+	// by SC. Writing it here puts it in the resolution pass that
+	// definitely runs.
+	URL string `json:"url,omitempty" yaml:"url,omitempty"`
+
+	// Name is the SC resource name of the notifier, recorded so logs and
+	// error messages can name it. Informational only — it does not
+	// resolve a URL, for the reason above.
+	Name string `json:"name,omitempty" yaml:"name,omitempty"`
+}
+
 // BackupIngress models the component's public entry point. Optional — a
 // smoke run can disable ingress via `ingress: null` and expose the service
 // on a high port with no TLS.
@@ -345,10 +405,46 @@ func (c *BackupConfig) Validate() error {
 			return err
 		}
 	}
+	// Notify: the url+token pair is all-or-nothing. Half of it is the
+	// failure mode this component exists to remove — a publisher that
+	// can reach the notifier but cannot authenticate gets a 401 on its
+	// first real alert, at the exact moment the operator is relying on
+	// it. The authoritative check runs plugin-side
+	// (plugin/internal/notify.go, which also sees the string shorthand
+	// this struct cannot express); this one keeps the typed config
+	// honest for anyone reading or generating it.
+	if err := c.validateNotify(); err != nil {
+		return err
+	}
 	// Lambda + filesystem archive: refuse at parse time (/tmp is
 	// ephemeral on Lambda cold starts — metadata would evaporate).
 	if c.DeployTo == "lambda" && c.Storage != nil && c.Storage.Type == "filesystem" {
 		return errors.Errorf("`storage.type: filesystem` is incompatible with `deployTo: lambda` — Lambda /tmp is ephemeral; use `storage.type: s3` instead")
+	}
+	return nil
+}
+
+// validateNotify enforces the notify.url + notifyToken pair.
+//
+// Each message names the key to add, because "notifications don't work"
+// is otherwise a four-layer debug across plugin, env, token and
+// channel.
+func (c *BackupConfig) validateNotify() error {
+	hasToken := strings.TrimSpace(c.NotifyToken) != ""
+	if c.Notify == nil {
+		if hasToken {
+			return errors.Errorf("`notifyToken` is set but there is no `notify:` block — add `notify: {url: \"https://...\"}` so the token has somewhere to be presented")
+		}
+		return nil
+	}
+	if strings.TrimSpace(c.Notify.URL) == "" {
+		if name := strings.TrimSpace(c.Notify.Name); name != "" {
+			return errors.Errorf("`notify.name: %[1]s` names a resource but no URL: add `notify.url: \"$sc:${resource:%[1]s.self-url}\"`, which SC resolves because you wrote it", name)
+		}
+		return errors.Errorf("`notify:` is declared with no `url` — add `notify.url: \"https://...\"`, or remove the `notify:` block to leave notifications off")
+	}
+	if !hasToken {
+		return errors.Errorf("`notify.url` is set but `notifyToken` is not — the publisher would reach the notifier and be refused with a 401 on its first alert. Mint a publisher token on the notifier, register it with `sc secrets add`, and set `notifyToken: \"${secret:<name>}\"`")
 	}
 	return nil
 }

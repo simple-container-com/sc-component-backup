@@ -49,7 +49,6 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
-
 	sdkservice "github.com/simple-container-com/go-aws-lambda-sdk/pkg/service"
 
 	"github.com/simple-container-com/sc-component-backup/service/internal/api"
@@ -237,6 +236,30 @@ func main() {
 	goembedbadmin.SetStoreBackend(backendLabel(useGoEmbedb))
 
 	sch := scheduler.New(scheduler.Config{}, metaStore.Tenants(), metaStore.Runs(), archiveStore, logger, nil)
+
+	// Publisher for sc-component-notifier. NOTIFY_URL/NOTIFY_TOKEN are
+	// landed by this component's plugin from the operator's `notify:`
+	// block; both absent means notifications are off and NewEmitter
+	// returns a no-op.
+	//
+	// A construction error is FATAL on purpose. It only happens when
+	// the wiring is half-done — a URL with no token (every event would
+	// 401), or a URL still holding an unresolved `$sc:…` placeholder —
+	// and both would otherwise surface for the first time at the moment
+	// an operator was relying on being paged. A deploy that fails here
+	// is strictly better than a service that runs with its alerting
+	// silently dead.
+	eventPublisher, err := notify.NewEmitter(notify.EmitterConfig{
+		BaseURL: os.Getenv("NOTIFY_URL"),
+		Token:   os.Getenv("NOTIFY_TOKEN"),
+		SelfURL: os.Getenv("BACKUP_AGENT_URL"),
+		Log:     logger,
+	})
+	if err != nil {
+		slog.Error("notify publisher init failed", "err", err)
+		os.Exit(1)
+	}
+	sch.SetPublisher(eventPublisher)
 
 	// Reconcile stuck "running" rows at startup. A Lambda that OOM'd
 	// mid-run (or was replaced for any other reason) leaves the row

@@ -207,6 +207,14 @@ var componentDefaultsJSON = func() []byte {
 			// from `running` to `succeeded` until the startup
 			// watchdog sweeps it.
 			"BACKUP_AGENT_URL": "$$sc:${resource:${name}.backup-agent-url}",
+			// Where to publish operator-relevant events — a failed
+			// backup, a failed restore. Plain env on purpose: a URL
+			// is not a credential, and the matching NOTIFY_TOKEN
+			// travels the SecretsManager-backed ComponentSecretEnvMap
+			// path instead. Empty when the operator declared no
+			// `notify:` block, and the service treats an empty
+			// NOTIFY_URL as "notifications off".
+			"NOTIFY_URL": "$$sc:${resource:${name}.notify-url}",
 			// Default-VPC subnets have an IGW route but no NAT;
 			// without a public IP the Fargate task can't reach
 			// CloudWatch/S3/ECR and dies before it starts.
@@ -300,6 +308,11 @@ func (p *backupPlugin) Schema(_ context.Context, _ *scpluginv1.SchemaRequest) (*
 			backupApi.ResourceType: {Values: []string{
 				"image", "env", "ingressRoutes", "imagePullSecretRef", "cloudExtras",
 				"worker", "storage", "metadata", "operatorPassword",
+				// Where to publish operator-relevant events, and the
+				// credential to present. Both must be allowlisted or
+				// SC core's dual-use of this list as
+				// allowed-top-level-keys rejects the whole stack.
+				"notify", "notifyToken",
 				// Compute-shape overrides for the dispatched aws-lambda
 				// template. The default Lambda memory (128 MB) OOMs any
 				// mongodump bigger than a handful of MB on the in-process
@@ -387,6 +400,18 @@ func (p *backupPlugin) Schema(_ context.Context, _ *scpluginv1.SchemaRequest) (*
 				// — see service/cmd/backup/main.go, next to the
 				// SERVICE_JWT_SECRET + BACKUP_OPERATOR_PASSWORD resolution.
 				"migrationToken": "ADMIN_MIGRATION_TOKEN",
+				// The publisher's event token: an `op:"event"` JWT the
+				// notifier minted for this tenant. Routed through the
+				// secret-env map rather than ComponentDefaults env so
+				// it lands in a per-function SecretsManager secret
+				// instead of plaintext in the Lambda's environment.
+				//
+				// The notifier's own signing key is deliberately NOT
+				// handed to publishers: it is also the KEK that seals
+				// every tenant's channel credentials at rest, so a
+				// publisher holding it could decrypt every stored
+				// Telegram token and mint a token for any tenant.
+				"notifyToken": "NOTIFY_TOKEN",
 			}},
 		},
 	}, nil
@@ -552,10 +577,29 @@ func (p *backupPlugin) PreProvision(stdctx context.Context, req *scpluginv1.PreP
 			return nil, errors.Wrap(jerr, "decode ComponentRaw")
 		}
 	}
+	// The `notify:` wiring is resolved FIRST and fails the provision
+	// when it cannot be, rather than deploying with notifications
+	// quietly off. An operator who wrote a `notify:` block believes
+	// they are covered; the first thing they would otherwise learn is
+	// that a backup failed and nobody was paged. Absent `notify:` is
+	// not an error — see backup.ValidateNotifyWiring.
+	notify, nerr := backupInternal.ValidateNotifyWiring(rawMap)
+	if nerr != nil {
+		return nil, errors.Wrapf(nerr, "backup component %q", req.GetResourceName())
+	}
+
+	// A non-lambda deployTo (vm-compose, k8s-run) has no default-VPC
+	// lookup to do, but it still needs its tpl extensions landed:
+	// `notify-url` is referenced from ComponentDefaults env on EVERY
+	// deployTo, and an extension that never lands leaves the literal
+	// placeholder in the service's environment. This used to be a bare
+	// early return, which is why the flag exists rather than a second
+	// exit.
+	skipVPCLookup := false
 	dt, _ := rawMap["deployTo"].(string)
 	if dt != "lambda" {
 		p.progress.Info("pre-provision", fmt.Sprintf("backup %q deployTo=%q — no VPC lookup needed, skipping", req.GetResourceName(), dt))
-		return &scpluginv1.PreProvisionResponse{}, nil
+		skipVPCLookup = true
 	}
 
 	region := "eu-central-1"
@@ -586,6 +630,11 @@ func (p *backupPlugin) PreProvision(stdctx context.Context, req *scpluginv1.PreP
 			tpl := map[string]string{
 				"cluster-name": fmt.Sprintf("sc-backup-%s-cluster", req.GetResourceName()),
 				"task-family":  fmt.Sprintf("sc-backup-%s-worker", req.GetResourceName()),
+				// Where this component POSTs operator-relevant
+				// events. Empty when no `notify:` block is declared,
+				// which the service reads as "notifications off" —
+				// the same contract as an absent env.
+				"notify-url": notify.URL,
 			}
 
 			// Self-URL for the Fargate worker's completion callback —
@@ -600,6 +649,12 @@ func (p *backupPlugin) PreProvision(stdctx context.Context, req *scpluginv1.PreP
 				if host, ok := ingress["hostname"].(string); ok && host != "" {
 					tpl["backup-agent-url"] = "https://" + host
 				}
+			}
+
+			if skipVPCLookup {
+				collector.AddResourceTplExtension(req.GetResourceName(), tpl)
+				p.progress.Info("pre-provision", fmt.Sprintf("backup %q derived: %s", req.GetResourceName(), backupInternal.NotifyEnvDescription(notify)))
+				return nil
 			}
 
 			awsProv, perr := awsprov.NewProvider(ctx, fmt.Sprintf("sc-backup-%s-aws-preprovision", req.GetResourceName()), &awsprov.ProviderArgs{
@@ -634,7 +689,7 @@ func (p *backupPlugin) PreProvision(stdctx context.Context, req *scpluginv1.PreP
 			// + VPC endpoints can override via env.BACKUP_ECS_ASSIGN_PUBLIC_IP=false.
 			tpl["assign-public-ip"] = "true"
 			collector.AddResourceTplExtension(req.GetResourceName(), tpl)
-			p.progress.Info("pre-provision", fmt.Sprintf("backup %q default-VPC: subnets=%s SG=%s assign-public-ip=true", req.GetResourceName(), discovery.SubnetIDsCSV, discovery.SecurityGroupID))
+			p.progress.Info("pre-provision", fmt.Sprintf("backup %q default-VPC: subnets=%s SG=%s assign-public-ip=true; %s", req.GetResourceName(), discovery.SubnetIDsCSV, discovery.SecurityGroupID, backupInternal.NotifyEnvDescription(notify)))
 			return nil
 		},
 	)

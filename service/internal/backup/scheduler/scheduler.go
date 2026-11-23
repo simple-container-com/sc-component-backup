@@ -17,6 +17,7 @@ import (
 
 	"github.com/simple-container-com/sc-component-backup/service/internal/backup"
 	"github.com/simple-container-com/sc-component-backup/service/internal/backup/driver"
+	"github.com/simple-container-com/sc-component-backup/service/internal/backup/notify"
 	"github.com/simple-container-com/sc-component-backup/service/internal/backup/storage"
 	"github.com/simple-container-com/sc-component-backup/service/internal/tenant"
 )
@@ -87,6 +88,11 @@ type Scheduler struct {
 	log      *slog.Logger
 	driverBy func(string) (driver.Driver, error)
 
+	// events publishes terminal run outcomes to sc-component-notifier.
+	// Never nil — New installs notify.Disabled{} when the operator
+	// declared no `notify:` block, so no call site needs a guard.
+	events notify.Publisher
+
 	inflightMu sync.Mutex
 	inflight   map[string]struct{} // key: tenantStack+"\x00"+resourceName
 }
@@ -109,7 +115,21 @@ func New(cfg Config, tenants tenant.Store, runs RunStore, s3 storage.Store, log 
 		log:      log,
 		driverBy: driverFactory,
 		inflight: map[string]struct{}{},
+		events:   notify.Disabled{},
 	}
+}
+
+// SetPublisher installs the notifier publisher.
+//
+// A setter rather than a seventh positional argument to New: this is
+// optional wiring, and the one existing call site should not have to
+// pass a sentinel. Tests install a fake to assert what would have been
+// published.
+func (s *Scheduler) SetPublisher(p notify.Publisher) {
+	if p == nil {
+		p = notify.Disabled{}
+	}
+	s.events = p
 }
 
 // Start runs the scheduler loop until ctx is cancelled. Graceful
@@ -258,7 +278,95 @@ func (s *Scheduler) RunOnce(ctx context.Context, tenantStack, resourceName, trig
 	if err := s.runs.UpdateBackup(ctx, run); err != nil {
 		s.log.Error("persist final backup-run state", "err", err, "runId", runID)
 	}
+	s.publishBackupOutcome(ctx, run)
 	return run, nil
+}
+
+// publishBackupOutcome emits the terminal status to the notifier.
+//
+// This is the hook, and the terminal status write is where it belongs:
+// the outcome is known exactly once here, which makes the event an EDGE
+// by construction. The alerts.Synthesizer is NOT the hook — it is
+// level-triggered and only runs on a SPA GET, so it can describe a
+// failure but can never be the thing that announces one.
+//
+// Errors are logged, never returned. A backup that succeeded must not
+// be reported as failed because Telegram was slow, and a backup that
+// failed has already failed — turning a notification error into a
+// second failure would only obscure the first. The log line is the
+// operator's trail, and the notifier's own delivery rows are the
+// durable record of what happened after this POST.
+func (s *Scheduler) publishBackupOutcome(ctx context.Context, run backup.BackupRun) {
+	if !s.events.Enabled() {
+		return
+	}
+
+	var kind, severity, title string
+	switch run.Status {
+	case backup.StatusFailed:
+		kind, severity = notify.KindBackupFailed, notify.SeverityError
+		title = fmt.Sprintf("Backup failed: %s/%s", run.TenantStack, run.ResourceName)
+	case backup.StatusCancelled:
+		// A cancellation is usually deliberate (an operator pressed
+		// cancel, or the Lambda hit its deadline), so it is a warning
+		// rather than an error — but it is still actionable, which is
+		// why it is not info. See the severity note in notify/events.go.
+		kind, severity = notify.KindBackupCancelled, notify.SeverityWarning
+		title = fmt.Sprintf("Backup cancelled: %s/%s", run.TenantStack, run.ResourceName)
+	case backup.StatusSucceeded:
+		// Emitted at info, which every channel's default minSeverity
+		// (warning) drops. That is intended: an operator who wants a
+		// green heartbeat lowers one channel's minimum, and everyone
+		// else is not paged about success.
+		kind, severity = notify.KindBackupSucceeded, notify.SeverityInfo
+		title = fmt.Sprintf("Backup succeeded: %s/%s", run.TenantStack, run.ResourceName)
+	default:
+		// Not a terminal status — nothing to announce.
+		return
+	}
+
+	ev := notify.Event{
+		ID:       notify.BackupRunEventID(run.ID, kind),
+		Source:   run.TenantStack,
+		Kind:     kind,
+		Severity: severity,
+		Subject:  run.TenantStack + "/" + run.ResourceName,
+		Title:    title,
+		Body:     backupEventBody(run),
+		URL:      s.events.RunLink("/#/runs/" + run.ID),
+		At:       run.FinishedAt,
+		Labels: map[string]string{
+			"tenant":   run.TenantStack,
+			"resource": run.ResourceName,
+			"driver":   run.Driver,
+			"runId":    run.ID,
+		},
+	}
+	if err := s.events.Publish(ctx, ev); err != nil {
+		s.log.Error("publish backup outcome", "err", err, "runId", run.ID, "kind", kind)
+	}
+}
+
+// backupEventBody renders the human-readable half of the message.
+func backupEventBody(run backup.BackupRun) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "driver: %s\n", run.Driver)
+	if !run.StartedAt.IsZero() && !run.FinishedAt.IsZero() {
+		fmt.Fprintf(&b, "duration: %s\n", run.FinishedAt.Sub(run.StartedAt).Round(time.Second))
+	}
+	if run.TriggerSource != "" {
+		fmt.Fprintf(&b, "trigger: %s\n", run.TriggerSource)
+	}
+	if run.SizeBytes > 0 {
+		fmt.Fprintf(&b, "size: %d bytes\n", run.SizeBytes)
+	}
+	if run.Error != "" {
+		// Already truncated to 512 at the status write; repeated here
+		// because the operator reading a Telegram message has no other
+		// view of it.
+		fmt.Fprintf(&b, "error: %s\n", run.Error)
+	}
+	return b.String()
 }
 
 // RunRestore streams a stored archive through the driver's Restore
@@ -325,7 +433,40 @@ func (s *Scheduler) RunRestore(ctx context.Context, runID string, triggeredBy st
 	if err := s.runs.UpdateRestore(ctx, restore); err != nil {
 		s.log.Error("persist final restore-run state", "err", err, "runId", restore.ID)
 	}
+	s.publishRestoreOutcome(ctx, restore)
 	return restore, nil
+}
+
+// publishRestoreOutcome emits a FAILED restore to the notifier.
+//
+// Only the failure. A restore is always operator-initiated — somebody
+// is watching the SPA while it runs — so a success notification is
+// noise, while a failure means the data is not where they just asked it
+// to be.
+func (s *Scheduler) publishRestoreOutcome(ctx context.Context, restore backup.RestoreRun) {
+	if !s.events.Enabled() || restore.Status != backup.StatusFailed {
+		return
+	}
+	ev := notify.Event{
+		ID:       notify.BackupRunEventID(restore.ID, notify.KindRestoreFailed),
+		Source:   restore.TenantStack,
+		Kind:     notify.KindRestoreFailed,
+		Severity: notify.SeverityError,
+		Subject:  restore.TenantStack + "/" + restore.ResourceName,
+		Title:    fmt.Sprintf("Restore failed: %s/%s", restore.TenantStack, restore.ResourceName),
+		Body:     fmt.Sprintf("from backup-run: %s\nerror: %s\n", restore.BackupRunID, restore.Error),
+		URL:      s.events.RunLink("/#/restores/" + restore.ID),
+		At:       restore.FinishedAt,
+		Labels: map[string]string{
+			"tenant":      restore.TenantStack,
+			"resource":    restore.ResourceName,
+			"restoreId":   restore.ID,
+			"backupRunId": restore.BackupRunID,
+		},
+	}
+	if err := s.events.Publish(ctx, ev); err != nil {
+		s.log.Error("publish restore outcome", "err", err, "restoreId", restore.ID, "kind", notify.KindRestoreFailed)
+	}
 }
 
 func findResource(resources []tenant.Resource, name string) (tenant.Resource, bool) {
