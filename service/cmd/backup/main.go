@@ -7,8 +7,17 @@
 // consumer that `uses: [my-backup]`.
 //
 //   - Reads env: SERVICE_JWT_SECRET (HS256, 32+ bytes, operator-set via
-//     the plugin's config.signingKey), STORAGE_* / METADATA_* (archive +
-//     metadata backend selection — see config.go), PORT (default 8080).
+//     the plugin's config.signingKey), BACKUP_OPERATOR_PASSWORD (SPA login,
+//     operator-set via config.operatorPassword), ADMIN_MIGRATION_TOKEN
+//     (bearer for the one-shot /admin/migrate-mongo-to-goembedb endpoint,
+//     operator-set via config.migrationToken; empty = route not mounted),
+//     STORAGE_* / METADATA_* (archive + metadata backend selection — see
+//     config.go), PORT (default 8080).
+//     All three operator-set secrets may arrive as `arn:aws:secretsmanager:*`
+//     ARN strings — the plugin binds `${secret:…}` config values onto Lambda
+//     env as per-function SecretsManager entries, and the Lambda runtime
+//     does not dereference them. Resolution happens once at startup via
+//     resolveAWSSecretARN; failure exits 2.
 //   - HTTP router:
 //     GET  /healthz                         — unauthenticated, 200
 //     POST /api/v1/tenants/register         — JWT-auth, upsert row
@@ -116,6 +125,27 @@ func main() {
 		}
 		if err := os.Setenv("BACKUP_OPERATOR_PASSWORD", resolved); err != nil {
 			slog.Error("failed to set resolved BACKUP_OPERATOR_PASSWORD env", "err", err)
+			os.Exit(2)
+		}
+	}
+	// Resolve ADMIN_MIGRATION_TOKEN on the same ARN pattern. The plugin's
+	// ComponentSecretEnvMap binds `config.migrationToken` as a per-function
+	// SecretsManager ARN (plaintext never lands in Lambda env); the gate at
+	// the migration route compares the operator's bearer against this env
+	// value — without resolution it compares against the ARN string and no
+	// human-typeable token matches. Mirrors the SERVICE_JWT_SECRET +
+	// BACKUP_OPERATOR_PASSWORD resolution above. Pre-resolve-and-write
+	// keeps the gate's os.Getenv reader untouched.
+	if t := os.Getenv("ADMIN_MIGRATION_TOKEN"); t != "" {
+		resolveCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		resolved, err := resolveAWSSecretARN(resolveCtx, "ADMIN_MIGRATION_TOKEN", t)
+		cancel()
+		if err != nil {
+			slog.Error("failed to resolve ADMIN_MIGRATION_TOKEN from SecretsManager", "err", err)
+			os.Exit(2)
+		}
+		if err := os.Setenv("ADMIN_MIGRATION_TOKEN", resolved); err != nil {
+			slog.Error("failed to set resolved ADMIN_MIGRATION_TOKEN env", "err", err)
 			os.Exit(2)
 		}
 	}
@@ -419,6 +449,13 @@ func main() {
 	// backup service already ran against external Mongo before this
 	// adoption — see internal/backup/meta/meta.go), so the semantic
 	// is "copy the external Mongo database into the embedded one".
+	//
+	// The env is already resolved (ARN → plaintext) at startup above,
+	// so this reader sees the bearer the operator set via
+	// config.migrationToken — not the SecretsManager ARN. Dropping
+	// `migrationToken` from the server.yaml (not just rotating it)
+	// tears the route down: an empty value here skips the route-
+	// registration branch entirely.
 	if adminToken := os.Getenv("ADMIN_MIGRATION_TOKEN"); adminToken != "" && migrationSinkDB != nil {
 		migration := &goembedbadmin.MigrationConfig{
 			Source:     migrationSourceDB, // may be nil → endpoint returns a 500 that names what is missing

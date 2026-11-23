@@ -193,13 +193,13 @@ go-embedb adoption only moves one of them.
 | `GOEMBEDB_SQLITE_DIR` | `/tmp/goembedb/` | sqlite base dir (per-Lambda, warm-reused). |
 | `GOEMBEDB_REPLSET_NAME` | `backup-rs` | replica-set name the embed advertises. |
 | `GOEMBEDB_REPLICATION_BACKEND` | `s3` | replication substrate (`s3` is the only shipped backend today). |
-| `GOEMBEDB_S3_BUCKET` | — | S3 bucket for active-active replication. Unset → single-node embed (fine for a smoke). |
+| `GOEMBEDB_S3_BUCKET` | — | S3 bucket for active-active replication. Unset: on a long-lived host this is a single-node embed; **on Lambda the embed warns and falls back to `/tmp` for its SQLite**, which is scrubbed across cold starts — do not run a live Lambda cutover without a bucket. |
 | `GOEMBEDB_S3_PREFIX` | `sc-component-backup--staging/` | key prefix inside the bucket. |
 | `GOEMBEDB_S3_REGION` | `$AWS_REGION` | bucket region. |
 | `GOEMBEDB_ACK_WAIT_LIVE_ONLY` | auto (on under Lambda) | guards against go-embedb Bug 13 — never wait for a replica that never came back. |
 | `GOEMBEDB_MAX_REPLICAS` | 10 under Lambda | upper bound on tracked replicas. |
 | `GOEMBEDB_HEARTBEAT_TTL` | 3m under Lambda | when a silent replica is dropped. |
-| `ADMIN_MIGRATION_TOKEN` | — | enables the migration endpoint (see below). |
+| `ADMIN_MIGRATION_TOKEN` | — | bearer for the migration endpoint. Set on the service **via the plugin's `config.migrationToken` as a `${secret:…}` value** (plaintext env is the pre-wire path and is discouraged — the per-function SecretsManager ARN is resolved once at startup; the gate compares against the plaintext, never the ARN string). Empty = route not mounted. |
 
 ### Building against go-embedb (a private dependency)
 
@@ -237,13 +237,47 @@ secret — see the fleet convention in `forge/CLAUDE.md` §"Secret management".
 ## Migration (external Mongo → go-embedb)
 
 The cutover uses an admin-only endpoint and is **opt-in**: the route
-is mounted only when `ADMIN_MIGRATION_TOKEN` is set AND
+is mounted only when `ADMIN_MIGRATION_TOKEN` is non-empty AND
 `USE_GOEMBEDB=1` is live (a sink exists). One-time operator tool;
 not part of the steady-state surface.
 
+### Operator-side wire (how the bearer gets in)
+
+In the consumer stack's `server.yaml`, set `config.migrationToken` on
+the backup Component as a `${secret:…}` value — never plaintext:
+
+```yaml
+resources:
+  resources:
+    my-backup:
+      type: sc-backup
+      config:
+        signingKey:       ${secret:my-backup-signing-key}
+        operatorPassword: ${secret:my-backup-operator-password}
+        migrationToken:   ${secret:my-backup-migration-token}
+        # …storage, metadata, worker, etc.
+```
+
+SC core + the aws-lambda template bind this through the plugin's
+`ComponentSecretEnvMap` as a **per-function SecretsManager entry** —
+the Lambda env holds an `arn:aws:secretsmanager:…` string, not the
+token. The service resolves the ARN once at startup
+(`service/cmd/backup/main.go`, next to the matching resolution for
+`SERVICE_JWT_SECRET` and `BACKUP_OPERATOR_PASSWORD`); the migration
+gate reads the resolved plaintext.
+
+**Unmount semantics (not lock).** Removing `migrationToken` from the
+config and redeploying leaves the endpoint un-registered — a
+subsequent `POST /admin/migrate-mongo-to-goembedb` returns the
+router's own 404, not a 401. This is deliberate: you cannot brute-
+force a route that is not wired. To take the endpoint down after a
+cutover, drop the key and deploy; do not merely rotate it.
+
+### Calling the endpoint
+
 ```
 POST /admin/migrate-mongo-to-goembedb[?dry_run=1]
-Headers: X-Admin-Token: <ADMIN_MIGRATION_TOKEN>
+Headers: X-Admin-Token: <resolved plaintext of config.migrationToken>
 ```
 
 Behaviour:
