@@ -5,7 +5,7 @@
 #
 # NOT published. Lives next to Dockerfile for the smoke rig only.
 
-ARG GO_VERSION=1.27
+ARG GO_VERSION=1.26
 
 FROM golang:${GO_VERSION}-alpine AS builder
 WORKDIR /src
@@ -22,7 +22,6 @@ ARG VERSION=smoke
 ARG COMMIT=smoke
 ARG REVISION=smoke
 RUN CGO_ENABLED=0 go build \
-    -trimpath -buildvcs=false \
     -ldflags "-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.revision=${REVISION}" \
     -o /out/backup ./cmd/backup
 

@@ -35,9 +35,6 @@ import (
 	"syscall"
 	"time"
 
-	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
-
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 
@@ -47,7 +44,6 @@ import (
 	"github.com/simple-container-com/sc-component-backup/service/internal/backup/alerts"
 	"github.com/simple-container-com/sc-component-backup/service/internal/backup/notify"
 	"github.com/simple-container-com/sc-component-backup/service/internal/backup/scheduler"
-	"github.com/simple-container-com/sc-component-backup/service/internal/goembedbadmin"
 	"github.com/simple-container-com/sc-component-backup/service/internal/ui"
 )
 
@@ -128,68 +124,10 @@ func main() {
 	defer cancel()
 
 	// Slice 1e.4g — archive.Store from env (STORAGE_*).
-	//
-	// BLOB CARVE-OUT: the archive store carries the dump artefacts
-	// (`.tar.gz`, `.sql.gz`, `.gz`) produced by the driver workers.
-	// It stays on S3 / GCS / filesystem regardless of USE_GOEMBEDB.
-	// Only metadata rows move through the goembedb path below.
 	archiveStore, archiveLocation, err := buildArchiveStore(ctx)
 	if err != nil {
 		slog.Error("archive store init failed", "err", err)
 		os.Exit(1)
-	}
-
-	// go-embedb adoption (design: forge docs/design/2026-11-22/
-	// go-embedb-active-active-s3/). When USE_GOEMBEDB=1 the metadata
-	// path is diverted onto an embedded ferretdb listener — the
-	// existing METADATA_TYPE=mongo wiring (five domain stores, four
-	// `mongo.Connect` calls) reuses the URI the embed advertises,
-	// with `?directConnection=true` appended so each client skips
-	// SDAM against the single-node replica set the embed exposes.
-	//
-	// migrationSourceDB captures the pre-cutover external Mongo for
-	// the `/admin/migrate-mongo-to-goembedb` endpoint's source. nil
-	// when either USE_GOEMBEDB is off or when the operator already
-	// unset METADATA_URI post-cutover.
-	useGoEmbedb := envOr("USE_GOEMBEDB", "") == "1"
-	var migrationSourceDB *mongo.Database
-	var migrationSinkDB *mongo.Database
-	if useGoEmbedb {
-		embed, berr := bootGoEmbed(slog.Default())
-		if berr != nil {
-			slog.Error("goembedb boot failed", "err", berr)
-			os.Exit(1)
-		}
-		// Capture the external Mongo as the migration source when
-		// configured. Non-fatal: a stack already running on goembedb
-		// (post-cutover) may have had METADATA_URI unset by that point.
-		if externalURI := os.Getenv("METADATA_URI"); externalURI != "" {
-			srcCtx, srcCancel := context.WithTimeout(ctx, 10*time.Second)
-			src, cerr := mongo.Connect(srcCtx, options.Client().ApplyURI(externalURI))
-			if cerr != nil {
-				slog.Warn("external METADATA_URI connect failed — migration source disabled", "err", cerr)
-			} else if perr := src.Ping(srcCtx, nil); perr != nil {
-				slog.Warn("external METADATA_URI ping failed — migration source disabled", "err", perr)
-			} else {
-				migrationSourceDB = src.Database(goembedbadmin.Database)
-				slog.Info("external Mongo captured as migration source", "db", goembedbadmin.Database)
-			}
-			srcCancel()
-		}
-		// Rewrite the metadata env so buildMetaStore reaches the embed
-		// through the standard mongo path. Direct-connection is forced
-		// in the URI so each of the four backend `mongo.Connect` calls
-		// pins to the loopback socket (see metaURIForGoEmbed doc).
-		if err := os.Setenv("METADATA_TYPE", "mongo"); err != nil {
-			slog.Error("set METADATA_TYPE for goembedb failed", "err", err)
-			os.Exit(1)
-		}
-		if err := os.Setenv("METADATA_URI", metaURIForGoEmbed(embed.URI)); err != nil {
-			slog.Error("set METADATA_URI for goembedb failed", "err", err)
-			os.Exit(1)
-		}
-		migrationSinkDB = embed.Client.Database(goembedbadmin.Database)
-		slog.Info("metadata backend: embedded go-embedb", "replSet", embed.ReplSet)
 	}
 
 	// Slice 1e.4b/4g — meta.Store umbrella (METADATA_*).
@@ -199,12 +137,6 @@ func main() {
 		os.Exit(1)
 	}
 	defer metaStore.Close(context.Background())
-
-	// Advertise the active metadata backend to Prometheus. Label is
-	// "goembedb" when the embed is live, otherwise the operator's
-	// chosen METADATA_TYPE (empty → the meta package's default — see
-	// buildMetaStore for the resolution shape).
-	goembedbadmin.SetStoreBackend(backendLabel(useGoEmbedb))
 
 	sch := scheduler.New(scheduler.Config{}, metaStore.Tenants(), metaStore.Runs(), archiveStore, logger, nil)
 
@@ -403,33 +335,6 @@ func main() {
 		r.Delete("/api/v1/settings/telegram", settingsCfg.TelegramDisable)
 	})
 
-	// Prometheus text-exposition. Unauthenticated: it exposes no
-	// tenant-scoped data, only process-level counters + the
-	// backup_store_backend{backend="..."} gauge an operator alerts
-	// on after flipping USE_GOEMBEDB. No `/api/` prefix so it is NOT
-	// behind the JWT middleware.
-	router.Handle("/metrics", goembedbadmin.MetricsHandler())
-
-	// Migration endpoint. Disabled unless ADMIN_MIGRATION_TOKEN is set
-	// — the endpoint is a one-off operator tool for the external-Mongo
-	// → goembedb cutover, NOT a steady-state route. Also silent when
-	// USE_GOEMBEDB is off (no sink to write to).
-	//
-	// Path name matches the pre-cutover shape of THIS service (the
-	// backup service already ran against external Mongo before this
-	// adoption — see internal/backup/meta/meta.go), so the semantic
-	// is "copy the external Mongo database into the embedded one".
-	if adminToken := os.Getenv("ADMIN_MIGRATION_TOKEN"); adminToken != "" && migrationSinkDB != nil {
-		migration := &goembedbadmin.MigrationConfig{
-			Source:     migrationSourceDB, // may be nil → endpoint returns a 500 that names what is missing
-			Sink:       migrationSinkDB,
-			AdminToken: adminToken,
-		}
-		router.Post("/admin/migrate-mongo-to-goembedb", migration.Migrate)
-		slog.Info("migration endpoint wired", "path", "/admin/migrate-mongo-to-goembedb",
-			"source", migrationSourceDB != nil, "sink", true)
-	}
-
 	// Embedded SPA.
 	spaFS, err := fs.Sub(ui.BuildFS, "dist")
 	if err != nil {
@@ -454,25 +359,6 @@ func main() {
 		os.Exit(1)
 	}
 	slog.Info("exited cleanly")
-}
-
-// backendLabel maps the boot-time backend selection to the
-// Prometheus gauge label. "goembedb" wins over any METADATA_TYPE
-// override since the embed is the actual listener the mongo client
-// talks to; otherwise the operator-set METADATA_TYPE is echoed. An
-// empty METADATA_TYPE resolves inside the meta package based on the
-// archive backend (filesystem→sqlite, object-store→colocated); we
-// don't re-resolve here — the gauge value "default" names that
-// implicit-default path so an operator sees a distinct label from an
-// explicit "colocated" / "sqlite" choice.
-func backendLabel(useGoEmbedb bool) string {
-	if useGoEmbedb {
-		return "goembedb"
-	}
-	if t := strings.ToLower(os.Getenv("METADATA_TYPE")); t != "" {
-		return t
-	}
-	return "default"
 }
 
 func mustGetEnv(name string) string {
