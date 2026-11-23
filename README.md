@@ -163,10 +163,128 @@ cuts a named release without an auto-tag step.
   engines/scheduler/storage/retention become Go. Not in 1b.b.
 - Slice 1f (restore SPA + live smoke) — after 1e.
 
+## Storage
+
+The service persists two very different kinds of thing, and the
+go-embedb adoption only moves one of them.
+
+- **Archive blobs** (`.tar.gz`, `.sql.gz`, `.gz` artefacts produced
+  by `mongodump` / `pg_dump` / `mariadb-dump`) stay in
+  **S3 / GCS / filesystem**, picked by `STORAGE_TYPE`
+  (`service/cmd/backup/config.go#buildArchiveStore`). Flipping
+  `USE_GOEMBEDB=1` does NOT move these — the archive store is read
+  on every download + presigned-URL request, and it is deliberately
+  object-storage-shaped. The S3 keys the operator sees in
+  `s3://<bucket>/<consumer-stack>/<db>/<ts>.archive.gz` keep their
+  shape across the cutover.
+- **Metadata rows** (tenants, projects, backup + restore runs,
+  snapshots + object samples, telegram settings, alerts
+  dismissals — the `sc_component_backup` database's eight
+  collections) can ride on the existing external-Mongo backend
+  (`METADATA_TYPE=mongo`) OR on an embedded **go-embedb**
+  (ferretdb + sqlite + optional S3 active-active replication) when
+  `USE_GOEMBEDB=1` is set.
+
+### Environment variables (go-embedb)
+
+| var | default | purpose |
+|---|---|---|
+| `USE_GOEMBEDB` | `0` | `1` diverts the metadata backend onto the embedded listener. |
+| `GOEMBEDB_SQLITE_DIR` | `/tmp/goembedb/` | sqlite base dir (per-Lambda, warm-reused). |
+| `GOEMBEDB_REPLSET_NAME` | `backup-rs` | replica-set name the embed advertises. |
+| `GOEMBEDB_REPLICATION_BACKEND` | `s3` | replication substrate (`s3` is the only shipped backend today). |
+| `GOEMBEDB_S3_BUCKET` | — | S3 bucket for active-active replication. Unset → single-node embed (fine for a smoke). |
+| `GOEMBEDB_S3_PREFIX` | `sc-component-backup--staging/` | key prefix inside the bucket. |
+| `GOEMBEDB_S3_REGION` | `$AWS_REGION` | bucket region. |
+| `GOEMBEDB_ACK_WAIT_LIVE_ONLY` | auto (on under Lambda) | guards against go-embedb Bug 13 — never wait for a replica that never came back. |
+| `GOEMBEDB_MAX_REPLICAS` | 10 under Lambda | upper bound on tracked replicas. |
+| `GOEMBEDB_HEARTBEAT_TTL` | 3m under Lambda | when a silent replica is dropped. |
+| `ADMIN_MIGRATION_TOKEN` | — | enables the migration endpoint (see below). |
+
+## Migration (external Mongo → go-embedb)
+
+The cutover uses an admin-only endpoint and is **opt-in**: the route
+is mounted only when `ADMIN_MIGRATION_TOKEN` is set AND
+`USE_GOEMBEDB=1` is live (a sink exists). One-time operator tool;
+not part of the steady-state surface.
+
+```
+POST /admin/migrate-mongo-to-goembedb[?dry_run=1]
+Headers: X-Admin-Token: <ADMIN_MIGRATION_TOKEN>
+```
+
+Behaviour:
+
+1. For each collection in `internal/goembedbadmin/collections.go#Collections`:
+   - `CountDocuments` on the source external Mongo.
+   - `Find` streams every document; each upserted into the same-named
+     sink collection by its own `_id`.
+2. The response reports per-collection source + migrated counts,
+   plus a `verified` boolean that is true only when every source
+   row landed and no per-document error fired.
+
+`dry_run=1` counts but does not copy. Per-document errors are
+non-fatal — the endpoint continues past them and lists every
+failure, so a half-populated sink is observable rather than silent.
+
+Example (staging smoke):
+
+```sh
+# Dry-run — see what WOULD move.
+curl -s -X POST -H "X-Admin-Token: $TOK" \
+  "https://backups.example.com/admin/migrate-mongo-to-goembedb?dry_run=1" | jq .
+
+# Real run.
+curl -s -X POST -H "X-Admin-Token: $TOK" \
+  "https://backups.example.com/admin/migrate-mongo-to-goembedb" | jq .verified
+```
+
+The archive bucket is **never** touched by this endpoint. See the
+package-doc §"Blob carve-out" for the closed set of collections
+that are copied.
+
+## Rollback
+
+- `USE_GOEMBEDB=0` on the Lambda env → the next deploy reverts to
+  the `METADATA_TYPE=mongo` + `METADATA_URI` path exactly as before
+  go-embedb was wired. Any writes made against the embed after the
+  cutover are NOT replicated back to the external cluster by this
+  service; keep the external cluster hot during the first 24h of a
+  cutover for exactly this reason, then decommission.
+- The archive bucket keeps its contents regardless — there is no
+  rollback step for blobs because they never moved.
+- Pulumi state for the per-tenant ECS Fargate task + the EventBridge
+  rule is untouched by the cutover.
+
+## Metrics
+
+A Prometheus text-exposition endpoint ships at `GET /metrics` for
+operator alerting:
+
+```
+backup_store_backend{backend="goembedb"} 1
+backup_store_backend{backend="mongo"} 0
+backup_store_backend{backend="postgres"} 0
+backup_store_backend{backend="mysql"} 0
+backup_store_backend{backend="sqlite"} 0
+backup_store_backend{backend="colocated"} 0
+```
+
+The gauge is set once at boot in `cmd/backup/main.go` after the
+metadata backend is chosen; a deploy flip (operator set
+`USE_GOEMBEDB=1` but the env never propagated) shows up as a stale
+`mongo==1` sample instead of a silent misconfiguration.
+
+The endpoint is unauthenticated on purpose — it exposes no
+tenant-scoped data, only process-level counters + the backend
+gauge. Same shape as forge-notifier, forge-aigateway and
+sc-component-observatory.
+
 ## Design docs
 
 - Platform: [sc-components-platform](https://github.com/simple-container-com/forge/tree/main/docs/design/2026-11-10/sc-components-platform/)
 - Backup refactor plan: [sc-component-backup-refactor](https://github.com/simple-container-com/forge/tree/main/docs/design/2026-11-12/sc-component-backup-refactor/)
+- go-embedb active-active S3: [go-embedb-active-active-s3](https://github.com/simple-container-com/forge/tree/main/docs/design/2026-11-22/go-embedb-active-active-s3/)
 - Source for the business-logic port: [local-db-backup](https://github.com/simple-container-com/local-db-backup)
 
 ## License
