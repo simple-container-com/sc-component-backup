@@ -331,6 +331,19 @@ func (p *backupPlugin) Schema(_ context.Context, _ *scpluginv1.SchemaRequest) (*
 				// `unknown or disallowed top-level key "schedulerToken"`
 				// — live-caught on forge preview run 44514355119.
 				"schedulerToken",
+				// The bearer the one-shot external-Mongo → go-embedb
+				// migration endpoint requires. Paired with the
+				// `migrationToken → ADMIN_MIGRATION_TOKEN` entry in
+				// ComponentSecretEnvMap below so a `${secret:...}` value
+				// here reaches the dispatched Lambda as a SecretsManager
+				// ARN (per-function secret, not plaintext env). Without
+				// this allowlist entry SC core refuses the stack at parse
+				// time with `unknown or disallowed top-level key
+				// "migrationToken"`. Unmount semantics: the service only
+				// wires `/admin/migrate-mongo-to-goembedb` when the env
+				// var is non-empty — dropping the key from server.yaml
+				// (not just rotating it) tears the route down.
+				"migrationToken",
 				// Which consumer environments may register as tenants.
 				// Empty/absent allows all — the pre-filter behaviour.
 				"tenantEnvironments",
@@ -357,6 +370,11 @@ func (p *backupPlugin) Schema(_ context.Context, _ *scpluginv1.SchemaRequest) (*
 			backupApi.ResourceType: {Entries: map[string]string{
 				"signingKey":       "SERVICE_JWT_SECRET",
 				"operatorPassword": "BACKUP_OPERATOR_PASSWORD",
+				// Paired with the `migrationToken` allowlist entry above.
+				// Resolution of the ARN happens in the service at startup
+				// — see service/cmd/backup/main.go, next to the
+				// SERVICE_JWT_SECRET + BACKUP_OPERATOR_PASSWORD resolution.
+				"migrationToken": "ADMIN_MIGRATION_TOKEN",
 			}},
 		},
 	}, nil

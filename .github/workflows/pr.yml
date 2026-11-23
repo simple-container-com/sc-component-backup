@@ -10,12 +10,22 @@ name: PR
 # (`#35`) was the only way back. A `go mod download` failure is cheap to
 # catch and expensive to discover after merge — so catch it here.
 #
-# Two jobs, deliberately: the image build alone would catch the module
-# graph breaking, but not a test regression, and `go test` alone would
-# not catch a Dockerfile that cannot fetch the private dependency.
+# Three jobs, deliberately: the image build alone would catch the module
+# graph breaking, but not a test regression; `go test ./...` in service/
+# alone would not catch a Dockerfile that cannot fetch the private
+# dependency; and neither would run the plugin module's tests.
 #
-# Not covered here: the plugin binaries. They are the slow, memory-pinned
-# half of `release.yml` and have no private deps.
+# Not covered here: the plugin *binaries*. They are the slow, memory-
+# pinned half of `release.yml` (see its OOM notes). Their TESTS are a
+# different thing and are covered — `go test` in `plugin/` needs no
+# cross-compilation, no `-ldflags`, and no credential (the only
+# simple-container dep is the public `api` module), so the reason to
+# skip the binaries is not a reason to skip the tests. It matters: the
+# Schema response the plugin returns IS the component's published
+# config contract, and `main_test.go` asserts the invariant that every
+# ComponentSecretEnvMap key is actually writable by an operator. Without
+# this job that test exists and never runs — the shape live-caught on
+# observatory before `plugin-test` was added there in commit `308f3b8`.
 
 on:
   pull_request:
@@ -94,6 +104,30 @@ jobs:
           # A dirty go.mod/go.sum after a build means the committed pins do
           # not describe the module graph — the next CI run would resolve
           # something different.
+          git diff --exit-code go.mod go.sum
+
+  plugin-test:
+    name: Build + test the plugin
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # No `sc secrets reveal` and no `GOPRIVATE` — plugin/go.mod
+      # replaces the sibling `api` module with `../api` (works in a
+      # checkout) and its only other simple-container dependency is the
+      # public `simple-container-com/api`. If a private dep is ever added
+      # here, this job starts failing in `go mod download` and the fix is
+      # to copy the reveal + GOPRIVATE block from the service job above.
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: plugin/go.mod
+          cache-dependency-path: plugin/go.sum
+
+      - name: Test
+        working-directory: plugin
+        run: |
+          set -euo pipefail
+          go test ./... -count=1
           git diff --exit-code go.mod go.sum
 
   image:
