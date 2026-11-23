@@ -193,7 +193,7 @@ go-embedb adoption only moves one of them.
 | `GOEMBEDB_SQLITE_DIR` | `/tmp/goembedb/` | sqlite base dir (per-Lambda, warm-reused). |
 | `GOEMBEDB_REPLSET_NAME` | `backup-rs` | replica-set name the embed advertises. |
 | `GOEMBEDB_REPLICATION_BACKEND` | `s3` | replication substrate (`s3` is the only shipped backend today). |
-| `GOEMBEDB_S3_BUCKET` | — | S3 bucket for active-active replication. Unset: on a long-lived host this is a single-node embed; **on Lambda the embed warns and falls back to `/tmp` for its SQLite**, which is scrubbed across cold starts — do not run a live Lambda cutover without a bucket. |
+| `GOEMBEDB_S3_BUCKET` | — | S3 bucket for active-active replication. Unset: on a long-lived host this is a single-node embed; **on Lambda the service refuses to boot with `GOEMBEDB_S3_BUCKET is required on Lambda …`**. The Lambda hard-fail is deliberate: without a shared bucket each warm container runs its own `/tmp`-backed store, the scheduler reads an empty sink on each cold start, and concludes a backup it already ran never happened — **re-running it**, permanent and recurring on every container recycle. Set the bucket BEFORE flipping `USE_GOEMBEDB=1`. |
 | `GOEMBEDB_S3_PREFIX` | `sc-component-backup--staging/` | key prefix inside the bucket. |
 | `GOEMBEDB_S3_REGION` | `$AWS_REGION` | bucket region. |
 | `GOEMBEDB_ACK_WAIT_LIVE_ONLY` | auto (on under Lambda) | guards against go-embedb Bug 13 — never wait for a replica that never came back. |

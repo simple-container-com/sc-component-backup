@@ -94,11 +94,21 @@ func bootGoEmbedOnce(logger *slog.Logger) (*goEmbed, error) {
 		ReplSetName: replSet,
 	}
 
-	// Replication substrate. OPTIONAL — the backup service has one
-	// writer today (the single Lambda), so a single-node embed (no
-	// GOEMBEDB_S3_BUCKET) is a valid "just put it in sqlite" deploy
-	// for a smoke. The S3 active-active layer fires only when the
-	// bucket is configured.
+	// Replication substrate. OPTIONAL on long-lived hosts (ECS / VM /
+	// local smoke) — a single-node embed is a valid "just put it in
+	// sqlite" deploy because the one writer keeps state across requests.
+	//
+	// HARD-REQUIRED on Lambda. Lambda's `/tmp` is per-container and dies
+	// with every container recycle, so "no bucket" means every warm
+	// container runs its own ephemeral store. Backup's blast radius is
+	// the worst of the three component repos: the scheduler reads an
+	// empty sink on each cold start, concludes a backup it already ran
+	// never happened, and **re-runs it**. Permanent and recurring on
+	// every container recycle, not a one-time empty-store window.
+	//
+	// So on Lambda, refuse to boot rather than warn. Operator either
+	// sets GOEMBEDB_S3_BUCKET (step 2 of the cutover) or leaves
+	// USE_GOEMBEDB=0; there is no silent middle ground.
 	if bucket := os.Getenv("GOEMBEDB_S3_BUCKET"); bucket != "" {
 		region := envOrDefault("GOEMBEDB_S3_REGION", os.Getenv("AWS_REGION"))
 		rep := &ferretdb.ReplicationStorageConfig{
@@ -135,6 +145,8 @@ func bootGoEmbedOnce(logger *slog.Logger) (*goEmbed, error) {
 		logger.Info("goembedb replication configured",
 			"bucket", rep.S3Bucket, "prefix", rep.S3Prefix, "region", rep.S3Region,
 			"ackWaitLiveOnly", rep.AckWaitLiveOnly, "heartbeatTTL", rep.HeartbeatTTL)
+	} else if isLambda() {
+		return nil, fmt.Errorf("goembedb: GOEMBEDB_S3_BUCKET is required on Lambda — /tmp is per-container and ephemeral, which makes the scheduler re-run backups it already ran (empty sink on each cold start reads as 'never happened'). Set GOEMBEDB_S3_BUCKET (step 2 of the cutover) or leave USE_GOEMBEDB=0")
 	} else {
 		logger.Warn("GOEMBEDB_S3_BUCKET unset — running single-node, no replication")
 	}
