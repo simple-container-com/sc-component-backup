@@ -49,6 +49,16 @@ print(f"{seg}.{b64(sig)}")
 PY
 }
 
+# The image build fetches the PRIVATE go-embedb fork, so it needs the
+# read key in plaintext. Fail here with the one command that fixes it,
+# rather than 90 seconds into the build with git's auth error wrapped in
+# a `go mod download` failure.
+GOEMBEDB_KEY="../.sc/deploy-keys/go-embedb.pem"
+if [ ! -s "$GOEMBEDB_KEY" ]; then
+  red "missing $GOEMBEDB_KEY — run 'sc secrets reveal --force' at the repo root first"
+  exit 1
+fi
+
 step "boot compose"
 docker compose -f "$COMPOSE_FILE" build --quiet 2>&1 | tail -5
 docker compose -f "$COMPOSE_FILE" up -d 2>&1 | tail -10
