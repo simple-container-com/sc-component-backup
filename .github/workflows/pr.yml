@@ -1,0 +1,133 @@
+name: PR
+
+# The gate this repo did not have.
+#
+# `release.yml` triggers only on a push to main (or a `v*` tag), so until
+# now NOTHING built the service image or ran its tests before a merge.
+# That is how `3a888c5` landed a `replace` pointing at a sibling checkout
+# that exists on exactly one operator's laptop: `main` went red on the
+# first post-merge Release, the image stream stopped, and the revert
+# (`#35`) was the only way back. A `go mod download` failure is cheap to
+# catch and expensive to discover after merge — so catch it here.
+#
+# Two jobs, deliberately: the image build alone would catch the module
+# graph breaking, but not a test regression, and `go test` alone would
+# not catch a Dockerfile that cannot fetch the private dependency.
+#
+# Not covered here: the plugin binaries. They are the slow, memory-pinned
+# half of `release.yml` and have no private deps.
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  service-test:
+    name: Build + test the service
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # service/go.mod routes github.com/FerretDB/FerretDB to the PRIVATE
+      # fork github.com/simple-container-com/go-embedb, so even `go build`
+      # needs a read credential — the replace is resolved while loading the
+      # module graph, long before any build tag or env var is consulted.
+      #
+      # Decrypted from this repo's own SC registry with the single
+      # org-level SC_CONFIG. A pull request from a FORK gets no secret and
+      # fails loudly on the `test -s` below, which is the right direction:
+      # these are private repos and every PR is branch-based.
+      - uses: simple-container-com/actions/install-sc@main
+      - name: Reveal the go-embedb deploy key
+        env:
+          SIMPLE_CONTAINER_CONFIG: ${{ secrets.SC_CONFIG }}
+        run: |
+          set -euo pipefail
+          sc secrets reveal --force
+          test -s .sc/deploy-keys/go-embedb.pem
+          # `sc secrets reveal` writes 0644. ssh refuses a world-readable
+          # private key outright ("bad permissions") and then reports the
+          # fetch as `Permission denied (publickey)`, which reads like the
+          # wrong key rather than the wrong mode.
+          chmod 600 .sc/deploy-keys/go-embedb.pem
+
+      # internal/ui embeds the built SPA with `go:embed all:dist`, so the
+      # Go package does not compile until the bundle exists. Same two
+      # commands the Dockerfile's ui-builder stage runs.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: service/internal/ui/package-lock.json
+      - name: Build the SPA
+        working-directory: service/internal/ui
+        run: |
+          set -euo pipefail
+          npm install --no-audit --no-fund
+          npm run build:prod
+
+      - uses: actions/setup-go@v5
+        with:
+          # From go.mod rather than a literal, so the toolchain never
+          # drifts from what the Dockerfile and the operators build with.
+          go-version-file: service/go.mod
+          cache-dependency-path: service/go.sum
+
+      # `go test`, not `go build`: `go build ./...` does not compile test
+      # packages, so it happily ships a tree whose _test.go files no longer
+      # build (fleet CLAUDE.md records the round-trip this cost).
+      - name: Test
+        working-directory: service
+        env:
+          # Keeps the private module off the public proxy (which cannot
+          # read it and reports git's auth failure as a misleading
+          # `invalid version`) and off the checksum database.
+          GOPRIVATE: github.com/simple-container-com/*
+        run: |
+          set -euo pipefail
+          git config --global url."git@github.com:".insteadOf "https://github.com/"
+          export GIT_SSH_COMMAND="ssh -i ${GITHUB_WORKSPACE}/.sc/deploy-keys/go-embedb.pem -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+          go test ./... -count=1
+          # A dirty go.mod/go.sum after a build means the committed pins do
+          # not describe the module graph — the next CI run would resolve
+          # something different.
+          git diff --exit-code go.mod go.sum
+
+  image:
+    name: Build the service image (no push)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: simple-container-com/actions/install-sc@main
+      - name: Reveal the go-embedb deploy key
+        env:
+          SIMPLE_CONTAINER_CONFIG: ${{ secrets.SC_CONFIG }}
+        run: |
+          set -euo pipefail
+          sc secrets reveal --force
+          test -s .sc/deploy-keys/go-embedb.pem
+          chmod 600 .sc/deploy-keys/go-embedb.pem
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Same inputs as the release build minus `push`, so a green run here
+      # means the release build will get as far as the registry. amd64 only,
+      # for the reason release.yml records (arm64 under QEMU: ~25 min).
+      - name: Build
+        uses: docker/build-push-action@v5
+        with:
+          context: service
+          file: service/Dockerfile
+          platforms: linux/amd64
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          secret-files: |
+            go_embedb_key=.sc/deploy-keys/go-embedb.pem
+          build-args: |
+            VERSION=0.0.0-pr
+            COMMIT=${{ github.sha }}

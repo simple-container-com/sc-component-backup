@@ -51,6 +51,12 @@ services:
       dockerfile: service/Dockerfile.smoke
       args:
         VERSION: smoke-local
+      # The private go-embedb fork's read key. Mounted for the
+      # `go mod download` RUN only; never a layer. Materialise it with
+      # `sc secrets reveal --force` at the repo root first — dev/smoke.sh
+      # checks for you.
+      secrets:
+        - go_embedb_key
     depends_on:
       seaweed:
         condition: service_healthy
@@ -74,3 +80,10 @@ services:
       interval: 3s
       timeout: 2s
       retries: 30
+
+# Build-time secrets. `file:` is resolved relative to THIS file's
+# directory, so the path climbs out of dev/ to the repo-root registry.
+# The plaintext is gitignored and produced by `sc secrets reveal --force`.
+secrets:
+  go_embedb_key:
+    file: ../.sc/deploy-keys/go-embedb.pem

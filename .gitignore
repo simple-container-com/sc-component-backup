@@ -7,9 +7,21 @@
 
 # Local SC state + secrets (gitignored per fleet CLAUDE.md — only encrypted
 # .sc/secrets.yaml registries are committed).
+#
+# `cfg.*.yaml` holds the private key that DECRYPTS the registry, so it is
+# per-operator and never committed; in CI it is materialised from the single
+# org-level SC_CONFIG secret. The glob covers cfg.github.yaml too — the
+# explicit line below is kept because it predates it and is referenced by
+# the fleet CLAUDE.md.
 /.sc/state/
 /.sc/stacks/*/secrets.yaml
+/.sc/cfg.*.yaml
 /.sc/cfg.github.yaml
+
+# Plaintext credentials SC manages: stored encrypted in .sc/secrets.yaml,
+# written to these paths by `sc secrets reveal --force`. Currently the
+# go-embedb deploy key — see README.md §Storage.
+/.sc/deploy-keys/
 
 # Go
 /plugin/vendor/

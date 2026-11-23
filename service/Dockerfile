@@ -19,7 +19,7 @@
 # `docker build` is run at smoke time (local or on the target VPS) with
 # `docker load` of the resulting image.
 
-ARG GOLANG_VERSION=1.26-alpine
+ARG GOLANG_VERSION=1.27-alpine
 ARG NODE_VERSION=20-alpine
 # Plain amazonlinux:2023 (NOT lambda/provided:al2023) so the container's
 # own ENTRYPOINT runs directly without lambda-entrypoint.sh demanding a
@@ -46,13 +46,43 @@ RUN npm run build:prod
 # -----------------------------
 FROM golang:${GOLANG_VERSION} AS go-builder
 
-RUN apk add --no-cache ca-certificates git make
+# openssh-client is for the private-module fetch below, not for the
+# runtime image — the runtime stage copies only the binary.
+RUN apk add --no-cache ca-certificates git make openssh-client
 
 WORKDIR /src
 
+# go.mod routes github.com/FerretDB/FerretDB to the PRIVATE fork
+# github.com/simple-container-com/go-embedb, so `go mod download` needs
+# a credential. It arrives as a buildx secret mount rather than a COPY
+# or a build ARG:
+#
+#   - a COPY would need the key inside the build context, which is
+#     `service/` (see .github/workflows/release.yml) — the key lives at
+#     the repo root — and would leave it in this stage's layer;
+#   - an ARG is echoed into the build log by any `docker build` front-end
+#     that prints the command line.
+#
+# The mount exists only for the lifetime of the RUN and never becomes a
+# layer. The release + PR workflows supply it with
+# `secret-files: go_embedb_key=.sc/deploy-keys/go-embedb.pem` after
+# `sc secrets reveal --force`; see README.md §Storage.
+#
+# GOPRIVATE does three things at once: it keeps the module off the public
+# proxy (which cannot read a private repo and answers with a confusing
+# `invalid version` wrapping git's auth failure), off the checksum
+# database, and therefore on the direct git path the insteadOf rewrite
+# below redirects to SSH.
+ENV GOPRIVATE=github.com/simple-container-com/*
+
 # Copy module files first for layer-cache friendliness.
 COPY go.mod go.sum* ./
-RUN go mod download
+RUN --mount=type=secret,id=go_embedb_key \
+      mkdir -p /root/.ssh \
+    && ssh-keyscan -t rsa,ecdsa,ed25519 github.com >> /root/.ssh/known_hosts 2>/dev/null \
+    && git config --global url."git@github.com:".insteadOf "https://github.com/" \
+    && GIT_SSH_COMMAND="ssh -i /run/secrets/go_embedb_key -o IdentitiesOnly=yes" \
+       go mod download
 
 COPY . .
 # Overwrite internal/ui/dist with the compiled SPA from stage 1.

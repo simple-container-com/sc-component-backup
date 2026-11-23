@@ -173,6 +173,31 @@ jobs:
         with:
           sc-config: ${{ secrets.SC_CONFIG }}
 
+      # service/go.mod routes github.com/FerretDB/FerretDB to the PRIVATE
+      # fork github.com/simple-container-com/go-embedb, so `go mod download`
+      # inside the image build needs a read credential.
+      #
+      # dockerhub-login does NOT leave one behind: it clones the api repo
+      # and reveals THERE, so this repo's own registry is still encrypted
+      # at this point. Hence an explicit reveal in this checkout. It works
+      # with the same org-level SC_CONFIG because .sc/secrets.yaml is
+      # encrypted to the fleet's shared recipient set — see README.md
+      # §Storage.
+      - name: Reveal the go-embedb deploy key
+        env:
+          SIMPLE_CONTAINER_CONFIG: ${{ secrets.SC_CONFIG }}
+        run: |
+          set -euo pipefail
+          sc secrets reveal --force
+          # Assert rather than trust: a reveal that decrypts nothing still
+          # exits 0, and the failure would otherwise surface as an opaque
+          # `go mod download` auth error 90 seconds into the image build.
+          test -s .sc/deploy-keys/go-embedb.pem
+          # buildx mounts the secret 0400 inside the build, so this is for
+          # the runner's own copy — reveal writes 0644, and any step that
+          # hands the path to ssh directly would be refused.
+          chmod 600 .sc/deploy-keys/go-embedb.pem
+
       - uses: docker/setup-buildx-action@v3
 
       # Caching:
@@ -202,6 +227,13 @@ jobs:
           push: true
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          # Mounted into the go-builder stage for the private-module
+          # fetch only; never a layer, never a build-arg (which would be
+          # echoed into the build log). Path is relative to the workspace,
+          # NOT to `context: service` — the key deliberately lives outside
+          # the build context.
+          secret-files: |
+            go_embedb_key=.sc/deploy-keys/go-embedb.pem
           build-args: |
             VERSION=${{ needs.version.outputs.version }}
             COMMIT=${{ github.sha }}
