@@ -71,6 +71,18 @@ import (
 	backupInternal "github.com/simple-container-com/sc-component-backup/plugin/internal"
 )
 
+// version is stamped by the release workflow via
+// `go build -ldflags "-X main.version=${VERSION}"` (release.yml:87). The
+// default `"dev"` is what a local `make build` or a test run sees.
+//
+// Historically this field did not exist and the PluginVersion below was
+// the literal `"sc-component-backup-0.0.1"` — so a provision log said
+// nothing about which plugin binary was actually loaded, and the
+// migrationToken wire (PR #37) had no log-level verification that the
+// allowlist-carrying binary was the one running. observatory +
+// notifier both stamp this way; the gap was a backup-only miss.
+var version = "dev"
+
 // backupPlugin is the gRPC server impl.
 type backupPlugin struct {
 	scpluginv1.UnimplementedSCCloudPluginServer
@@ -220,7 +232,7 @@ var componentDefaultsJSON = func() []byte {
 
 func (p *backupPlugin) Schema(_ context.Context, _ *scpluginv1.SchemaRequest) (*scpluginv1.SchemaResponse, error) {
 	return &scpluginv1.SchemaResponse{
-		PluginVersion:         "sc-component-backup-0.0.1",
+		PluginVersion:         "sc-component-backup-" + version,
 		ProviderTypes:         []string{backupApi.ProviderType},
 		ResourceTypes:         []string{backupApi.ResourceType},
 		ComputeProcessorTypes: []string{backupApi.ComputeProcessorType},
