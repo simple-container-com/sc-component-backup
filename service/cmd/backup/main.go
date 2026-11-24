@@ -307,6 +307,11 @@ func main() {
 	// Slice 1e.2 — SPA-facing handlers. Every handler reaches its
 	// narrow store through the meta.Store's accessors (slice 1e.4b).
 	sessionCfg := api.NewSessionConfigFromEnv([]byte(jwtSecret))
+	// So the SPA header + a post-deploy smoke can confirm WHICH build
+	// is serving. The same value /healthz below publishes; this wire
+	// is latent to handler tests (every internal/api test builds its
+	// own SessionConfig), so version_wire_test.go asserts it live.
+	sessionCfg.Version = version
 	metaCfg := &api.MetaConfig{Version: version, Commit: commit}
 	overviewCfg := &api.OverviewConfig{
 		Tenants:         metaStore.Tenants(),
@@ -358,7 +363,9 @@ func main() {
 	}
 
 	// Unauthenticated endpoints — healthz + the session probe + login/logout.
-	router.Get("/healthz", api.Healthz)
+	// /healthz now carries the build stamp (the only probe reachable
+	// without credentials — see api.Healthz comment).
+	router.Get("/healthz", api.Healthz(version))
 	router.Get("/api/v1/session", sessionCfg.Session)
 	router.Post("/api/v1/login", sessionCfg.Login)
 	router.Post("/api/v1/logout", sessionCfg.Logout)
