@@ -17,7 +17,7 @@ ui:
 	@if [ -d internal/ui/node_modules ]; then \
 	  echo "ui/node_modules present — skipping npm install"; \
 	else \
-	  cd internal/ui && npm install --no-audit --no-fund; \
+	  cd internal/ui && npm ci --no-audit --no-fund; \
 	fi
 	cd internal/ui && npm run build:prod
 
