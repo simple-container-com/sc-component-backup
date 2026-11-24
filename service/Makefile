@@ -14,11 +14,17 @@ build: ui
 	CGO_ENABLED=0 go build -trimpath -ldflags "$(LDFLAGS)" -o $(SERVICE) ./cmd/backup
 
 ui:
-	@if [ -d internal/ui/node_modules ]; then \
-	  echo "ui/node_modules present — skipping npm install"; \
-	else \
-	  cd internal/ui && npm ci --no-audit --no-fund; \
-	fi
+	# `npm ci` is delete-and-reinstall by design — that is the whole
+	# point: the resulting node_modules is what the lockfile pins, no
+	# more and no less. A presence check that skipped it when
+	# node_modules already existed (previously on this line) defeated
+	# that guarantee: a stale node_modules survived every `make ui`
+	# and `npm run build:prod` embedded whatever was on disk. CI calls
+	# npm ci directly and the Dockerfile runs it in a clean layer, so
+	# the shipped artifact was always honest; a local `make build`
+	# before a manual smoke was the only path it mis-served on, but
+	# the same shape as #45's stale-lockfile bug a layer down.
+	cd internal/ui && npm ci --no-audit --no-fund
 	cd internal/ui && npm run build:prod
 
 test:
