@@ -223,6 +223,29 @@ func (c *ColocatedMigrationConfig) Migrate(w http.ResponseWriter, r *http.Reques
 	writeJSON(w, status, resp)
 }
 
+// warnOnSuspiciousSourceCount emits an operator-visible slog.Warn
+// when a per-collection source count is a NONZERO multiple of 1000.
+//
+// Why: AWS `ListObjectsV2` defaults to 1000-key pages and the
+// historical unpaginated `S3Store.List` (pre-2026-11-24) returned
+// exactly one page as the complete listing. A `source_count` of
+// precisely 1000, 2000, … under any new walker is the exact shape
+// that fleet bug takes when it recurs — belt-and-braces visibility
+// on top of the S3Store.List fix itself. Zero runtime cost; a legit
+// deployment with exactly 1000 of something still pages fine on
+// the fixed List, so this is a ping, not a hard-fail.
+//
+// Live-caught 2026-11-24 on sibling sc-component-observatory's
+// dry-run migration (`s3_count: 1000`).
+func warnOnSuspiciousSourceCount(collection string, sourceCount int64) {
+	if sourceCount > 0 && sourceCount%1000 == 0 {
+		slog.Warn("suspicious source count — may indicate an unpaginated list; audit the source",
+			"source_count", sourceCount,
+			"collection", collection,
+			"hint", "AWS ListObjectsV2 defaults to 1000-key pages; if your source walks a prefix via S3 List, confirm it paginates")
+	}
+}
+
 // migrateTenants walks the colocated tenants/ prefix and upserts each
 // row by stackName. The Mongo-side reader uses `stackName` as the
 // match key (tenant.Record carries no `_id` field — the collection's
@@ -236,6 +259,7 @@ func (c *ColocatedMigrationConfig) migrateTenants(ctx context.Context, dryRun bo
 		return
 	}
 	row := colocatedMigrationRow{Collection: CollectionTenants, Source: "colocated", SourceCount: int64(len(rows))}
+	warnOnSuspiciousSourceCount(CollectionTenants, row.SourceCount)
 	resp.SourceCount += row.SourceCount
 	if !dryRun {
 		coll := c.Sink.Collection(CollectionTenants)
@@ -266,6 +290,7 @@ func (c *ColocatedMigrationConfig) migrateProjects(ctx context.Context, dryRun b
 		return nil
 	}
 	row := colocatedMigrationRow{Collection: CollectionProjects, Source: "colocated", SourceCount: int64(len(rows))}
+	warnOnSuspiciousSourceCount(CollectionProjects, row.SourceCount)
 	resp.SourceCount += row.SourceCount
 	if !dryRun {
 		coll := c.Sink.Collection(CollectionProjects)
@@ -296,6 +321,7 @@ func (c *ColocatedMigrationConfig) migrateBackupRuns(ctx context.Context, dryRun
 		return
 	}
 	row := colocatedMigrationRow{Collection: CollectionBackupRuns, Source: "colocated", SourceCount: int64(len(rows))}
+	warnOnSuspiciousSourceCount(CollectionBackupRuns, row.SourceCount)
 	resp.SourceCount += row.SourceCount
 	if !dryRun {
 		coll := c.Sink.Collection(CollectionBackupRuns)
@@ -350,6 +376,7 @@ func (c *ColocatedMigrationConfig) migrateRestoreRuns(ctx context.Context, dryRu
 		return
 	}
 	row.SourceCount = int64(len(rows))
+	warnOnSuspiciousSourceCount(CollectionRestoreRuns, row.SourceCount)
 	resp.SourceCount += row.SourceCount
 	if !dryRun {
 		coll := c.Sink.Collection(CollectionRestoreRuns)
@@ -409,5 +436,6 @@ func (c *ColocatedMigrationConfig) migrateSnapshots(ctx context.Context, projs [
 			}
 		}
 	}
+	warnOnSuspiciousSourceCount(CollectionSnapshots, row.SourceCount)
 	resp.Rows = append(resp.Rows, row)
 }

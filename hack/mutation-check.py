@@ -63,6 +63,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 API_PKG = "./internal/api/"
 ADMIN_PKG = "./internal/goembedbadmin/"
+STORAGE_PKG = "./internal/backup/storage/"
 PLUGIN_PKG = "./internal/"
 PLG_CMD_PKG = "./cmd/sc-component-backup/"
 # The SERVICE module's cmd package. Easy to confuse with PLG_CMD_PKG
@@ -105,6 +106,7 @@ COLOC_ADMIN = "service/internal/goembedbadmin/colocated_source.go"
 # wrong-field that misled the pre-fix framing of this feature.
 COLOC_META = "service/internal/backup/meta/colocated.go"
 META_PKG = "./internal/backup/meta/"
+S3_STORAGE = "service/internal/backup/storage/s3.go"
 SVC_MAIN = "service/cmd/backup/main.go"
 
 # plugin/ files
@@ -321,6 +323,29 @@ MUTATIONS = [
      'slog.Error("failed to resolve BACKUP_OPERATOR_PASSWORD from SecretsManager", "err", err)\n\t\t\tos.Exit(2)',
      'slog.Error("failed to resolve BACKUP_OPERATOR_PASSWORD from SecretsManager", "err", err)',
      "TestBinaryExitsTwoOnBackupOperatorPasswordArnResolveFailure", 1),
+
+    # --------------------------------------------------------- s3-pagination
+    # The S3Store.List pagination fix. The pre-2026-11-24 shape issued
+    # one `ListObjectsV2` call and returned the 1000-key page as the
+    # complete listing — live-caught on sibling sc-component-observatory
+    # with `s3_count: 1000` exactly at the AWS page cap. On any backup
+    # deployment past 1000 keys for a `_meta/<domain>/` prefix the SPA
+    # list-runs query and the scheduler "has this tenant been backed up
+    # recently?" probe both lost visibility, and PR #49's colocated →
+    # go-embedb migration derived both SourceCount AND MigratedCount
+    # from the truncated page so `verified: true` stayed honest against
+    # itself, orphaning tenants on cutover.
+    #
+    # Mutation: force the `out.IsTruncated` check to always exit the
+    # loop. The unique line below only matches the paginating shape
+    # (the pre-fix one-call code never reads IsTruncated at all), so a
+    # STALE here means the fix has been reverted and the entry wants
+    # updating to the new find string — exactly the signal this harness
+    # is built for.
+    ("s3-pagination", "S3Store.List stops following ContinuationToken", S3_STORAGE, STORAGE_PKG,
+     "if out.IsTruncated == nil || !*out.IsTruncated {",
+     "if true {",
+     "TestS3Store_List_PaginatesPast1000Keys", 1),
 ]
 
 TEST_FILE_PREFIXES = (
@@ -330,6 +355,7 @@ TEST_FILE_PREFIXES = (
     "migration_test.go:",
     "main_test.go:",
     "version_wire_test.go:",
+    "s3_pagination_test.go:",
 )
 COMPILE_MARKERS = ("build failed", "undefined:", "declared and not used", "cannot use")
 

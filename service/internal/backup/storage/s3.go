@@ -199,27 +199,69 @@ func (s *S3Store) Presign(ctx context.Context, path string, expires time.Duratio
 	return req.URL, nil
 }
 
+// List enumerates every object under prefix, following
+// ListObjectsV2's ContinuationToken until IsTruncated is false.
+//
+// LIVE-CAUGHT 2026-11-24 on sibling sc-component-observatory's
+// dry-run colocated→goembedb migration: it answered
+// `s3_count: 1000` — exactly AWS's default page cap. The earlier
+// shape issued ONE ListObjectsV2 call and returned `out.Contents`
+// as the complete listing; `out.IsTruncated` was never read and
+// `NextContinuationToken` was never threaded, so any prefix with
+// ≥1001 objects silently truncated to its first page. The same
+// defect was byte-identical here (meta.colocatedStore walks `_meta/`
+// via this `List`), and the ColocatedMigrationConfig in sibling
+// `goembedbadmin/colocated_source.go` derived both `SourceCount`
+// AND `MigratedCount` from that truncated page — so a cutover on a
+// deployment past the 1000-key boundary reported `verified: true`
+// against `truncated >= truncated`, the operator flipped
+// `USE_GOEMBEDB=1`, and the scheduler's next tick found orphaned
+// tenants on the far side.
+//
+// Independent of go-embedb, the same `List` answers the SPA
+// list-runs query and the scheduler's "has this tenant been backed
+// up recently?" probe — the loss of visibility applies there too.
+//
+// Shape kept visibly identical to the fix sc-components is landing
+// in observatory so the next reader sees the trap once, in the same
+// spot, in both repos.
 func (s *S3Store) List(ctx context.Context, prefix string) ([]StoredObject, error) {
 	prefix = strings.TrimPrefix(prefix, "/")
-	out, err := s.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
-		Bucket: aws.String(s.cfg.Bucket),
-		Prefix: aws.String(prefix),
-	})
-	if err != nil {
-		return nil, fmt.Errorf("s3 list %q: %w", prefix, err)
-	}
-	result := make([]StoredObject, 0, len(out.Contents))
-	for _, o := range out.Contents {
-		so := StoredObject{Path: aws.ToString(o.Key)}
-		if o.Size != nil {
-			so.Size = *o.Size
+	var (
+		result            []StoredObject
+		continuationToken *string
+	)
+	for {
+		out, err := s.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:            aws.String(s.cfg.Bucket),
+			Prefix:            aws.String(prefix),
+			ContinuationToken: continuationToken,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("s3 list %q: %w", prefix, err)
 		}
-		if o.LastModified != nil {
-			so.ModifiedAt = *o.LastModified
+		for _, o := range out.Contents {
+			so := StoredObject{Path: aws.ToString(o.Key)}
+			if o.Size != nil {
+				so.Size = *o.Size
+			}
+			if o.LastModified != nil {
+				so.ModifiedAt = *o.LastModified
+			}
+			result = append(result, so)
 		}
-		result = append(result, so)
+		if out.IsTruncated == nil || !*out.IsTruncated {
+			return result, nil
+		}
+		next := aws.ToString(out.NextContinuationToken)
+		if next == "" {
+			// Defensive: a `truncated=true` reply with no token means
+			// the backend cut pagination mid-walk — surface rather
+			// than loop forever on the same page.
+			return nil, fmt.Errorf("s3 list %q: truncated response without NextContinuationToken", prefix)
+		}
+		continuationToken = aws.String(next)
 	}
-	return result, nil
 }
 
 func (s *S3Store) Delete(ctx context.Context, path string) error {
