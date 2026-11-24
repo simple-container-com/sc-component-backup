@@ -12,6 +12,8 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/options"
 
 	"github.com/pkg/errors"
+
+	"github.com/simple-container-com/sc-component-backup/service/internal/mongox"
 )
 
 // Collection name constants — kept exported so operator-side tooling can
@@ -45,9 +47,10 @@ func NewMongoStore(ctx context.Context, uri string) (*MongoStore, error) {
 		return nil, errors.Wrap(err, "mongo ping")
 	}
 	coll := client.Database(defaultDBName).Collection(defaultCollectionName)
-	if _, err := coll.Indexes().CreateOne(ctx, mongo.IndexModel{
+	_, err = coll.Indexes().CreateOne(ctx, mongo.IndexModel{
 		Keys: bson.D{{Key: "softDeleted", Value: 1}, {Key: "_id", Value: 1}},
-	}); err != nil {
+	})
+	if err = mongox.TolerateNotWritablePrimary("projects.softDeleted_id", err); err != nil {
 		_ = client.Disconnect(ctx)
 		return nil, errors.Wrap(err, "mongo index create")
 	}

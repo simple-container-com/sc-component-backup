@@ -13,6 +13,7 @@ import (
 	"github.com/pkg/errors"
 
 	"github.com/simple-container-com/sc-component-backup/service/internal/backup"
+	"github.com/simple-container-com/sc-component-backup/service/internal/mongox"
 )
 
 // Default collection + DB names for the run store. The DB name matches
@@ -93,13 +94,15 @@ func (s *MongoRunStore) ensureIndexes(ctx context.Context) error {
 		{Keys: bson.D{{Key: "tenantStack", Value: 1}, {Key: "startedAt", Value: -1}}},
 		{Keys: bson.D{{Key: "status", Value: 1}}},
 	}
-	if _, err := s.backups.Indexes().CreateMany(ctx, backupIdx); err != nil {
+	_, err := s.backups.Indexes().CreateMany(ctx, backupIdx)
+	if err = mongox.TolerateNotWritablePrimary("backup_runs", err); err != nil {
 		return errors.Wrap(err, "backup_runs indexes")
 	}
 	restoreIdx := []mongo.IndexModel{
 		{Keys: bson.D{{Key: "tenantStack", Value: 1}, {Key: "startedAt", Value: -1}}},
 	}
-	if _, err := s.restores.Indexes().CreateMany(ctx, restoreIdx); err != nil {
+	_, err = s.restores.Indexes().CreateMany(ctx, restoreIdx)
+	if err = mongox.TolerateNotWritablePrimary("restore_runs", err); err != nil {
 		return errors.Wrap(err, "restore_runs indexes")
 	}
 	return nil
