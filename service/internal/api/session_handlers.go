@@ -41,6 +41,14 @@ type SessionResponse struct {
 	Authenticated bool   `json:"authenticated"`
 	CSRF          string `json:"csrf,omitempty"` // present iff we grow CSRF
 	PasswordSet   bool   `json:"password_set"`
+	// Version is the build stamp this service was compiled with — the
+	// `main.version` ldflag from the release workflow. Reported
+	// unauthenticated so a post-deploy smoke can confirm WHICH build is
+	// serving (the signal is useless if it requires AWS credentials to
+	// read the boot log). A CalVer `vYYYY.MM.DD-<short-sha>` is not a
+	// credential — the short SHA is already in every release/tag/image
+	// ref. Mirrors sc-component-notifier#6's design.
+	Version string `json:"version,omitempty"`
 }
 
 // SessionConfig holds the tiny bit of shared state session/login/logout
@@ -63,6 +71,13 @@ type SessionConfig struct {
 	// false when developing against http://localhost:8080). Defaults
 	// to true in production deploys (behind HTTPS).
 	CookieSecure bool
+	// Version is the build stamp (main.version, CalVer). Reported on
+	// the session probe unauthenticated — see the SessionResponse.Version
+	// field comment for the rationale. The wire from cmd/backup/main.go
+	// to this field is latent to handler tests: every internal/api test
+	// builds its own SessionConfig, so none of them catches the main.go
+	// line being dropped. Hence TestBinaryReportsItsBuildOnHealthzAndSession.
+	Version string
 }
 
 // NewSessionConfigFromEnv builds a SessionConfig from env, used from
@@ -90,7 +105,10 @@ func NewSessionConfigFromEnv(signingKey []byte) SessionConfig {
 // unauthenticated request should get a 200 with authenticated=false,
 // not a 401.
 func (c *SessionConfig) Session(w http.ResponseWriter, r *http.Request) {
-	resp := SessionResponse{PasswordSet: c.OperatorPassword != ""}
+	resp := SessionResponse{
+		PasswordSet: c.OperatorPassword != "",
+		Version:     c.Version,
+	}
 	raw := tokenFromRequest(r)
 	if raw != "" && c.verifyToken(raw) {
 		resp.Authenticated = true
