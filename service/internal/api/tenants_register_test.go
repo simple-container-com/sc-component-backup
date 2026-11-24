@@ -104,6 +104,46 @@ func TestTenantsRegister_JWTMismatch(t *testing.T) {
 	Expect(rr.Code).To(Equal(http.StatusForbidden))
 }
 
+// TestTenantsRegister_RejectsNonRegisterOp pins the `claims.Op !=
+// "register"` gate in the handler. Live-caught 2026-11-24 by the
+// mutation harness: TestTenantsRegister_JWTMismatch happens to also
+// fail when the op check is removed, BUT only because the tenant↔body
+// check below fires first — and mintTestJWT always mints
+// `op:"register"`, so no other test ever presented a non-register op.
+// A handler where the op check was quietly removed would hand a
+// scheduler or operator token the ability to overwrite a tenant row.
+func TestTenantsRegister_RejectsNonRegisterOp(t *testing.T) {
+	RegisterTestingT(t)
+
+	store := tenant.NewInMemoryStore()
+	mux := http.NewServeMux()
+	mux.Handle("POST /api/v1/tenants/register", JWTMiddleware([]byte(testKey))(TenantsRegister(store)))
+
+	// Mint a valid, tenant-matching token with the WRONG op. If the op
+	// check is removed, the tenant↔body check still passes (they
+	// match), and the handler would 200. With the op check present,
+	// 403.
+	now := time.Now().UTC()
+	claims := jwt.MapClaims{
+		"op":     "operator",
+		"tenant": "x",
+		"iat":    now.Unix(),
+		"exp":    now.Add(1 * time.Minute).Unix(),
+	}
+	tok := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	raw, err := tok.SignedString([]byte(testKey))
+	Expect(err).ToNot(HaveOccurred())
+
+	body, _ := json.Marshal(map[string]any{"stackName": "x", "version": "v1"})
+	req := httptest.NewRequest("POST", "/api/v1/tenants/register", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+raw)
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	Expect(rr.Code).To(Equal(http.StatusForbidden), "non-register op must be refused BEFORE the body check; got body: %s", rr.Body.String())
+}
+
 func TestTenantsRegister_Unsigned(t *testing.T) {
 	RegisterTestingT(t)
 
