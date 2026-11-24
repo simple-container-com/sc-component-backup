@@ -577,6 +577,19 @@ func projectNames(cfgs []project.Config) []string {
 // pick a value in a field with no bson tag but a json tag. The
 // point is to surface where the two impls disagree today; silent
 // agreement is surprising, not reassuring.
+//
+// IF A DURABILITY-OR-RECOVERY CASE LANDS HERE, make it survive at
+// least TWO simulated redeploys, not one. Live-caught in the
+// go-embedb engine fix (PR #32, 2026-11-24): the author's one-
+// redeploy reclaim test PASSED under a design that would have lost
+// everything older than the previous generation. It took a THIRD
+// generation in the log — i.e. two redeploys since the first write
+// — to make the loss observable. A one-redeploy fixture is satisfied
+// by an impl that still loses all history on redeploys 2+, just less
+// visibly. Same anti-selection-bias discipline as the non-chronological
+// IDs in TestConformance_Runs_ListBackupsByTenant_SortOrder: the
+// fixture must be able to tell a correct impl from a plausibly-wrong
+// one, and for durability the minimum N is 2 redeploys, not 1.
 func init() {
 	// No-op — placeholder so a future reviewer looking for a package
 	// init() finds this comment and does not add one that fights
