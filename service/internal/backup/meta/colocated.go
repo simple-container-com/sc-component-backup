@@ -25,6 +25,7 @@ func (s *colocatedStore) Tenants() tenant.Store              { return colocTenan
 func (s *colocatedStore) Runs() scheduler.RunStore           { return colocRuns{s} }
 func (s *colocatedStore) Projects() project.Store            { return colocProjects{s} }
 func (s *colocatedStore) Snapshots() scheduler.SnapshotStore { return colocSnapshots{s} }
+func (s *colocatedStore) Backend() Type                      { return TypeColocated }
 func (s *colocatedStore) Close(_ context.Context) error      { return nil }
 
 const metaPrefix = "_meta/"

@@ -90,6 +90,7 @@ func (s *sqliteStore) Tenants() tenant.Store              { return s.tenants }
 func (s *sqliteStore) Runs() scheduler.RunStore           { return s.runs }
 func (s *sqliteStore) Projects() project.Store            { return s.projects }
 func (s *sqliteStore) Snapshots() scheduler.SnapshotStore { return s.snaps }
+func (s *sqliteStore) Backend() Type                      { return TypeSQLite }
 func (s *sqliteStore) Close(_ context.Context) error      { return s.db.Close() }
 
 // migrationSQL is a single CREATE IF NOT EXISTS batch — re-opening is

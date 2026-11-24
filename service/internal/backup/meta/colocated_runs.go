@@ -114,6 +114,38 @@ func (r colocRuns) ListAllBackups(ctx context.Context, limit int) ([]backup.Back
 	return out, nil
 }
 
+// ListAllRestores walks every tenant's restores prefix and merges
+// into a single slice. Not on scheduler.RunStore — the interface
+// currently exposes list-by-tenant only for restores — but
+// goembedbadmin's colocated → go-embedb migration needs a cross-
+// tenant snapshot, and walking prefixes here is the one place that
+// already knows about the key layout. Narrow enough to add as a
+// method on colocRuns rather than widening the interface for every
+// other backend.
+//
+// `limit <= 0` means "no cap" (same convention as ListAllBackups).
+// Caller responsible for memory bounding at scale — the migration
+// is a one-off and runs with the Lambda's full memory budget.
+func (r colocRuns) ListAllRestores(ctx context.Context, limit int) ([]backup.RestoreRun, error) {
+	rows, err := r.s.archive.List(ctx, metaPrefix+"restores/")
+	if err != nil {
+		return nil, err
+	}
+	out := make([]backup.RestoreRun, 0, len(rows))
+	for _, obj := range rows {
+		var run backup.RestoreRun
+		if ok, err := r.s.getJSON(ctx, obj.Path, &run); err != nil || !ok {
+			continue
+		}
+		out = append(out, run)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].StartedAt.After(out[j].StartedAt) })
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
 func (r colocRuns) PutRestore(ctx context.Context, run backup.RestoreRun) error {
 	return r.s.putJSON(ctx, restoreRunKey(run), run)
 }

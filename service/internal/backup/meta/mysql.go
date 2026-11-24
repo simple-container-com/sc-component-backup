@@ -78,6 +78,7 @@ func (s *mysqlStore) Tenants() tenant.Store              { return s.tenants }
 func (s *mysqlStore) Runs() scheduler.RunStore           { return s.runs }
 func (s *mysqlStore) Projects() project.Store            { return s.projects }
 func (s *mysqlStore) Snapshots() scheduler.SnapshotStore { return s.snaps }
+func (s *mysqlStore) Backend() Type                      { return TypeMySQL }
 func (s *mysqlStore) Close(_ context.Context) error      { return s.db.Close() }
 
 // migrationSQLMySQL mirrors migrationSQLPostgres with MariaDB/MySQL

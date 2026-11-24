@@ -58,6 +58,7 @@ func (s *mongoStore) Tenants() tenant.Store              { return s.tenants }
 func (s *mongoStore) Runs() scheduler.RunStore           { return s.runs }
 func (s *mongoStore) Projects() project.Store            { return s.projects }
 func (s *mongoStore) Snapshots() scheduler.SnapshotStore { return s.snaps }
+func (s *mongoStore) Backend() Type                      { return TypeMongo }
 
 func (s *mongoStore) Close(ctx context.Context) error {
 	var firstErr error
