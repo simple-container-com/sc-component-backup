@@ -234,12 +234,30 @@ half and `.sc/cfg.*.yaml` are gitignored. The registry is encrypted to the fleet
 recipient set, so the single **org-level `SC_CONFIG`** decrypts it with no per-repo GitHub
 secret — see the fleet convention in `forge/CLAUDE.md` §"Secret management".
 
-## Migration (external Mongo → go-embedb)
+## Migration (metadata → go-embedb)
 
-The cutover uses an admin-only endpoint and is **opt-in**: the route
-is mounted only when `ADMIN_MIGRATION_TOKEN` is non-empty AND
-`USE_GOEMBEDB=1` is live (a sink exists). One-time operator tool;
-not part of the steady-state surface.
+The cutover uses one of TWO admin-only endpoints, picked by what the
+deploy's PRE-cutover metadata backend was:
+
+| Operator currently runs… | Endpoint                                     | What it reads |
+|---|---|---|
+| `METADATA_TYPE=mongo` against an EXTERNAL DB (cross-fleet import) | `POST /admin/migrate-mongo-to-goembedb` | that external `METADATA_URI` database |
+| `metadata: colocated` (the staging default — JSON under `s3://.../_meta/`) | `POST /admin/migrate-colocated-to-goembedb` | the live S3 colocated keyspace via the service's own `meta.Store` accessors |
+
+Both routes are **opt-in** — mounted only when `ADMIN_MIGRATION_TOKEN`
+is non-empty AND `USE_GOEMBEDB=1` is live (a sink exists); same auth
+gate, same per-request constant-time bearer compare. One-time operator
+tool; not part of the steady-state surface.
+
+**Which endpoint to call.** If the staging deploy you are cutting over
+has NO `METADATA_URI` set (archive is S3 + metadata is colocated — the
+default production shape today), reach for `migrate-colocated-to-goembedb`.
+The mongo-source endpoint on that deploy would walk an EMPTY external
+database, "verify" against `0 >= 0`, and leave every tenant orphaned on
+the next scheduler tick. The colocated endpoint walks the live
+`_meta/...` S3 keyspace via the same accessors the service already uses
+in production, so a drift between the writer's key layout and the
+migration's reader is unreachable by construction.
 
 ### Operator-side wire (how the bearer gets in)
 
@@ -309,6 +327,67 @@ curl -s -X POST -H "X-Admin-Token: $TOK" \
 The archive bucket is **never** touched by this endpoint. See the
 package-doc §"Blob carve-out" for the closed set of collections
 that are copied.
+
+### Calling `migrate-colocated-to-goembedb`
+
+Same auth header, same `?dry_run=1` support, different response
+shape — one row per sink collection, with `source: "colocated"` for
+the four domain stores the colocated store exposes accessors for
+(`tenants`, `projects`, `backup_runs`, `restore_runs`, `db_snapshots`)
+and `source: "none"` with a reason for the three that are NOT
+colocated-backed (`settings` in `notify.MongoStore`,
+`alerts_dismissals` in `alerts.MongoStore`, `object_samples` has no
+list-all accessor — samples regenerate on the next scheduler tick).
+
+```
+POST /admin/migrate-colocated-to-goembedb[?dry_run=1]
+Headers: X-Admin-Token: <resolved plaintext of config.migrationToken>
+```
+
+Response (abridged):
+
+```json
+{
+  "dry_run": false,
+  "source_empty": false,
+  "source_count": 42,
+  "migrated_count": 42,
+  "verified": true,
+  "elapsed_ms": 231,
+  "rows": [
+    { "collection": "alerts_dismissals", "source": "none", "reason": "no colocated accessor — stored elsewhere (alerts.MongoStore); dismissals will reset after cutover" },
+    { "collection": "backup_runs",       "source": "colocated", "source_count": 21, "migrated_count": 21 },
+    { "collection": "db_snapshots",      "source": "colocated", "source_count": 6,  "migrated_count": 6  },
+    { "collection": "object_samples",    "source": "none", "reason": "no list-all accessor on colocated SnapshotStore; samples regenerate on the next scheduler tick" },
+    { "collection": "projects",          "source": "colocated", "source_count": 3,  "migrated_count": 3  },
+    { "collection": "restore_runs",      "source": "colocated", "source_count": 1,  "migrated_count": 1  },
+    { "collection": "settings",          "source": "none", "reason": "no colocated accessor — stored elsewhere (notify.MongoStore); re-create via SPA after cutover" },
+    { "collection": "tenants",           "source": "colocated", "source_count": 11, "migrated_count": 11 }
+  ]
+}
+```
+
+**Empty-source refusal.** A WET run that found zero across every
+colocated-owned class answers **HTTP 422** (not 200) so a runbook
+`curl -f` catches the orphan path without parsing JSON. Body carries
+`source_empty: true` + `verified: false`. A dry run on the same empty
+source answers 200 (counting an empty source is a valid dry run) but
+still reports `source_empty: true` + `verified: false`. `verified` is
+`true` ONLY when the walk found at least one row AND every row landed
+AND no per-document error fired — an empty source can NEVER verify by
+construction.
+
+Example (staging smoke):
+
+```sh
+# Dry-run — see what WOULD move, and spot an empty source before touching anything.
+curl -fs -X POST -H "X-Admin-Token: $TOK" \
+  "https://backups.example.com/admin/migrate-colocated-to-goembedb?dry_run=1" | jq .
+
+# Real run — fails LOUDLY on an empty source (422), green on verified.
+curl -fs -X POST -H "X-Admin-Token: $TOK" \
+  "https://backups.example.com/admin/migrate-colocated-to-goembedb" | jq .verified
+```
 
 ## Rollback
 

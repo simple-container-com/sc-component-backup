@@ -126,6 +126,21 @@ type snapshotDoc struct {
 	Source        string    `bson:"source,omitempty"`
 }
 
+// SnapshotToBSONDoc is the exported mapping from stats.DbSnapshot to
+// the on-wire bson doc the MongoSnapshotStore writes. The migration
+// endpoint (service/internal/goembedbadmin) walks the colocated
+// `_meta/snapshots/.../.json` keyspace — which stores the stats.
+// DbSnapshot json shape — and re-uses this helper to upsert the
+// bson shape into the goembedb sink. Centralising the mapping here
+// means a drift between the writer and the migrator is one edit
+// instead of two.
+//
+// Returns `any` so the mongo driver sees the typed snapshotDoc
+// struct with its bson tags (a `bson.M` would key by Go field
+// names, not tag values). Callers pass the result straight to
+// `collection.ReplaceOne`/`InsertOne`.
+func SnapshotToBSONDoc(s stats.DbSnapshot) any { return toSnapshotDoc(s) }
+
 func toSnapshotDoc(s stats.DbSnapshot) snapshotDoc {
 	return snapshotDoc{
 		ID: s.ID, Project: s.Project, Engine: s.Engine, Database: s.Database,

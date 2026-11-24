@@ -90,6 +90,12 @@ JWTMW = "service/internal/api/jwt_middleware.go"
 TICK = "service/internal/api/scheduler_tick.go"
 TENANTS_REGISTER = "service/internal/api/tenants_register.go"
 ADMIN = "service/internal/goembedbadmin/migration.go"
+# The sibling colocated-source migration — same package, different file.
+# Kept alongside ADMIN so a reviewer sees both guard surfaces in one
+# place. The two live-caught traps the file exists to close
+# (verified=true on empty, source_empty response field) are mutated
+# below.
+COLOC_ADMIN = "service/internal/goembedbadmin/colocated_source.go"
 SVC_MAIN = "service/cmd/backup/main.go"
 
 # plugin/ files
@@ -165,6 +171,29 @@ MUTATIONS = [
      "\t\treturn\n\t}\n",
      "",
      "TestMigration_AuthAndGate", 1),
+
+    # The colocated → go-embedb migration exists because an operator
+    # flipping USE_GOEMBEDB=1 on a `metadata: colocated` staging deploy
+    # would have otherwise been served by the mongo-source endpoint
+    # above — which counts an EMPTY external DB, declares `verified=true`
+    # against `0 >= 0`, and leaves every tenant orphaned on the next
+    # scheduler tick. The two guards below are the specific surface that
+    # closes that trap: `SourceCount > 0` is the AND-term keeping verified
+    # honest, and the 422 status on an empty wet run is what makes a
+    # runbook `curl -f` catch the orphan path without parsing JSON.
+    ("goembedbadmin", "colocated verified drops SourceCount>0 term", COLOC_ADMIN, ADMIN_PKG,
+     "resp.Verified = resp.SourceCount > 0 && resp.MigratedCount >= resp.SourceCount",
+     "resp.Verified = resp.MigratedCount >= resp.SourceCount",
+     "TestColocatedMigration_EmptySource_422", 1),
+
+    # The 422-on-empty guard itself. A regression to 200 still returns
+    # source_empty=true in the body, but shell `curl -f` would no longer
+    # catch it — an operator automation that assumes non-2xx = failure
+    # would flip USE_GOEMBEDB=1 on an empty store.
+    ("goembedbadmin", "colocated empty-source stays 200 (loses 422)", COLOC_ADMIN, ADMIN_PKG,
+     "if resp.SourceEmpty && !dryRun {\n\t\tstatus = http.StatusUnprocessableEntity\n\t}",
+     "",
+     "TestColocatedMigration_EmptySource_422", 1),
 
     # ------------------------------------------------------- secret-env wire
     # Schema() is the component's published API and it is two plain maps

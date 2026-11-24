@@ -49,10 +49,12 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+
 	sdkservice "github.com/simple-container-com/go-aws-lambda-sdk/pkg/service"
 
 	"github.com/simple-container-com/sc-component-backup/service/internal/api"
 	"github.com/simple-container-com/sc-component-backup/service/internal/backup/alerts"
+	"github.com/simple-container-com/sc-component-backup/service/internal/backup/meta"
 	"github.com/simple-container-com/sc-component-backup/service/internal/backup/notify"
 	"github.com/simple-container-com/sc-component-backup/service/internal/backup/scheduler"
 	"github.com/simple-container-com/sc-component-backup/service/internal/goembedbadmin"
@@ -522,6 +524,38 @@ func main() {
 		router.Post("/admin/migrate-mongo-to-goembedb", migration.Migrate)
 		slog.Info("migration endpoint wired", "path", "/admin/migrate-mongo-to-goembedb",
 			"source", migrationSourceDB != nil, "sink", true)
+
+		// Second migration endpoint — colocated S3 → go-embedb. The
+		// mongo endpoint above is for cross-fleet imports (operator
+		// already runs METADATA_TYPE=mongo against an external DB); a
+		// staging deploy with `metadata: colocated` would be orphaned by
+		// it (empty external DB → verified=true against zero → every
+		// tenant disappears on the next tick). This sibling endpoint
+		// walks the live colocated meta.Store via its own accessors so
+		// a `_meta/` key-layout drift between the writer and the
+		// migration reader is unreachable by construction.
+		//
+		// Source is built fresh here (the service's own meta.Store may
+		// be the goembedb-backed one post-USE_GOEMBEDB=1; the migration
+		// needs to see the PRE-cutover colocated keyspace, which is
+		// just the archive store + TypeColocated). Non-fatal: a build
+		// failure logs + skips the endpoint rather than refusing to
+		// boot.
+		colocCtx, colocCancel := context.WithTimeout(ctx, 10*time.Second)
+		colocSource, cerr := meta.NewFromConfig(colocCtx, meta.Config{Type: meta.TypeColocated}, archiveStore)
+		colocCancel()
+		if cerr != nil {
+			slog.Warn("colocated migration source build failed — endpoint not mounted", "err", cerr)
+		} else {
+			colocMigration := &goembedbadmin.ColocatedMigrationConfig{
+				Source:     colocSource,
+				Sink:       migrationSinkDB,
+				AdminToken: adminToken,
+			}
+			router.Post("/admin/migrate-colocated-to-goembedb", colocMigration.Migrate)
+			slog.Info("colocated migration endpoint wired", "path", "/admin/migrate-colocated-to-goembedb",
+				"source", true, "sink", true)
+		}
 	}
 
 	// Embedded SPA.
