@@ -250,10 +250,31 @@ MUTATIONS = [
      "sessionCfg.Version = version",
      'sessionCfg.Version = ""',
      "TestBinaryReportsItsBuildOnHealthzAndSession", 1),
+
+    # ARN-exit calibration (per sc-components' selection-bias correction
+    # 2026-11-24): the two bugs backup actually shipped — `signingKey`
+    # as a bare ARN on backup-smoke-1d 2026-11-14, and
+    # BACKUP_OPERATOR_PASSWORD read-by-nothing on backup.simple-forge.com
+    # 2026-11-18 — were closed by adding resolveAWSSecretARN + a loud
+    # os.Exit(2) on resolve failure. Those exits are the guard this
+    # whole file exists to assert. Each mutation deletes the Exit(2)
+    # line inside its respective resolve-error block; the test boots
+    # with a bogus ARN and asserts exit code 2, so a bypass of the
+    # loud-failure path flips the test red.
+    ("arn-exit", "SERVICE_JWT_SECRET resolve failure no longer exits", SVC_MAIN, SVC_CMD_PKG,
+     'slog.Error("failed to resolve SERVICE_JWT_SECRET from SecretsManager", "err", err)\n\t\t\tos.Exit(2)',
+     'slog.Error("failed to resolve SERVICE_JWT_SECRET from SecretsManager", "err", err)',
+     "TestBinaryExitsTwoOnServiceJWTSecretArnResolveFailure", 1),
+
+    ("arn-exit", "BACKUP_OPERATOR_PASSWORD resolve failure no longer exits", SVC_MAIN, SVC_CMD_PKG,
+     'slog.Error("failed to resolve BACKUP_OPERATOR_PASSWORD from SecretsManager", "err", err)\n\t\t\tos.Exit(2)',
+     'slog.Error("failed to resolve BACKUP_OPERATOR_PASSWORD from SecretsManager", "err", err)',
+     "TestBinaryExitsTwoOnBackupOperatorPasswordArnResolveFailure", 1),
 ]
 
 TEST_FILE_PREFIXES = (
     "tenants_register_test.go:",
+    "arn_exit_test.go:",
     "scheduler_tick_test.go:",
     "migration_test.go:",
     "main_test.go:",
