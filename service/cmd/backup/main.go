@@ -148,6 +148,33 @@ func main() {
 			os.Exit(2)
 		}
 	}
+	// Resolve NOTIFY_TOKEN on the same ARN pattern. The plugin's
+	// ComponentSecretEnvMap binds `config.notifyToken` as a per-function
+	// SecretsManager ARN; the notify publisher POSTs to the notifier with
+	// this value as its Bearer. Without resolution the service would
+	// present the SecretsManager ARN string instead of the token, and the
+	// notifier would 401. Same shape as SERVICE_JWT_SECRET +
+	// BACKUP_OPERATOR_PASSWORD + ADMIN_MIGRATION_TOKEN above.
+	//
+	// Caught 2026-11-24 by TestSecretEnvVarsAreResolvedByTheService — the
+	// Schema invariant test added alongside this fix. Before the test
+	// landed, the notify wiring (PR #33) had bound notifyToken as a
+	// secret env var but no service-side resolver; a Lambda deploy with
+	// `config.notifyToken: ${secret:…}` would have sent an ARN string as
+	// its Bearer.
+	if t := os.Getenv("NOTIFY_TOKEN"); t != "" {
+		resolveCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		resolved, err := resolveAWSSecretARN(resolveCtx, "NOTIFY_TOKEN", t)
+		cancel()
+		if err != nil {
+			slog.Error("failed to resolve NOTIFY_TOKEN from SecretsManager", "err", err)
+			os.Exit(2)
+		}
+		if err := os.Setenv("NOTIFY_TOKEN", resolved); err != nil {
+			slog.Error("failed to set resolved NOTIFY_TOKEN env", "err", err)
+			os.Exit(2)
+		}
+	}
 	port := envOr("PORT", "8080")
 
 	slog.Info("starting sc-component-backup",

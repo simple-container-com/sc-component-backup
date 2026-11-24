@@ -5,6 +5,7 @@ package goembedbadmin
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -130,7 +131,12 @@ func (c *MigrationConfig) Migrate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "migration endpoint disabled (ADMIN_MIGRATION_TOKEN unset)")
 		return
 	}
-	if r.Header.Get("X-Admin-Token") != c.AdminToken {
+	// Constant-time compare so a remote attacker cannot learn the
+	// token's length or prefix by timing the response. The bearer is
+	// shared across operator consumers so the leak would be shared
+	// — low severity, trivially cheap to close.
+	got := r.Header.Get("X-Admin-Token")
+	if subtle.ConstantTimeCompare([]byte(got), []byte(c.AdminToken)) != 1 {
 		writeErr(w, http.StatusUnauthorized, "missing or invalid X-Admin-Token")
 		return
 	}
