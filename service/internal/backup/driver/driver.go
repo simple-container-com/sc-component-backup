@@ -131,13 +131,44 @@ func requireCmd(name string) error {
 // tailStderr returns the last 256 bytes of a child process's stderr,
 // used to attach a diagnosable tail to a dump/restore error without
 // bloating the DB-logged BackupRun.Error field.
+//
+// An empty tail is reported as "(no stderr output)" rather than as the
+// empty string: a run on 2026-11-24 failed with `mongodump failed: exit
+// status 1; stderr tail: ` and nothing after the colon, which reads like
+// a truncated log line rather than what it was — a child that exited
+// non-zero having printed nothing. Naming the condition makes the next
+// one diagnosable at a glance.
 func tailStderr(stderr []byte) string {
 	const max = 256
 	s := strings.TrimSpace(string(stderr))
+	if s == "" {
+		return "(no stderr output)"
+	}
 	if len(s) <= max {
 		return s
 	}
 	return "..." + s[len(s)-max:]
 }
+
+// tailBuffer is an io.Writer that retains only the last `max` bytes
+// written to it. Used for a child process whose stderr carries progress
+// output as well as errors (mongodump without --quiet), where a plain
+// bytes.Buffer would grow with the size of the dump.
+type tailBuffer struct {
+	max int
+	buf []byte
+}
+
+func (t *tailBuffer) Write(p []byte) (int, error) {
+	n := len(p)
+	t.buf = append(t.buf, p...)
+	if over := len(t.buf) - t.max; over > 0 {
+		t.buf = t.buf[over:]
+	}
+
+	return n, nil
+}
+
+func (t *tailBuffer) Bytes() []byte { return t.buf }
 
 var _ = io.EOF // keep `io` referenced even if subpackages are stubs
