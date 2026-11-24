@@ -4,7 +4,6 @@
 package driver
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -69,20 +68,26 @@ func (m *MongoDBDriver) Dump(ctx context.Context, conn ConnectionSpec, out io.Wr
 	// --archive=- streams to stdout; --gzip compresses on the wire.
 	// Scope to a database when the tenant declares one (see note in
 	// the pre-port stub about tenant-scoped users lacking clusterAdmin).
+	//
+	// Deliberately NOT --quiet. It was, until 2026-11-25, and that cost
+	// a diagnosis: a forge-sessions dump failed with `exit status 1` and
+	// an EMPTY stderr tail, because --quiet suppresses the very line
+	// ("Failed: ...") that says why. stderr goes to a private buffer and
+	// never to the archive (which is stdout), so the only cost of the
+	// chattier mode is progress output — bounded by tailBuffer.
 	args := []string{
 		"--config=" + cfgPath,
 		"--archive=-",
 		"--gzip",
-		"--quiet",
 	}
 	if conn.Database != "" {
 		args = append(args, "--db="+conn.Database)
 	}
 	cmd := exec.CommandContext(ctx, "mongodump", args...)
 	cmd.Env = cleanEnv()
-	var stderr bytes.Buffer
+	stderr := &tailBuffer{max: 4096}
 	cmd.Stdout = out
-	cmd.Stderr = &stderr
+	cmd.Stderr = stderr
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("mongodump failed: %w; stderr tail: %s", err,
 			redact(tailStderr(stderr.Bytes()), secretsFromConn(conn)))
@@ -113,16 +118,16 @@ func (m *MongoDBDriver) Restore(ctx context.Context, conn ConnectionSpec, in io.
 		"--archive=-",
 		"--gzip",
 		"--drop",
-		"--quiet",
 	}
 	if conn.Database != "" {
 		args = append(args, "--nsInclude="+conn.Database+".*")
 	}
 	cmd := exec.CommandContext(ctx, "mongorestore", args...)
 	cmd.Env = cleanEnv()
-	var stderr bytes.Buffer
+	// Not --quiet, for the same reason as Dump above.
+	stderr := &tailBuffer{max: 4096}
 	cmd.Stdin = in
-	cmd.Stderr = &stderr
+	cmd.Stderr = stderr
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("mongorestore failed: %w; stderr tail: %s", err,
 			redact(tailStderr(stderr.Bytes()), secretsFromConn(conn)))
