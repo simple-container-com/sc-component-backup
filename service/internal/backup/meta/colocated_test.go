@@ -204,6 +204,40 @@ func TestColocated_RunResultsDelegates(t *testing.T) {
 	}
 }
 
+// TestColocated_BackendReportsLive pins the contract main.go's
+// Prometheus gauge now depends on: the resolved backend of a Store
+// built with Config{Type: ""} + an InMemoryStore archive reports
+// TypeColocated (because tests default to colocated — see
+// resolveType), and a Config{Type: TypeColocated} still reports it.
+//
+// A regression here (returning TypeDefault, or any other value) would
+// mislabel the gauge after a `metadata: colocated` deploy, which is
+// the specific operator probe the gauge exists to answer
+// honestly. Mutation entry in hack/mutation-check.py breaks the
+// colocatedStore.Backend() return and asserts this test goes red.
+func TestColocated_BackendReportsLive(t *testing.T) {
+	ctx := context.Background()
+	arch := storage.NewInMemoryStore()
+
+	// Default resolution with an in-memory archive → colocated.
+	store, err := NewFromConfig(ctx, Config{Type: ""}, arch)
+	if err != nil {
+		t.Fatalf("new default: %v", err)
+	}
+	if b := store.Backend(); b != TypeColocated {
+		t.Fatalf("default-resolution Backend() = %q, want %q", b, TypeColocated)
+	}
+
+	// Explicit colocated.
+	store, err = NewFromConfig(ctx, Config{Type: TypeColocated}, arch)
+	if err != nil {
+		t.Fatalf("new colocated: %v", err)
+	}
+	if b := store.Backend(); b != TypeColocated {
+		t.Fatalf("explicit Backend() = %q, want %q", b, TypeColocated)
+	}
+}
+
 func TestColocated_ForeignKeysUnderMetaDontCrashList(t *testing.T) {
 	ctx := context.Background()
 	arch := storage.NewInMemoryStore()

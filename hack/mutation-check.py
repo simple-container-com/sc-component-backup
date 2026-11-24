@@ -96,6 +96,15 @@ ADMIN = "service/internal/goembedbadmin/migration.go"
 # (verified=true on empty, source_empty response field) are mutated
 # below.
 COLOC_ADMIN = "service/internal/goembedbadmin/colocated_source.go"
+# Colocated meta-store backend reporter — the live wire the Prometheus
+# `backup_store_backend` gauge now reads at boot (set-once-from-env was
+# replaced with set-once-from-metaStore.Backend()). A regression here
+# would silently mislabel the gauge after a `metadata: colocated`
+# deploy and read the wrong answer under an unauthenticated
+# `curl /metrics | grep store_backend` — the same shape of probe-read-
+# wrong-field that misled the pre-fix framing of this feature.
+COLOC_META = "service/internal/backup/meta/colocated.go"
+META_PKG = "./internal/backup/meta/"
 SVC_MAIN = "service/cmd/backup/main.go"
 
 # plugin/ files
@@ -194,6 +203,19 @@ MUTATIONS = [
      "if resp.SourceEmpty && !dryRun {\n\t\tstatus = http.StatusUnprocessableEntity\n\t}",
      "",
      "TestColocatedMigration_EmptySource_422", 1),
+
+    # The `backup_store_backend` Prometheus gauge now reads the live
+    # metaStore.Backend() post-boot (instead of the old set-once-from-env
+    # inference). If colocatedStore.Backend() ever returns the empty
+    # TypeDefault — what resolveType bounces the empty env back to as
+    # "colocated" — the gauge would report "" after a `metadata: colocated`
+    # deploy and an unauthenticated `curl /metrics | grep store_backend`
+    # would read the wrong answer. This is the specific probe the gauge
+    # exists to answer honestly after a `USE_GOEMBEDB=1` cutover.
+    ("goembedbadmin", "colocated.Backend() mis-reports as TypeDefault", COLOC_META, META_PKG,
+     "func (s *colocatedStore) Backend() Type                      { return TypeColocated }",
+     "func (s *colocatedStore) Backend() Type                      { return TypeDefault }",
+     "TestColocated_BackendReportsLive", 1),
 
     # ------------------------------------------------------- secret-env wire
     # Schema() is the component's published API and it is two plain maps

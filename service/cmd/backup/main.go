@@ -258,11 +258,25 @@ func main() {
 	}
 	defer metaStore.Close(context.Background())
 
-	// Advertise the active metadata backend to Prometheus. Label is
-	// "goembedb" when the embed is live, otherwise the operator's
-	// chosen METADATA_TYPE (empty → the meta package's default — see
-	// buildMetaStore for the resolution shape).
-	goembedbadmin.SetStoreBackend(backendLabel(useGoEmbedb))
+	// Advertise the active metadata backend to Prometheus. Label comes
+	// from the LIVE metaStore — metaStore.Backend() reports the
+	// resolved concrete type (so a colocated-defaulted-from-S3 deploy
+	// reports "colocated", not "default"), and the USE_GOEMBEDB=1 path
+	// overrides to "goembedb" because the meta store underneath is a
+	// mongoStore talking to the embed and reports "mongo".
+	//
+	// Reading it live closes a question an unauthenticated
+	// `curl /metrics | grep store_backend` answers after cutover: did
+	// the embed actually take over, or did the boot fall through to
+	// something else? Same operator probe that settled the pre-cutover
+	// `metadata: colocated` question recurs in the harder direction
+	// here; a set-once-from-env gauge would have reported the operator's
+	// intent, not the live backend.
+	backendLabelValue := string(metaStore.Backend())
+	if useGoEmbedb {
+		backendLabelValue = "goembedb"
+	}
+	goembedbadmin.SetStoreBackend(backendLabelValue)
 
 	sch := scheduler.New(scheduler.Config{}, metaStore.Tenants(), metaStore.Runs(), archiveStore, logger, nil)
 
@@ -584,15 +598,12 @@ func main() {
 	slog.Info("exited cleanly")
 }
 
-// backendLabel maps the boot-time backend selection to the
-// Prometheus gauge label. "goembedb" wins over any METADATA_TYPE
-// override since the embed is the actual listener the mongo client
-// talks to; otherwise the operator-set METADATA_TYPE is echoed. An
-// empty METADATA_TYPE resolves inside the meta package based on the
-// archive backend (filesystem→sqlite, object-store→colocated); we
-// don't re-resolve here — the gauge value "default" names that
-// implicit-default path so an operator sees a distinct label from an
-// explicit "colocated" / "sqlite" choice.
+// backendLabel is retained for TestBinaryReportsStoreBackend, which
+// pins the env-to-label mapping for the inexpensive
+// "USE_GOEMBEDB=1 → goembedb" path. The runtime gauge wire now reads
+// the live metaStore.Backend() (see the setter above); this helper is
+// the pre-store-boot answer the test can check without standing up a
+// Mongo/Ferret pair.
 func backendLabel(useGoEmbedb bool) string {
 	if useGoEmbedb {
 		return "goembedb"

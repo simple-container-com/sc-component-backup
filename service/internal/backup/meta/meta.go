@@ -61,11 +61,19 @@ import (
 // Store aggregates the four narrow stores via accessor methods — see
 // the package doc for why this isn't a simple interface-embedding
 // shape.
+//
+// Backend() returns the RESOLVED backend type (post-defaulting — so
+// the colocated-defaulted-from-S3 branch reports "colocated", not
+// "default"). The goembedbadmin metrics gauge reads it at boot
+// instead of inferring from env, so an operator reading
+// `/metrics | grep store_backend` sees the live backend rather than
+// the operator's intent.
 type Store interface {
 	Tenants() tenant.Store
 	Runs() scheduler.RunStore
 	Projects() project.Store
 	Snapshots() scheduler.SnapshotStore
+	Backend() Type
 	Close(ctx context.Context) error
 }
 

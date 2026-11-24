@@ -65,6 +65,7 @@ func (s *postgresStore) Tenants() tenant.Store              { return s.tenants }
 func (s *postgresStore) Runs() scheduler.RunStore           { return s.runs }
 func (s *postgresStore) Projects() project.Store            { return s.projects }
 func (s *postgresStore) Snapshots() scheduler.SnapshotStore { return s.snaps }
+func (s *postgresStore) Backend() Type                      { return TypePostgres }
 func (s *postgresStore) Close(_ context.Context) error      { return s.db.Close() }
 
 // migrationSQLPostgres mirrors sqlite.go's migrationSQL. Idempotent via
