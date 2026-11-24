@@ -63,6 +63,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 API_PKG = "./internal/api/"
 ADMIN_PKG = "./internal/goembedbadmin/"
+MONGOX_PKG = "./internal/mongox/"
 STORAGE_PKG = "./internal/backup/storage/"
 PLUGIN_PKG = "./internal/"
 PLG_CMD_PKG = "./cmd/sc-component-backup/"
@@ -105,6 +106,11 @@ COLOC_ADMIN = "service/internal/goembedbadmin/colocated_source.go"
 # `curl /metrics | grep store_backend` — the same shape of probe-read-
 # wrong-field that misled the pre-fix framing of this feature.
 COLOC_META = "service/internal/backup/meta/colocated.go"
+# The NotWritablePrimary classification that lets a non-lease-owner
+# execution environment boot. Mutated below in both directions — it is
+# the guard that stood between the 2026-11-24 outage and a service that
+# serves reads from every replica.
+MONGOX = "service/internal/mongox/notprimary.go"
 META_PKG = "./internal/backup/meta/"
 S3_STORAGE = "service/internal/backup/storage/s3.go"
 SVC_MAIN = "service/cmd/backup/main.go"
@@ -364,6 +370,46 @@ MUTATIONS = [
      "Prefix:            aws.String(prefix),",
      "Prefix:            nil,",
      "TestS3Store_List_PaginatedPrefixIsStable", 1),
+
+    # ------------------------------------------------------------- mongox
+    # go-embedb grants ONE write lease per tenant and classifies every
+    # DDL op — createIndexes included — as RMW, so a non-owner replica
+    # is refused with NotWritablePrimary(10107). On Lambda the refusal
+    # is a dead end rather than a "retry at the primary": each exec env
+    # is its own VM with no inbound path, so every slot advertises
+    # 127.0.0.1:0 and the `primary` hint can never be dialled.
+    #
+    # Treating it as fatal took backup.simple-forge.com down on
+    # 2026-11-24: `meta store init` creates six indexes across four
+    # stores and os.Exit(1)s, so every non-owner env died ~880ms into
+    # init, Lambda answered the resulting 502 by spawning another env,
+    # and the loop reached five slots (r-01..r-05) and epoch 43 without
+    # self-healing for over an hour.
+    #
+    # Mutating in BOTH directions because both are live failure modes
+    # and they look nothing alike in production: swallow-nothing is the
+    # outage above, swallow-everything hides a genuine index conflict
+    # (a duplicate key on a unique index) behind a WARN and lets the
+    # service boot onto a schema it does not have.
+    ("mongox", "NotWritablePrimary treated as fatal again (the outage)", MONGOX, MONGOX_PKG,
+     "\tif IsNotWritablePrimary(err) {",
+     "\tif false {",
+     "TestTolerateNotWritablePrimary", 1),
+
+    ("mongox", "every index error swallowed, not just 10107", MONGOX, MONGOX_PKG,
+     "\tif IsNotWritablePrimary(err) {",
+     "\tif err != nil {",
+     "TestTolerateNotWritablePrimary", 1),
+
+    # The wire code itself. 10107 is owned by go-embedb's
+    # handlererrors.ErrNotWritablePrimary, not by this package, so the
+    # test asserts it against a LITERAL — the first version of that test
+    # built its fixture from this const and therefore passed with the
+    # const inverted, proving only that the code agreed with itself.
+    ("mongox", "wire code drifts off 10107", MONGOX, MONGOX_PKG,
+     "const codeNotWritablePrimary = 10107",
+     "const codeNotWritablePrimary = 10108",
+     "TestCodeMatchesWireSpec|TestIsNotWritablePrimary", 1),
 ]
 
 TEST_FILE_PREFIXES = (

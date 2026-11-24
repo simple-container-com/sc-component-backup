@@ -14,6 +14,7 @@ import (
 	"github.com/pkg/errors"
 
 	"github.com/simple-container-com/sc-component-backup/service/internal/backup/stats"
+	"github.com/simple-container-com/sc-component-backup/service/internal/mongox"
 )
 
 // Default collection names for the snapshot store. DB name matches the
@@ -89,13 +90,15 @@ func (s *MongoSnapshotStore) ensureIndexes(ctx context.Context) error {
 		{Keys: bson.D{{Key: "project", Value: 1}, {Key: "ts", Value: -1}}},
 		{Keys: bson.D{{Key: "project", Value: 1}, {Key: "database", Value: 1}, {Key: "ts", Value: -1}}},
 	}
-	if _, err := s.snapshots.Indexes().CreateMany(ctx, snapIdx); err != nil {
+	_, err := s.snapshots.Indexes().CreateMany(ctx, snapIdx)
+	if err = mongox.TolerateNotWritablePrimary("db_snapshots", err); err != nil {
 		return errors.Wrap(err, "db_snapshots indexes")
 	}
 	sampleIdx := []mongo.IndexModel{
 		{Keys: bson.D{{Key: "project", Value: 1}, {Key: "database", Value: 1}, {Key: "snapshotId", Value: -1}}},
 	}
-	if _, err := s.samples.Indexes().CreateMany(ctx, sampleIdx); err != nil {
+	_, err = s.samples.Indexes().CreateMany(ctx, sampleIdx)
+	if err = mongox.TolerateNotWritablePrimary("object_samples", err); err != nil {
 		return errors.Wrap(err, "object_samples indexes")
 	}
 	return nil

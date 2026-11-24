@@ -12,6 +12,8 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/options"
 
 	"github.com/pkg/errors"
+
+	"github.com/simple-container-com/sc-component-backup/service/internal/mongox"
 )
 
 // Store is the tenant repository interface. Two implementations: MongoStore
@@ -58,10 +60,11 @@ func NewMongoStore(ctx context.Context, uri string) (*MongoStore, error) {
 
 	// Unique index on stackName — enforces (stackName, version) idempotency
 	// at the DB level. Upserts use stackName as the match key.
-	if _, err := coll.Indexes().CreateOne(ctx, mongo.IndexModel{
+	_, err = coll.Indexes().CreateOne(ctx, mongo.IndexModel{
 		Keys:    bson.D{{Key: "stackName", Value: 1}},
 		Options: options.Index().SetUnique(true),
-	}); err != nil {
+	})
+	if err = mongox.TolerateNotWritablePrimary("tenants.stackName", err); err != nil {
 		_ = client.Disconnect(ctx)
 		return nil, errors.Wrap(err, "mongo index create")
 	}
