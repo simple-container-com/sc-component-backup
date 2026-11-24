@@ -76,7 +76,7 @@ jobs:
         working-directory: service/internal/ui
         run: |
           set -euo pipefail
-          npm install --no-audit --no-fund
+          npm ci --no-audit --no-fund
           npm run build:prod
 
       - uses: actions/setup-go@v5
@@ -177,7 +177,7 @@ jobs:
         working-directory: service/internal/ui
         run: |
           set -euo pipefail
-          npm install --no-audit --no-fund
+          npm ci --no-audit --no-fund
           npm run build:prod
 
       - uses: actions/setup-go@v5
@@ -212,18 +212,8 @@ jobs:
 
       # A mutation that is written back incorrectly would leave the tree
       # dirty. Cheap insurance against the harness itself lying.
-      #
-      # `npm install` above may rewrite service/internal/ui/package-lock.json
-      # (name + version when cached lockfile metadata differs from
-      # package.json). That has nothing to do with the mutation harness
-      # itself — the harness never touches package-lock.json. Exclude it
-      # from the restoration check so an unrelated node-side churn
-      # doesn't mask a harness undo-failure.
       - name: tree restored
-        run: |
-          set -euo pipefail
-          git checkout -- service/internal/ui/package-lock.json 2>/dev/null || true
-          git diff --exit-code
+        run: git diff --exit-code
 
   image:
     name: Build the service image (no push)
