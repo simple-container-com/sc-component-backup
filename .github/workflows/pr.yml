@@ -130,6 +130,101 @@ jobs:
           go test ./... -count=1
           git diff --exit-code go.mod go.sum
 
+  # Asserts the tests actually catch the faults they claim to. See
+  # hack/mutation-check.py — it breaks one guard at a time and requires
+  # the matching test to go red. This is what distinguishes a regression
+  # test from a test that merely agrees with the code as written; it
+  # already live-caught a tenants_register test weaker than its name
+  # (TestTenantsRegister_JWTMismatch only catches the body-tenant
+  # mismatch, not the op gate — mintTestJWT hard-codes op:"register").
+  #
+  # Ported from sc-component-notifier's CI shape verbatim. The two
+  # version-wire entries at the bottom of MUTATIONS are the ones this
+  # repo earns its own harness for: a value present, correct, and read
+  # by nothing, logging identically to a working deploy. That exact
+  # shape has shipped TWICE in this fleet (signingKey as a bare ARN on
+  # backup-smoke-1d 2026-11-14, then BACKUP_OPERATOR_PASSWORD on the
+  # first backup.simple-forge.com login 2026-11-18).
+  mutation-check:
+    runs-on: ubuntu-latest
+    name: mutation check
+    steps:
+      - uses: actions/checkout@v4
+
+      # service's private go-embedb dep needs the reveal to resolve.
+      # Same credential path as the `service-test` job above.
+      - uses: simple-container-com/actions/install-sc@main
+      - name: Reveal the go-embedb deploy key
+        env:
+          SIMPLE_CONTAINER_CONFIG: ${{ secrets.SC_CONFIG }}
+        run: |
+          set -euo pipefail
+          sc secrets reveal --force
+          test -s .sc/deploy-keys/go-embedb.pem
+          chmod 600 .sc/deploy-keys/go-embedb.pem
+
+      # internal/ui embeds the built SPA with `go:embed all:dist`, so
+      # the Go package does not compile until the bundle exists. The
+      # binary test TestBinaryReportsItsBuildOnHealthzAndSession links
+      # cmd/backup (which transitively imports internal/ui), so we need
+      # the dist produced here too. Same two commands service-test runs.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: service/internal/ui/package-lock.json
+      - name: Build the SPA
+        working-directory: service/internal/ui
+        run: |
+          set -euo pipefail
+          npm install --no-audit --no-fund
+          npm run build:prod
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: service/go.mod
+          cache-dependency-path: service/go.sum
+
+      # Warm the build cache once per module, so the one `go test -run`
+      # call per mutation doesn't each pay for a cold compile. Both
+      # modules: the harness mutates service/ AND plugin/.
+      #
+      # Non-fatal on purpose: this step only warms a cache, and the
+      # mutation loop re-fetches whatever is missing. Gating the job
+      # on it turns a module-proxy hiccup into a red PR (notifier's
+      # first run of this step hit exactly that).
+      - name: prime build cache
+        continue-on-error: true
+        env:
+          GOPRIVATE: github.com/simple-container-com/*
+          GIT_SSH_COMMAND: ssh -i ${{ github.workspace }}/.sc/deploy-keys/go-embedb.pem -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new
+        run: |
+          set -euo pipefail
+          git config --global url."git@github.com:".insteadOf "https://github.com/"
+          (cd service && go test ./... -count=1 -run XXXNONE)
+          (cd plugin  && go test ./... -count=1 -run XXXNONE)
+
+      - name: mutation check
+        env:
+          GOPRIVATE: github.com/simple-container-com/*
+          GIT_SSH_COMMAND: ssh -i ${{ github.workspace }}/.sc/deploy-keys/go-embedb.pem -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new
+        run: python3 hack/mutation-check.py
+
+      # A mutation that is written back incorrectly would leave the tree
+      # dirty. Cheap insurance against the harness itself lying.
+      #
+      # `npm install` above may rewrite service/internal/ui/package-lock.json
+      # (name + version when cached lockfile metadata differs from
+      # package.json). That has nothing to do with the mutation harness
+      # itself — the harness never touches package-lock.json. Exclude it
+      # from the restoration check so an unrelated node-side churn
+      # doesn't mask a harness undo-failure.
+      - name: tree restored
+        run: |
+          set -euo pipefail
+          git checkout -- service/internal/ui/package-lock.json 2>/dev/null || true
+          git diff --exit-code
+
   image:
     name: Build the service image (no push)
     runs-on: ubuntu-latest
