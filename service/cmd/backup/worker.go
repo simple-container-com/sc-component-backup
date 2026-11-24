@@ -67,8 +67,17 @@ func runWorker(ctx context.Context) int {
 	s3Region := envOr("BACKUP_S3_REGION", "eu-central-1")
 	s3Key := mustEnv("BACKUP_S3_KEY")
 
+	// The build stamp is the only external verification the worker
+	// has: it is a one-shot Fargate task with no HTTP surface, so
+	// /healthz can only confirm the Lambda's build. Logging version +
+	// commit here closes the gap on "which image is the worker
+	// running?" — read via CloudWatch logs alongside the task
+	// outcome. Same `main.version` ldflag the service mode reports.
 	slog.Info(
 		"backup worker starting",
+		"version", version,
+		"commit", commit,
+		"revision", revision,
 		"driver", driverName,
 		"database", tenantDB,
 		"s3_bucket", s3Bucket,
