@@ -41,6 +41,12 @@ type SessionResponse struct {
 	Authenticated bool   `json:"authenticated"`
 	CSRF          string `json:"csrf,omitempty"` // present iff we grow CSRF
 	PasswordSet   bool   `json:"password_set"`
+	// Version is the build stamp (`main.version`, CalVer
+	// `vYYYY.MM.DD-<sha>`), reported by the session probe to an
+	// AUTHENTICATED caller only — the handler leaves it empty on the
+	// anonymous branch and `omitempty` drops the key from the body.
+	// See SessionConfig.Version for the rationale.
+	Version string `json:"version,omitempty"`
 }
 
 // SessionConfig holds the tiny bit of shared state session/login/logout
@@ -63,6 +69,26 @@ type SessionConfig struct {
 	// false when developing against http://localhost:8080). Defaults
 	// to true in production deploys (behind HTTPS).
 	CookieSecure bool
+
+	// Version is the build stamp (`main.version`, CalVer
+	// `vYYYY.MM.DD-<sha>`), reported by the session probe to an
+	// AUTHENTICATED caller only.
+	//
+	// It exists because a pin bump was unverifiable from outside. The
+	// binary logs its version once at boot (cmd/backup/main.go) and
+	// exposes it nowhere, `/healthz` answers a bare "ok", and reading
+	// CloudWatch needs AWS credentials an operator smoking a deploy
+	// usually does not have. So "the provision went green" was the only
+	// available evidence that a new image was serving — which is
+	// evidence that the apply ran, not that this process is the build
+	// you merged.
+	//
+	// Authenticated-only on purpose: the value is an exact commit SHA
+	// of a private repo, and `/api/v1/session` is reachable
+	// unauthenticated by design (the SPA needs it before it holds a
+	// cookie). Gating it adds the verification without widening what an
+	// anonymous caller learns.
+	Version string
 }
 
 // NewSessionConfigFromEnv builds a SessionConfig from env, used from
@@ -94,6 +120,11 @@ func (c *SessionConfig) Session(w http.ResponseWriter, r *http.Request) {
 	raw := tokenFromRequest(r)
 	if raw != "" && c.verifyToken(raw) {
 		resp.Authenticated = true
+		// Only for a caller who proved they hold the operator password
+		// — see the Version field comment for why it is not
+		// unconditional. The `omitempty` tag on SessionResponse.Version
+		// drops the key from the body on the anonymous branch.
+		resp.Version = c.Version
 	}
 	writeJSON(w, http.StatusOK, resp)
 }

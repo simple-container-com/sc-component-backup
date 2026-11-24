@@ -49,6 +49,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+
 	sdkservice "github.com/simple-container-com/go-aws-lambda-sdk/pkg/service"
 
 	"github.com/simple-container-com/sc-component-backup/service/internal/api"
@@ -307,6 +308,11 @@ func main() {
 	// Slice 1e.2 — SPA-facing handlers. Every handler reaches its
 	// narrow store through the meta.Store's accessors (slice 1e.4b).
 	sessionCfg := api.NewSessionConfigFromEnv([]byte(jwtSecret))
+	// So a post-deploy smoke can prove WHICH build is serving. The boot
+	// log above already carries this value, but reading it needs AWS
+	// credentials; the authenticated session probe needs the operator
+	// password. See api.SessionConfig.Version for the full rationale.
+	sessionCfg.Version = version
 	metaCfg := &api.MetaConfig{Version: version, Commit: commit}
 	overviewCfg := &api.OverviewConfig{
 		Tenants:         metaStore.Tenants(),
