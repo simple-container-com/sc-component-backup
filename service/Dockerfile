@@ -36,7 +36,7 @@ FROM node:${NODE_VERSION} AS ui-builder
 
 WORKDIR /ui
 COPY internal/ui/package.json ./
-# COPY internal/ui/package-lock.json ./   ← uncomment once a lockfile exists
+COPY internal/ui/package-lock.json ./
 RUN npm ci --no-audit --no-fund
 COPY internal/ui/ ./
 RUN npm run build:prod
