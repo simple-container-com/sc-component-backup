@@ -199,27 +199,86 @@ func (s *S3Store) Presign(ctx context.Context, path string, expires time.Duratio
 	return req.URL, nil
 }
 
+// s3ListAPI is the one method listAllObjects needs. It exists so a
+// test can drive the pagination loop with a fake that actually
+// honours ContinuationToken — the concrete `*s3.Client` cannot be
+// faked, and a loop that re-requests page 1 forever is
+// indistinguishable from a correct one against any fake that ignores
+// the token.
+type s3ListAPI interface {
+	ListObjectsV2(ctx context.Context, in *s3.ListObjectsV2Input, optFns ...func(*s3.Options)) (*s3.ListObjectsV2Output, error)
+}
+
+// List enumerates every object under prefix. Thin wrapper over
+// `listAllObjects` — see that function's comment for the pagination
+// contract.
 func (s *S3Store) List(ctx context.Context, prefix string) ([]StoredObject, error) {
+	return listAllObjects(ctx, s.client, s.cfg.Bucket, prefix)
+}
+
+// listAllObjects walks EVERY page of a ListObjectsV2 result.
+//
+// A single ListObjectsV2 call returns at most 1000 keys and signals
+// the clip only via `IsTruncated` — it does not error, warn, or
+// indicate the clip in any other way. This function used to be one
+// unpaginated call, and the bug it caused is worth recording because
+// the symptom looked like data:
+//
+//   - LIVE-CAUGHT 2026-11-24 on sibling sc-component-observatory's
+//     dry-run colocated→goembedb migration: it answered
+//     `s3_count: 1000` — exactly the AWS page cap. Backup had the
+//     byte-identical defect.
+//   - PR #49's `ColocatedMigrationConfig` derived both `SourceCount`
+//     AND `MigratedCount` from this walker, so `verified: true` would
+//     have stayed honest against `truncated >= truncated` — a cutover
+//     past the 1000-key boundary would have orphaned tenants.
+//   - Keys migrate in sorted path order. The first page under
+//     `_meta/` is all low-prefix classes (e.g. `backup_runs/`); the
+//     `tenants/` and `restores/` shards the scheduler + the SPA read
+//     sort later and would have been clipped away entirely.
+//
+// So: no caller may assume one page, and a `source_count` that comes
+// back as exactly a multiple of 1000 deserves suspicion from whoever
+// reads it (see the `% 1000 == 0` warn in
+// `goembedbadmin/colocated_source.go`).
+//
+// Shape kept visibly identical to the fix sc-components is landing in
+// observatory (`sc-component-observatory#33`) so the next reader sees
+// the trap once, in the same spot, in both repos.
+func listAllObjects(ctx context.Context, api s3ListAPI, bucket, prefix string) ([]StoredObject, error) {
 	prefix = strings.TrimPrefix(prefix, "/")
-	out, err := s.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
-		Bucket: aws.String(s.cfg.Bucket),
-		Prefix: aws.String(prefix),
-	})
-	if err != nil {
-		return nil, fmt.Errorf("s3 list %q: %w", prefix, err)
-	}
-	result := make([]StoredObject, 0, len(out.Contents))
-	for _, o := range out.Contents {
-		so := StoredObject{Path: aws.ToString(o.Key)}
-		if o.Size != nil {
-			so.Size = *o.Size
+	var (
+		result []StoredObject
+		token  *string
+	)
+	for {
+		out, err := api.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:            aws.String(bucket),
+			Prefix:            aws.String(prefix),
+			ContinuationToken: token,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("s3 list %q: %w", prefix, err)
 		}
-		if o.LastModified != nil {
-			so.ModifiedAt = *o.LastModified
+		for _, o := range out.Contents {
+			so := StoredObject{Path: aws.ToString(o.Key)}
+			if o.Size != nil {
+				so.Size = *o.Size
+			}
+			if o.LastModified != nil {
+				so.ModifiedAt = *o.LastModified
+			}
+			result = append(result, so)
 		}
-		result = append(result, so)
+		// Trust IsTruncated, not the presence of a token: S3 returns
+		// NextContinuationToken only while truncated, and a nil-safe
+		// read of both keeps a single-page bucket from looping on a
+		// stray non-nil token the backend echoed.
+		if out.IsTruncated == nil || !*out.IsTruncated || aws.ToString(out.NextContinuationToken) == "" {
+			return result, nil
+		}
+		token = out.NextContinuationToken
 	}
-	return result, nil
 }
 
 func (s *S3Store) Delete(ctx context.Context, path string) error {

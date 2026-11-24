@@ -86,14 +86,22 @@ type ColocatedMigrationConfig struct {
 // runbook `curl -f` catches it without parsing JSON. A dry run on
 // the same source answers 200 — counting is the point of a dry run.
 type colocatedMigrationResponse struct {
-	DryRun        bool                    `json:"dry_run"`
-	SourceEmpty   bool                    `json:"source_empty"`
-	SourceCount   int64                   `json:"source_count"`
-	MigratedCount int64                   `json:"migrated_count"`
-	Verified      bool                    `json:"verified"`
-	ElapsedMs     int64                   `json:"elapsed_ms"`
-	Rows          []colocatedMigrationRow `json:"rows"`
-	Errors        []migrationError        `json:"errors,omitempty"`
+	DryRun        bool  `json:"dry_run"`
+	SourceEmpty   bool  `json:"source_empty"`
+	SourceCount   int64 `json:"source_count"`
+	MigratedCount int64 `json:"migrated_count"`
+	// SinkRows is the sink's TOTAL row count across the walked
+	// collections AFTER the migration runs — summing
+	// `CountDocuments` per collection on the sink database. It is
+	// one half of what `Verified` compares, and an operator reading
+	// a bare `verified: true` cannot otherwise see whether the sink
+	// was empty beforehand (e.g. idempotent re-run on a populated
+	// sink, or a sink already carrying live traffic).
+	SinkRows  int64                   `json:"sink_rows"`
+	Verified  bool                    `json:"verified"`
+	ElapsedMs int64                   `json:"elapsed_ms"`
+	Rows      []colocatedMigrationRow `json:"rows"`
+	Errors    []migrationError        `json:"errors,omitempty"`
 }
 
 // colocatedMigrationRow is the per-collection breakdown operators read
@@ -196,19 +204,76 @@ func (c *ColocatedMigrationConfig) Migrate(w http.ResponseWriter, r *http.Reques
 	// source_empty: zero across every class that was walked.
 	resp.SourceEmpty = resp.SourceCount == 0
 
-	// verified: at least one source row AND every row accounted for
-	// AND no per-document errors. `SourceCount > 0` is the specific
-	// guard the `verified: true on 0 >= 0` trap requires.
-	if !dryRun && len(resp.Errors) == 0 {
-		resp.Verified = resp.SourceCount > 0 && resp.MigratedCount >= resp.SourceCount
+	// sink_rows: count documents in the sink across every walked
+	// collection, for operator visibility and as one half of the
+	// `verified` composite. A failing count is NOT a migration
+	// failure (the keys are already written) — surface it as a
+	// per-collection error entry and keep summing.
+	if !dryRun {
+		for _, name := range walkedSinkCollections() {
+			n, err := c.Sink.Collection(name).CountDocuments(ctx, bson.M{})
+			if err != nil {
+				resp.Errors = append(resp.Errors, migrationError{Collection: name, Err: "sink count: " + err.Error()})
+				continue
+			}
+			resp.SinkRows += n
+		}
+	}
+
+	// verified: four clauses, each closing a specific way the obvious
+	// one-liner reported success on a bad migration. Mirrors the
+	// shape sc-components landed on observatory (#33); each clause is
+	// here because the pre-hardening check could be computed as TRUE
+	// in a way that had nothing to do with a good migration, and
+	// `verified` is the single field the runbook tells the operator
+	// to read.
+	//
+	//   - **Empty source.** 0 >= 0. A misconfigured Source reports
+	//     success. Hence `SourceCount > 0`.
+	//   - **Truncated source.** 1000 copied == 1000 listed, when the
+	//     bucket held more. Fixed in storage/s3.go; `SourceCount > 0`
+	//     cannot catch it, so the fix is the lister's — and the warn
+	//     below is the tripwire if any walker regresses.
+	//   - **Per-key errors.** A migration that logged failures but
+	//     still passed a count check. Hence `len(Errors) == 0`.
+	//   - **Partial run on populated sink.** `MigratedCount` is a
+	//     per-run tally (not CountDocuments) so this is already tight,
+	//     but tightening `>=` to `==` makes the intent explicit and
+	//     pins the invariant a future refactor cannot weaken.
+	//   - **Pre-populated sink.** `SinkRows` can satisfy a loose
+	//     check against a sink that already carried live traffic;
+	//     the AND-term `SinkRows >= MigratedCount` is the lower bound
+	//     the sink must cross for the per-run writes to be observable.
+	//
+	// A dry run never claims verified: `MigratedCount` is 0 under
+	// `dryRun`, and 0 != positive SourceCount.
+	if !dryRun && len(resp.Errors) == 0 && resp.SourceCount > 0 {
+		resp.Verified = resp.MigratedCount == resp.SourceCount && resp.SinkRows >= resp.MigratedCount
 	}
 	resp.ElapsedMs = time.Since(start).Milliseconds()
+
+	// A source count that is an exact multiple of 1000 is the
+	// signature of a list that stopped at a page boundary — AWS caps
+	// a ListObjectsV2 page at 1000 keys and signals the clip only
+	// via IsTruncated, which an unpaginated caller never reads. The
+	// real count landing on a round 1000 is possible but unlikely; a
+	// truncated one is certain to. Not a failure — the operator is
+	// the one who can tell which it is, and this is how they get
+	// asked. Live-caught 2026-11-24 on sc-component-observatory
+	// (`s3_count: 1000`); the fix is s3.go's `listAllObjects` and
+	// this is the tripwire if any new walker regresses.
+	if resp.SourceCount > 0 && resp.SourceCount%1000 == 0 {
+		slog.Warn("suspicious source count — may indicate an unpaginated list; audit the source",
+			"source_count", resp.SourceCount,
+			"hint", "AWS ListObjectsV2 defaults to 1000-key pages; if your source walks a prefix via S3 List, confirm it paginates")
+	}
 
 	slog.Info("colocated migration",
 		"dry_run", resp.DryRun,
 		"source_empty", resp.SourceEmpty,
 		"source_count", resp.SourceCount,
 		"migrated_count", resp.MigratedCount,
+		"sink_rows", resp.SinkRows,
 		"verified", resp.Verified,
 		"errors", len(resp.Errors),
 		"elapsed_ms", resp.ElapsedMs)
@@ -221,6 +286,24 @@ func (c *ColocatedMigrationConfig) Migrate(w http.ResponseWriter, r *http.Reques
 		status = http.StatusUnprocessableEntity
 	}
 	writeJSON(w, status, resp)
+}
+
+// walkedSinkCollections returns the sink collection names the
+// colocated → goembedb migration actually writes into. Used to sum
+// `SinkRows` across exactly those classes — a sibling collection
+// sitting in the same sink (settings, alerts_dismissals,
+// object_samples — the three listed as `source: "none"` in the
+// response) is deliberately NOT summed here, because the migration
+// does not touch it and a sink carrying unrelated writes should not
+// move the `verified` composite.
+func walkedSinkCollections() []string {
+	return []string{
+		CollectionTenants,
+		CollectionProjects,
+		CollectionBackupRuns,
+		CollectionRestoreRuns,
+		CollectionSnapshots,
+	}
 }
 
 // migrateTenants walks the colocated tenants/ prefix and upserts each
