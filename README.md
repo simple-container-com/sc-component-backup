@@ -27,11 +27,21 @@ operator's server.yaml                  operator's client.yaml (per service)
       type: sc-backup                         staging:
       config:                                   uses: [the-backup]        ← consumer opt-in
         deployTo: lambda                        type: single-image
-        image: {...}                            template: lambda
-        signingKey: ${secret:JWT_KEY}           parent: forge/infra
+        signingKey: ${secret:JWT_KEY}           template: lambda
+        schedulerToken: ${secret:TICK}          parent: forge/infra
         ingress:
           hostname: backups.example.com
 ```
+
+That is the whole component block. `deployTo:` picks the template and
+everything derivable follows from it — the `image` (from this plugin's
+own released version, so the two cannot drift), Lambda sizing, the IAM
+action set, the Fargate worker cluster, the storage and metadata
+backends, the go-embedb wiring, and the scheduler tick. Override any of
+them with one key in `config:`; operator wins per key, but note that a
+**list** value is taken wholesale rather than merged, so writing your own
+`cloudExtras.awsRoles` replaces the component's set instead of adding to
+it.
 
 1. `sc provision` on the parent → slice 1a's sidecar wrapper dispatches
    the Backup service into the chosen deployTo template (Lambda in the
@@ -57,35 +67,16 @@ operator's server.yaml                  operator's client.yaml (per service)
    carry. Only SUCCEEDED runs count, so a failing tenant stays due
    rather than being marked done by having been attempted.
 
-### The timer is operator config, and without it nothing runs
+### The timer is a component default; one secret is yours
 
 The service does not schedule itself: a Lambda cannot hold a ticker (the
 runtime freezes background goroutines when the handler returns), so the
-timer must be a platform resource. Declare it on the component:
+timer must be a platform resource. On `deployTo: lambda` the component
+declares it for you — a `bk-tick` EventBridge rule on `rate(30 minutes)`
+— and all you supply is the credential it presents:
 
 ```yaml
     schedulerToken: "${secret:backup-scheduler-token}"
-    cloudExtras:
-      lambdaSchedules:
-        - name: bk-tick                # <= 14 chars, rejected at APPLY
-          expression: "rate(30 minutes)"
-          request: |-
-            {
-              "requestId": "scheduled-backup",
-              "httpMethod": "POST",
-              "path": "/api/v1/scheduler/tick",
-              "requestContext": {
-                "http": {
-                  "path": "/api/v1/scheduler/tick",
-                  "method": "POST",
-                  "protocol": "HTTP/1.1"
-                }
-              },
-              "body": "{}",
-              "headers": {
-                "Authorization": "Bearer ${secret:backup-scheduler-token}"
-              }
-            }
 ```
 
 **Tick every 30 minutes, back up every 4 hours.** The tick is cheap — it
@@ -93,15 +84,20 @@ lists tenants and fires only the due ones — and a finer tick than the
 interval is what makes a missed fire self-heal instead of doubling the
 gap to 8 h.
 
-It lives in operator config rather than the component's defaults because
-SC resolves `${secret:NAME}` inside a schedule request but not the
-`${resource:...}` form, and a generic component cannot hardcode one
-stack's secret name.
-
 > This was missing until 2026-11-19, and the gap was invisible: no rule
 > existed, the handler was a no-op without `?force=true`, and the SPA
 > displayed "every hour" from a stored value nothing read. Every archive
 > in the bucket was from a manual Run Now.
+>
+> The first fix put a ~30-line schedule block in every operator's
+> server.yaml, on the reading that *"SC resolves `${secret:NAME}` inside a
+> schedule request but not the `${resource:...}` form"*. That was a
+> misdiagnosis: the `$sc:` sentinel has to be at **position 0 of the
+> payload** rather than beside the token, because `substituteString`
+> returns a string unchanged unless it *begins* with the sentinel — and
+> says nothing when it doesn't. With that corrected the component ships
+> the schedule itself. See `schedulerTickRequest` in
+> `plugin/cmd/sc-component-backup/main.go`.
 
 ## Three Go modules
 
