@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 
 	"github.com/simple-container-com/sc-component-backup/service/internal/backup"
 	"github.com/simple-container-com/sc-component-backup/service/internal/backup/meta"
@@ -468,6 +469,7 @@ type colocatedResp struct {
 	SourceEmpty   bool              `json:"source_empty"`
 	SourceCount   int64             `json:"source_count"`
 	MigratedCount int64             `json:"migrated_count"`
+	SkippedCount  int64             `json:"skipped_count"`
 	Verified      bool              `json:"verified"`
 	ElapsedMs     int64             `json:"elapsed_ms"`
 	Rows          []colocatedResRow `json:"rows"`
@@ -479,6 +481,7 @@ type colocatedResRow struct {
 	Source        string `json:"source"`
 	SourceCount   int64  `json:"source_count"`
 	MigratedCount int64  `json:"migrated_count"`
+	SkippedCount  int64  `json:"skipped_count"`
 	Reason        string `json:"reason"`
 }
 
@@ -495,3 +498,95 @@ func decodeColocated(t *testing.T, w *httptest.ResponseRecorder) colocatedResp {
 // anchor that stops a `go mod tidy` from dropping the scheduler import
 // here if the direct caller (colocated_source.go) ever moves.
 var _ = scheduler.SnapshotToBSONDoc
+
+// TestColocatedMigration_DoesNotClobberAFresherTenantRow is THE
+// regression test for [the freshness guard]. A tenant row carries the
+// Mongo credential the worker dumps with, and every consumer deploy
+// ROTATES that credential — so a restore that blindly replays a
+// snapshot over a live row does not merely lose an update, it breaks
+// that tenant's backups outright with `(AuthenticationFailed)`.
+//
+// That is not hypothetical: on 2026-11-25 a wet run of this endpoint
+// reverted 6 of 7 tenant rows to pre-rotation passwords and every
+// `mongodump` for them failed. The seventh survived only because it had
+// not deployed since the snapshot was taken.
+//
+// The skip must also count as success — see the `verified` assertion.
+// An operator who sees `verified: false` on the correct outcome stops
+// reading the field.
+func TestColocatedMigration_DoesNotClobberAFresherTenantRow(t *testing.T) {
+	client, cleanup := embeddedMongo(t)
+	defer cleanup()
+	sink := client.Database("sink_" + t.Name())
+
+	src, _ := newColocatedSource(t)
+	nT, nP, nB, nR, nS := seedColocated(t, src)
+	wantTotal := int64(nT + nP + nB + nR + nS)
+
+	// The live row: same stack as a seeded source row, but stamped
+	// LATER — exactly what a consumer deploy leaves behind after the
+	// snapshot was taken — and carrying a credential that only exists
+	// in the sink.
+	ctx := context.Background()
+	live := tenant.Record{
+		StackName:  "stack-a",
+		Version:    "v-live",
+		Resources:  []tenant.Resource{{Type: "mongodb", Name: "db", Connection: map[string]string{"uri": "live-uri"}}},
+		OrgID:      "org-x",
+		CreatedAt:  time.Now().UTC(),
+		LastSeenAt: time.Now().UTC().Add(time.Hour),
+	}
+	if _, err := sink.Collection(goembedbadmin.CollectionTenants).ReplaceOne(ctx,
+		tenant.UpsertFilter(live.StackName), live, options.Replace().SetUpsert(true)); err != nil {
+		t.Fatalf("seed live sink row: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/admin/migrate-colocated-to-goembedb", nil)
+	req.Header.Set("X-Admin-Token", "secret")
+	w := httptest.NewRecorder()
+	(&goembedbadmin.ColocatedMigrationConfig{Source: src, Sink: sink, AdminToken: "secret"}).Migrate(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("Migrate: status %d, body %s", w.Code, w.Body.String())
+	}
+	resp := decodeColocated(t, w)
+
+	// THE assertion: the live credential survived.
+	var got tenant.Record
+	if err := sink.Collection(goembedbadmin.CollectionTenants).
+		FindOne(ctx, tenant.UpsertFilter("stack-a")).Decode(&got); err != nil {
+		t.Fatalf("read back stack-a: %v", err)
+	}
+	if got.Version != "v-live" {
+		t.Fatalf("stack-a version = %q, want %q — the migration overwrote a FRESHER tenant row, which reverts its Mongo credential to a pre-rotation password and breaks that tenant's backups", got.Version, "v-live")
+	}
+	if uri := got.Resources[0].Connection["uri"]; uri != "live-uri" {
+		t.Fatalf("stack-a uri = %q, want %q — the live credential was clobbered by the snapshot copy", uri, "live-uri")
+	}
+
+	// A stack that had NOT deployed since the snapshot must still be
+	// copied — the guard is a freshness check, not a blanket skip.
+	if err := sink.Collection(goembedbadmin.CollectionTenants).
+		FindOne(ctx, tenant.UpsertFilter("stack-b")).Decode(&got); err != nil {
+		t.Fatalf("stack-b was not migrated at all: %v", err)
+	}
+	if got.Version != "v1" {
+		t.Fatalf("stack-b version = %q, want %q (source copy)", got.Version, "v1")
+	}
+
+	// And the skip is accounted as a success, not as a gap.
+	if resp.SkippedCount != 1 {
+		t.Fatalf("skipped_count = %d, want 1", resp.SkippedCount)
+	}
+	if resp.MigratedCount != wantTotal-1 {
+		t.Fatalf("migrated_count = %d, want %d (one skip)", resp.MigratedCount, wantTotal-1)
+	}
+	if !resp.Verified {
+		t.Fatalf("verified=false when every source row was either copied or deliberately skipped (body=%s)", w.Body.String())
+	}
+	for _, row := range resp.Rows {
+		if row.Collection == goembedbadmin.CollectionTenants && row.SkippedCount != 1 {
+			t.Fatalf("tenants row skipped_count = %d, want 1 (%+v)", row.SkippedCount, row)
+		}
+	}
+}
