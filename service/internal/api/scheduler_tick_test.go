@@ -506,3 +506,122 @@ func TestResolveIntervalMinutes_ProjectConfigWins(t *testing.T) {
 		t.Errorf("project interval 1h: got %d, want 60", got)
 	}
 }
+
+// TestSchedulerTick_DrivesReplicationTick pins the go-embedb wiring.
+//
+// The loops this drives are wall-clock tickers, and on Lambda a frozen
+// container never runs them: measured 2026-11-25, all six slots sat at
+// `heartbeat == joinedAt` and no snapshot was committed for ~6 h. The
+// EventBridge tick is the only thing here that runs on a real
+// invocation, so if this call is ever dropped the replication layer
+// silently stops renewing with every HTTP response still 200.
+func TestSchedulerTick_DrivesReplicationTick(t *testing.T) {
+	restore := setupTickEnv(t)
+	defer restore()
+
+	store := tenant.NewInMemoryStore()
+	_ = store.Upsert(context.Background(), tenant.Record{StackName: "t"})
+
+	called := 0
+
+	h := NewSchedulerTickHandler(SchedulerTickConfig{
+		Tenants:    store,
+		Runs:       runsWith("t"),
+		MintWorker: func(string, string, time.Duration) (string, error) { return "worker-jwt", nil },
+		AgentURL:   "https://backup.example.com",
+		Ecs: &fakeEcs{runTask: func(context.Context, *ecs.RunTaskInput, ...func(*ecs.Options)) (*ecs.RunTaskOutput, error) {
+			return &ecs.RunTaskOutput{}, nil
+		}},
+		ReplicationTick: func(ctx context.Context) error {
+			called++
+
+			if _, ok := ctx.Deadline(); !ok {
+				t.Error("ReplicationTick must get a bounded context — a snapshot plus a GC " +
+					"sweep is several sequential S3 round-trips and must not eat the whole invocation")
+			}
+
+			return nil
+		},
+	})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, tickRequest("/api/v1/scheduler/tick"))
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("tick status = %d, want 202", rec.Code)
+	}
+
+	if called != 1 {
+		t.Fatalf("ReplicationTick called %d times, want exactly 1", called)
+	}
+}
+
+// TestSchedulerTick_ReplicationFailureIsNotFatal — a replication tick
+// that errors must not take the backup tick with it. The inverse
+// (failing the tick) would mean one hiccup in the replication layer
+// stops the fleet's databases being dumped, which is strictly worse
+// than a logged warning retried on the next tick.
+func TestSchedulerTick_ReplicationFailureIsNotFatal(t *testing.T) {
+	restore := setupTickEnv(t)
+	defer restore()
+
+	store := tenant.NewInMemoryStore()
+	_ = store.Upsert(context.Background(), tenant.Record{StackName: "t", Resources: []tenant.Resource{
+		{Name: "mongo", Connection: map[string]string{"driver": "mongodb", "uri": "mongodb://h/", "database": "db1"}},
+	}})
+
+	fired := 0
+
+	h := NewSchedulerTickHandler(SchedulerTickConfig{
+		Tenants:    store,
+		Runs:       runsWith("t"),
+		MintWorker: func(string, string, time.Duration) (string, error) { return "worker-jwt", nil },
+		AgentURL:   "https://backup.example.com",
+		Ecs: &fakeEcs{runTask: func(context.Context, *ecs.RunTaskInput, ...func(*ecs.Options)) (*ecs.RunTaskOutput, error) {
+			fired++
+			return &ecs.RunTaskOutput{}, nil
+		}},
+		ReplicationTick: func(context.Context) error {
+			return errors.New("s3 unavailable")
+		},
+	})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, tickRequest("/api/v1/scheduler/tick"))
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("tick status = %d, want 202 despite a failing replication tick", rec.Code)
+	}
+
+	if fired != 1 {
+		t.Fatalf("backup dispatch fired %d times, want 1 — a replication failure must not "+
+			"stop the tenant dump", fired)
+	}
+}
+
+// TestSchedulerTick_NilReplicationTickIsSkipped — USE_GOEMBEDB=0 leaves
+// the hook nil and the handler must not panic on it.
+func TestSchedulerTick_NilReplicationTickIsSkipped(t *testing.T) {
+	restore := setupTickEnv(t)
+	defer restore()
+
+	store := tenant.NewInMemoryStore()
+	_ = store.Upsert(context.Background(), tenant.Record{StackName: "t"})
+
+	h := NewSchedulerTickHandler(SchedulerTickConfig{
+		Tenants:    store,
+		Runs:       runsWith("t"),
+		MintWorker: func(string, string, time.Duration) (string, error) { return "worker-jwt", nil },
+		AgentURL:   "https://backup.example.com",
+		Ecs: &fakeEcs{runTask: func(context.Context, *ecs.RunTaskInput, ...func(*ecs.Options)) (*ecs.RunTaskOutput, error) {
+			return &ecs.RunTaskOutput{}, nil
+		}},
+	})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, tickRequest("/api/v1/scheduler/tick"))
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("tick status = %d, want 202", rec.Code)
+	}
+}
