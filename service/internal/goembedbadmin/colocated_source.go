@@ -98,11 +98,16 @@ type colocatedMigrationResponse struct {
 	// a bare `verified: true` cannot otherwise see whether the sink
 	// was empty beforehand (e.g. idempotent re-run on a populated
 	// sink, or a sink already carrying live traffic).
-	SinkRows  int64                   `json:"sink_rows"`
-	Verified  bool                    `json:"verified"`
-	ElapsedMs int64                   `json:"elapsed_ms"`
-	Rows      []colocatedMigrationRow `json:"rows"`
-	Errors    []migrationError        `json:"errors,omitempty"`
+	SinkRows int64 `json:"sink_rows"`
+	// SkippedCount is the total across classes of source rows left
+	// alone because the sink's copy was fresher. It counts toward
+	// `Verified` exactly as `MigratedCount` does — a skip is a
+	// deliberate, successful outcome, not a gap.
+	SkippedCount int64                   `json:"skipped_count,omitempty"`
+	Verified     bool                    `json:"verified"`
+	ElapsedMs    int64                   `json:"elapsed_ms"`
+	Rows         []colocatedMigrationRow `json:"rows"`
+	Errors       []migrationError        `json:"errors,omitempty"`
 }
 
 // colocatedMigrationRow is the per-collection breakdown operators read
@@ -115,7 +120,11 @@ type colocatedMigrationRow struct {
 	Source        string `json:"source"`
 	SourceCount   int64  `json:"source_count"`
 	MigratedCount int64  `json:"migrated_count"`
-	Reason        string `json:"reason,omitempty"`
+	// SkippedCount counts source rows deliberately NOT written
+	// because the sink already held a FRESHER copy. Only the tenants
+	// class can report this today; see [ColocatedMigrationConfig.migrateTenants].
+	SkippedCount int64  `json:"skipped_count,omitempty"`
+	Reason       string `json:"reason,omitempty"`
 }
 
 // Migrate serves `POST /admin/migrate-colocated-to-goembedb`.
@@ -125,8 +134,15 @@ type colocatedMigrationRow struct {
 //  1. For each of the four colocated-owned classes
 //     (tenants, projects, backup_runs, restore_runs, db_snapshots)
 //     the Source's accessor lists live rows; each is bson-upserted
-//     into the same-named sink collection by its reader-side key
-//     (stackName for tenants, _id for the other four).
+//     into the same-named sink collection by its reader-side key —
+//     `_id` for every class, via [tenant.UpsertFilter] for tenants
+//     (pinning `_id` is what keeps the write out of go-embedb's RMW
+//     class; see that function).
+//     Tenants additionally SKIP any row the sink already holds a
+//     fresher copy of — see [sinkIsFresher], and do not weaken it:
+//     the stored Mongo credential rotates on every consumer deploy,
+//     so overwriting a live row with a snapshot copy breaks that
+//     tenant's backups outright.
 //  2. For settings, alerts_dismissals, object_samples — classes with
 //     NO colocated accessor — a row lands in the response with
 //     source="none" and a reason. The operator sees the gap without
@@ -248,8 +264,16 @@ func (c *ColocatedMigrationConfig) Migrate(w http.ResponseWriter, r *http.Reques
 	//
 	// A dry run never claims verified: `MigratedCount` is 0 under
 	// `dryRun`, and 0 != positive SourceCount.
+	//   - **Deliberate skips.** A row the sink already held a fresher
+	//     copy of is accounted in `SkippedCount`, and copied+skipped
+	//     must still cover the source. Counting only `MigratedCount`
+	//     here would report `verified: false` for the *correct*
+	//     outcome — the operator's one summary field would cry wolf on
+	//     every re-run against a live sink, which is how a field like
+	//     this stops being read at all.
 	if !dryRun && len(resp.Errors) == 0 && resp.SourceCount > 0 {
-		resp.Verified = resp.MigratedCount == resp.SourceCount && resp.SinkRows >= resp.MigratedCount
+		resp.Verified = resp.MigratedCount+resp.SkippedCount == resp.SourceCount &&
+			resp.SinkRows >= resp.MigratedCount
 	}
 	resp.ElapsedMs = time.Since(start).Milliseconds()
 
@@ -327,6 +351,11 @@ func (c *ColocatedMigrationConfig) migrateTenants(ctx context.Context, dryRun bo
 	if !dryRun {
 		coll := c.Sink.Collection(CollectionTenants)
 		for _, rec := range rows {
+			if sinkIsFresher(ctx, coll, rec) {
+				row.SkippedCount++
+				resp.SkippedCount++
+				continue
+			}
 			opts := options.Replace().SetUpsert(true)
 			if _, err := coll.ReplaceOne(ctx, tenant.UpsertFilter(rec.StackName), rec, opts); err != nil {
 				resp.Errors = append(resp.Errors, migrationError{Collection: CollectionTenants, ID: rec.StackName, Err: "upsert: " + err.Error()})
@@ -337,6 +366,46 @@ func (c *ColocatedMigrationConfig) migrateTenants(ctx context.Context, dryRun bo
 		}
 	}
 	resp.Rows = append(resp.Rows, row)
+}
+
+// sinkTenantReader is the one-method slice of [mongo.Collection] that
+// [sinkIsFresher] needs, so the freshness guard can be tested against
+// a fake.
+type sinkTenantReader interface {
+	FindOne(ctx context.Context, filter any, opts ...*options.FindOneOptions) *mongo.SingleResult
+}
+
+// sinkIsFresher reports whether the sink already holds a NEWER copy of
+// this tenant than the colocated source does, comparing `lastSeenAt` —
+// which [api.TenantsRegister] stamps with `time.Now().UTC()` on every
+// registration, so a row written by a live consumer deploy always sorts
+// after a row read out of a snapshot.
+//
+// Without this guard the migration is a time machine pointed at live
+// credentials, and that is not hypothetical — it is what this function
+// exists to prevent. Every consumer deploy peer-invokes
+// sc-plugin-mongodb's `mint-scoped-user`, which ROTATES the
+// `peer-<stack>` Atlas password (a 409 USER_ALREADY_EXISTS becomes a
+// PATCH with a freshly generated one) and returns the new URI for the
+// tenant row. A tenant row's stored password is therefore valid only
+// until that stack's next deploy. On 2026-11-25 a restore of 7 tenant
+// rows from a colocated snapshot reverted 6 of them to pre-rotation
+// passwords and every `mongodump` for those tenants failed with
+// `(AuthenticationFailed) Authentication failed`. The seventh —
+// forge-concierge — survived only because it had not deployed since
+// 2026-11-19, so its snapshot copy was older than its last mint.
+//
+// A missing or undecodable sink row answers false: copy it. The
+// absent case is the ordinary restore-into-an-empty-sink path, and an
+// unreadable row is better replaced by a known-good snapshot copy than
+// left as-is.
+func sinkIsFresher(ctx context.Context, coll sinkTenantReader, src tenant.Record) bool {
+	var existing tenant.Record
+	if err := coll.FindOne(ctx, tenant.UpsertFilter(src.StackName)).Decode(&existing); err != nil {
+		return false
+	}
+
+	return existing.LastSeenAt.After(src.LastSeenAt)
 }
 
 // migrateProjects walks the colocated projects/ prefix and upserts
