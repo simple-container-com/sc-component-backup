@@ -51,6 +51,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"strings"
 	"sync"
@@ -138,7 +139,7 @@ func (p *backupPlugin) SetBroker(b *hplugin.GRPCBroker) { p.broker = b }
 // Marshalled once at init time to avoid re-marshalling on every
 // Schema() RPC.
 var componentDefaultsJSON = func() []byte {
-	b, err := json.Marshal(map[string]any{
+	defaults := map[string]any{
 		// Lambda routing + the full IAM role list the backup service
 		// needs for its own S3-colocated metadata + ECS-dispatched
 		// backup workers. Dropping these on a stack with
@@ -149,6 +150,13 @@ var componentDefaultsJSON = func() []byte {
 		// + the scalar-defaults roadmap item.
 		"cloudExtras": map[string]any{
 			"lambdaRoutingType": "function-url",
+			"lambdaSchedules": []any{
+				map[string]any{
+					"name":       "bk-tick",
+					"expression": "rate(30 minutes)",
+					"request":    schedulerTickRequest("scheduled-backup", "/api/v1/scheduler/tick"),
+				},
+			},
 			"awsRoles": []string{
 				"s3:PutObject", "s3:GetObject", "s3:ListBucket",
 				"s3:DeleteObject", "s3:AbortMultipartUpload",
@@ -223,12 +231,49 @@ var componentDefaultsJSON = func() []byte {
 			// explicitly in server.yaml if they have a NAT + VPC
 			// endpoints.
 			"BACKUP_ECS_ASSIGN_PUBLIC_IP": "$$sc:${resource:${name}.assign-public-ip}",
+			// go-embedb is the metadata engine, not an opt-in
+			// experiment: the colocated store it replaced served
+			// read-modify-write upserts from whichever warm Lambda
+			// execution environment held the lease and answered
+			// NotWritablePrimary(10107) from every other one, which
+			// failed roughly half of all tenant registrations and so
+			// failed the deploy of every service naming this
+			// component in `uses:`. An operator who leaves this unset
+			// should get the engine the fleet actually runs.
+			"USE_GOEMBEDB": "1",
+			// The bucket go-embedb keeps its log + snapshots in. The
+			// SAME bucket as the archives on purpose — one lifecycle
+			// policy, one set of grants, and the `awsRoles` above
+			// already cover it. Derived at PreProvision from the
+			// operator's `storage:` block so the two shapes
+			// (`storage: my-data` vs `storage: {bucket: my-data}`)
+			// cannot disagree; see [backup.BucketForStorageRef] for
+			// why that is a live hazard rather than a nicety.
+			"GOEMBEDB_S3_BUCKET": "$$sc:${resource:${name}.storage-bucket}",
 		},
+		// Lambda sizing. 512 MB is measured, not guessed: the service
+		// is a Go binary plus an embedded SPA whose largest in-flight
+		// object is one dump-dispatch payload (the archive itself is
+		// streamed by the Fargate worker, never buffered here).
+		//
+		// The 300 s timeout is NOT about a slow handler — it is the
+		// scheduler tick, which fans out across every registered
+		// tenant and dispatches a Fargate task per due database. SC's
+		// own default is 128 MB / 30 s; the sweep does not fit in it.
+		"maxMemory": 512,
+		"timeout":   300,
 		// The only `deployTo:` target with a per-plugin dispatch
 		// today. Operator can override to any aws-lambda-shaped
 		// template by name.
 		"deployTo": "lambda",
-	})
+	}
+	// The image this plugin version's service ships as. Omitted for an
+	// unstamped build so the operator gets SC's "image required" rather
+	// than a pull of `:dev` that does not exist — see [defaultImage].
+	if img := defaultImage(); img != "" {
+		defaults["image"] = img
+	}
+	b, err := json.Marshal(defaults)
 	if err != nil {
 		// Can't return an error from an init-time `var ... = func()()`;
 		// a bad defaults payload would cascade to every Schema() RPC
@@ -237,6 +282,101 @@ var componentDefaultsJSON = func() []byte {
 	}
 	return b
 }()
+
+// imageRepo is the Docker Hub repository this plugin's service image is
+// published to. Kept beside [defaultImage] because the two are a pair:
+// release.yml pushes `<imageRepo>:<tag>` and stamps `<tag>` into
+// [version] in the same job, off the same CalVer value.
+const imageRepo = "simplecontainer/sc-component-backup"
+
+// defaultImage is the service image that matches THIS plugin binary.
+//
+// The plugin and its service image are released together —
+// `.github/workflows/release.yml` computes one CalVer tag, stamps it
+// into `main.version` with `-ldflags -X`, and pushes
+// `simplecontainer/sc-component-backup:<that same tag>`. So the binary
+// already knows the image it belongs with, and an operator who pins
+// the plugin version has, by construction, pinned the image too.
+//
+// Defaulting it here is therefore not a convenience — it ENFORCES the
+// lockstep. Two pins for one release is two chances to bump one and
+// not the other, and a plugin running against a mismatched service
+// image fails in whichever way the contract happened to change that
+// week, with nothing in the config to point at.
+//
+// Returns "" for an unstamped build (`version` is "dev" for a local
+// `go build`), so a developer gets SC's own "image required" error
+// instead of a pull of a tag that was never pushed.
+func defaultImage() string {
+	if version == "" || version == "dev" {
+		return ""
+	}
+
+	return imageRepo + ":" + version
+}
+
+// schedulerTickRequest renders the EventBridge target input that drives
+// an inline scheduler tick.
+//
+// The schedule has to exist, and it has to live HERE rather than in
+// every operator's server.yaml, because Lambda freezes background
+// goroutines the instant the handler returns: the sweep cannot be a
+// ticker inside the process, so it is an HTTP endpoint that runs the
+// work inline when called, and something external has to call it. On
+// aws-lambda that something is a rule built from
+// `cloudExtras.lambdaSchedules`.
+//
+// THE SENTINEL POSITION IS THE WHOLE TRICK, and it is why this default
+// was previously believed impossible. `substituteString`
+// (api `pkg/clouds/pulumi/api/defaults_interpolation.go:174`) returns
+// the string UNCHANGED unless it BEGINS with `$$sc:`. So the obvious
+// shape — the sentinel next to the token it guards, as in
+// `"Bearer $$sc:${resource:${name}.scheduler-token}"` — is skipped in
+// silence. That is exactly what shipped to sc-component-observatory on
+// 2026-11-19: the rule was created, fired on time, and the tick
+// answered 401 twice with the literal
+// `Bearer $$sc:${resource:${name}.scheduler-token}` in its input. The
+// conclusion drawn then was that SC resolves `${secret:NAME}` inside a
+// schedule payload but not the tpl-extension form, and that a generic
+// component therefore cannot ship a schedule at all — a ~25-line
+// comment to that effect went into all three components. It was a
+// misdiagnosis. With the sentinel at position 0 of the whole payload,
+// `${name}` substitutes, the sentinel is stripped, and SC core's
+// post-PreProvision `ResolvePlaceholders` pass
+// (`plugin_sidecars.go:1580`) walks into
+// `cloudExtras.lambdaSchedules[].request` — a string inside a map
+// inside a slice — and substitutes `${resource:…}` mid-string.
+//
+// Constraint worth keeping in view: a schedule `name` longer than 14
+// characters is rejected at APPLY, after preview has passed.
+func schedulerTickRequest(requestID, path string) string {
+	req := map[string]any{
+		"requestId":  requestID,
+		"httpMethod": http.MethodPost,
+		"path":       path,
+		"requestContext": map[string]any{
+			"http": map[string]any{
+				"path":     path,
+				"method":   http.MethodPost,
+				"protocol": "HTTP/1.1",
+			},
+		},
+		"body": "{}",
+		"headers": map[string]any{
+			"Authorization": "Bearer ${resource:${name}.scheduler-token}",
+		},
+	}
+	b, err := json.Marshal(req)
+	if err != nil {
+		// Unreachable: every value above is a marshallable literal.
+		// Panic rather than ship a schedule whose input is empty — a
+		// rule that fires every 30 minutes and 400s reads as "the
+		// backup component is broken".
+		panic("sc-component-backup: schedulerTickRequest: " + err.Error())
+	}
+
+	return pApi.DefaultsSentinel + string(b)
+}
 
 func (p *backupPlugin) Schema(_ context.Context, _ *scpluginv1.SchemaRequest) (*scpluginv1.SchemaResponse, error) {
 	return &scpluginv1.SchemaResponse{
@@ -568,7 +708,17 @@ func (p *backupPlugin) PreProvision(stdctx context.Context, req *scpluginv1.PreP
 
 	p.progress.Info("pre-provision", fmt.Sprintf("backup component %q (type %q)", req.GetResourceName(), req.GetResourceType()))
 
-	// Decode ComponentRaw — the merged .Raw post-ComponentDefaults.
+	// Decode ComponentRaw — the OPERATOR's raw, PRE-ComponentDefaults.
+	// api says so in as many words at `plugin_sidecars.go:1869`: "this
+	// emits the pre-ComponentDefaults operator Raw. Plugins that need
+	// to see the fully-merged Raw can call `pApi.DeepMergeComponentRaw`
+	// themselves". (This comment used to claim the opposite, which is
+	// why the `region` fallback below hardcodes a value instead of
+	// trusting the `$$sc:${template.region}` default — the default is
+	// not here yet, and would still be an uninterpolated sentinel if it
+	// were.) Anything derived here must reproduce the default rather
+	// than read it; see [backup.DefaultBucketName].
+	//
 	// A non-lambda deployTo is a valid shape (vm-compose, k8s-run);
 	// we just have nothing to look up.
 	var rawMap map[string]any
@@ -635,6 +785,21 @@ func (p *backupPlugin) PreProvision(stdctx context.Context, req *scpluginv1.PreP
 				// which the service reads as "notifications off" —
 				// the same contract as an absent env.
 				"notify-url": notify.URL,
+				// The EFFECTIVE archive bucket, which is also where
+				// go-embedb keeps its log + snapshots. Derived from the
+				// operator's `storage:` block across all three shapes it
+				// may take, so `env.GOEMBEDB_S3_BUCKET` can be a plugin
+				// default instead of a hand-copied line that disagrees
+				// with the bucket the template creates.
+				"storage-bucket": backupInternal.BucketForStorageRef(rawMap, req.GetResourceName(), req.GetHeader().GetEnvironment()),
+				// The bearer token the scheduler tick's EventBridge rule
+				// presents. Landed as a tpl extension rather than named
+				// as a secret in ComponentDefaults, because those
+				// defaults ship to every operator and cannot know one
+				// stack's secret names. See [schedulerTickRequest] for
+				// the sentinel-position constraint that makes the
+				// reference in the schedule payload resolve at all.
+				"scheduler-token": backupInternal.SchedulerTokenFromConfig(rawMap),
 			}
 
 			// Self-URL for the Fargate worker's completion callback —
