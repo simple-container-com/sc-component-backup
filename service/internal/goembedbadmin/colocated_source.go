@@ -20,6 +20,7 @@ import (
 	"github.com/simple-container-com/sc-component-backup/service/internal/backup/meta"
 	"github.com/simple-container-com/sc-component-backup/service/internal/backup/project"
 	"github.com/simple-container-com/sc-component-backup/service/internal/backup/scheduler"
+	"github.com/simple-container-com/sc-component-backup/service/internal/tenant"
 )
 
 // ColocatedMigrationConfig wires the `/admin/migrate-colocated-to-goembedb`
@@ -307,10 +308,13 @@ func walkedSinkCollections() []string {
 }
 
 // migrateTenants walks the colocated tenants/ prefix and upserts each
-// row by stackName. The Mongo-side reader uses `stackName` as the
-// match key (tenant.Record carries no `_id` field — the collection's
-// unique index is on stackName), so a filter on `_id` would create
-// duplicates on re-run. See `service/internal/tenant/store.go#MongoStore.Upsert`.
+// row through [tenant.UpsertFilter], the same `_id`-pinned match key
+// MongoStore.Upsert uses. Pinning `_id` is what keeps the write out of
+// go-embedb's read-modify-write class, so it is served by every replica
+// rather than only the tenant lease owner — see tenant.UpsertFilter for
+// the outage that taught us. Using a `stackName` filter here instead
+// would both re-take the lease and, once rows are keyed by `_id`,
+// duplicate every row on re-run.
 func (c *ColocatedMigrationConfig) migrateTenants(ctx context.Context, dryRun bool, resp *colocatedMigrationResponse) {
 	rows, err := c.Source.Tenants().List(ctx)
 	if err != nil {
@@ -323,9 +327,8 @@ func (c *ColocatedMigrationConfig) migrateTenants(ctx context.Context, dryRun bo
 	if !dryRun {
 		coll := c.Sink.Collection(CollectionTenants)
 		for _, rec := range rows {
-			filter := bson.M{"stackName": rec.StackName}
 			opts := options.Replace().SetUpsert(true)
-			if _, err := coll.ReplaceOne(ctx, filter, rec, opts); err != nil {
+			if _, err := coll.ReplaceOne(ctx, tenant.UpsertFilter(rec.StackName), rec, opts); err != nil {
 				resp.Errors = append(resp.Errors, migrationError{Collection: CollectionTenants, ID: rec.StackName, Err: "upsert: " + err.Error()})
 				continue
 			}
