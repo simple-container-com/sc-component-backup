@@ -44,13 +44,11 @@ import (
 	"syscall"
 	"time"
 
-	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
-
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
-
 	sdkservice "github.com/simple-container-com/go-aws-lambda-sdk/pkg/service"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 
 	"github.com/simple-container-com/sc-component-backup/service/internal/api"
 	"github.com/simple-container-com/sc-component-backup/service/internal/backup/alerts"
@@ -212,6 +210,13 @@ func main() {
 	useGoEmbedb := envOr("USE_GOEMBEDB", "") == "1"
 	var migrationSourceDB *mongo.Database
 	var migrationSinkDB *mongo.Database
+
+	// replicationTick drives go-embedb's five background loops from the
+	// EventBridge-driven scheduler tick. Nil when USE_GOEMBEDB=0 — there
+	// is no embed to drive. See api.SchedulerTickConfig.ReplicationTick
+	// for why a Lambda cannot leave them to their own tickers.
+	var replicationTick func(context.Context) error
+
 	if useGoEmbedb {
 		embed, berr := bootGoEmbed(slog.Default())
 		if berr != nil {
@@ -247,6 +252,7 @@ func main() {
 			os.Exit(1)
 		}
 		migrationSinkDB = embed.Client.Database(goembedbadmin.Database)
+		replicationTick = embed.FDB.TickNow
 		slog.Info("metadata backend: embedded go-embedb", "replSet", embed.ReplSet)
 	}
 
@@ -439,6 +445,8 @@ func main() {
 			MintWorker:   api.MintWorkerJWT([]byte(jwtSecret)),
 			AgentURL:     strings.TrimRight(os.Getenv("BACKUP_AGENT_URL"), "/"),
 			PathTemplate: "", // scheduler default; shared string
+			// Nil on a non-goembedb stack; the handler skips it.
+			ReplicationTick: replicationTick,
 		}).ServeHTTP)
 
 		// SPA-facing read-only surface (slice 1e.2 2026-11-13). Mutating

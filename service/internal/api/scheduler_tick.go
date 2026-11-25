@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"strings"
@@ -87,6 +88,27 @@ type SchedulerTickConfig struct {
 	Ecs EcsClient
 	// Now is injected for tests; defaults to time.Now.
 	Now func() time.Time
+
+	// ReplicationTick drives go-embedb's background replication loops
+	// once, synchronously. Wired to [ferretdb.FerretDB.TickNow] when
+	// USE_GOEMBEDB=1; nil otherwise (and on a non-goembedb stack there
+	// is nothing to drive).
+	//
+	// This is here, on the EventBridge-driven tick, because it is the
+	// only thing in this service that runs on a real invocation that
+	// stays awake until its work finishes. go-embedb's five loops
+	// (slot heartbeat, lease renewal, reader reconcile, snapshot, GC)
+	// are wall-clock tickers, and AWS Lambda freezes the container the
+	// instant the response flushes — so a loop fires only if ONE
+	// invocation outlives its period. This service is awake ~21 s per
+	// 30-minute tick, a ~1.2% duty cycle, and the measured result was
+	// that NONE of them ever fired: all six slots sat at
+	// `heartbeat == joinedAt` to the nanosecond, the replica was three
+	// TTLs dead by its own record while serving traffic, and no
+	// snapshot was committed for ~6 h.
+	//
+	// See `forge/docs/roadmap/items/go-embedb-snapshot-ticker-starves-on-lambda.md`.
+	ReplicationTick func(context.Context) error
 }
 
 // NewSchedulerTickHandler returns the chi handler. Reads config knobs
@@ -123,6 +145,29 @@ func NewSchedulerTickHandler(cfg SchedulerTickConfig) http.Handler {
 			(claims.Op != OpScheduler && claims.Op != OpOperator) {
 			http.Error(w, `{"error":"token op must be 'scheduler' or 'operator'"}`, http.StatusForbidden)
 			return
+		}
+
+		// Drive go-embedb's replication loops FIRST, before any backup
+		// work. Ordering is deliberate: this renews the slot heartbeat
+		// and the tenant leases, so it must happen even when the
+		// backup dispatch below fails — otherwise a stack with a
+		// broken Fargate config would also silently stop replicating.
+		//
+		// Never fatal to the tick. A replication tick that fails is
+		// retried on the next one; a backup tick that 500s because
+		// replication hiccuped would stop dumping databases, which is
+		// strictly worse. Logged so it is not silent.
+		if cfg.ReplicationTick != nil {
+			// Bounded independently of the tick's own budget: a
+			// snapshot plus a GC sweep is several sequential S3
+			// round-trips, and it must not be able to eat the whole
+			// invocation and starve the backup dispatch.
+			repCtx, repCancel := context.WithTimeout(ctx, 20*time.Second)
+			if err := cfg.ReplicationTick(repCtx); err != nil {
+				slog.WarnContext(repCtx, "scheduler tick: replication tick failed",
+					"err", err)
+			}
+			repCancel()
 		}
 
 		// One dispatch path, shared with Run Now.
