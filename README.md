@@ -72,17 +72,29 @@ it.
 The service does not schedule itself: a Lambda cannot hold a ticker (the
 runtime freezes background goroutines when the handler returns), so the
 timer must be a platform resource. On `deployTo: lambda` the component
-declares it for you — a `bk-tick` EventBridge rule on `rate(30 minutes)`
+declares it for you — a `bk-tick` EventBridge rule on `rate(2 minutes)`
 — and all you supply is the credential it presents:
 
 ```yaml
     schedulerToken: "${secret:backup-scheduler-token}"
 ```
 
-**Tick every 30 minutes, back up every 4 hours.** The tick is cheap — it
+**Tick every 2 minutes, back up every 4 hours.** The tick is cheap — it
 lists tenants and fires only the due ones — and a finer tick than the
 interval is what makes a missed fire self-heal instead of doubling the
 gap to 8 h.
+
+The cadence is 2 minutes rather than something lazier because the tick
+is also the only thing that drives go-embedb's replication loops on a
+Lambda (`Handler.TickNow`; a frozen container does not tick). Reader
+catch-up is one of those loops, so **the tick period is the window in
+which a peer replays another replica's log** — and a write that is not
+replayed before its writer's slot is reclaimed becomes permanently
+unreadable, epoch-fenced or GC'd, despite being durable in S3 and
+acked. At `rate(30 minutes)` that cost real data on 2026-11-26: a
+rotated Atlas password that never reached the tenant row, and four
+finished 1.9 GB backups stuck on `running`. See the long comment on the
+plugin's `lambdaSchedules` default.
 
 > This was missing until 2026-11-19, and the gap was invisible: no rule
 > existed, the handler was a no-op without `?force=true`, and the SPA

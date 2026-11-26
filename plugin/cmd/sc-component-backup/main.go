@@ -150,10 +150,65 @@ var componentDefaultsJSON = func() []byte {
 		// + the scalar-defaults roadmap item.
 		"cloudExtras": map[string]any{
 			"lambdaRoutingType": "function-url",
+			// `rate(2 minutes)`, NOT the `rate(30 minutes)` this was
+			// until 2026-11-26, and the number is a DATA-DURABILITY
+			// knob rather than a scheduling one.
+			//
+			// The tick is the only thing that drives go-embedb's
+			// replication loops here — a frozen Lambda does not tick,
+			// so `Handler.TickNow` is called from the tick handler and
+			// nowhere else. Reader catch-up is one of those loops. So
+			// the tick period IS the window in which a peer will
+			// replay another replica's log, and at 30 minutes that
+			// window was long enough to lose acked writes:
+			//
+			//   A replica serves a write, uploads the log segment to
+			//   S3, collects peer acks, returns 200 — and freezes. Its
+			//   heartbeat never renews. R14 reclaims the slot, the
+			//   epoch bumps, and from then on peer readers REJECT
+			//   every entry it wrote (entries below the slot table's
+			//   current epoch are refused by design — §3.4), or GC
+			//   Phase A deletes the evicted slot's log outright. The
+			//   bytes are durable in S3 and permanently unreadable.
+			//
+			// Live-caught 2026-11-26, two symptoms one cause: the
+			// forge-baas deploy's two `tenants/register` writes were
+			// both acked 200 and lost, leaving a rotated-away Atlas
+			// password in the tenant row (every subsequent mongodump:
+			// `(AuthenticationFailed)`); and four worker
+			// `runs/{id}/complete` callbacks were acked 200 and lost,
+			// leaving finished 1.9 GB backups stuck on `running` until
+			// a reaper called them `interrupted` — which in turn made
+			// `tenantIsDue` read forge-conductor as never-backed-up and
+			// dump it 8 times in a day. The timing is the tell: every
+			// write that landed AT a tick persisted, every write that
+			// landed between ticks was lost.
+			//
+			// 2 minutes also removes most cold starts (a container
+			// stays warm across a 2-minute gap), which means fewer
+			// slot claims, fewer epoch bumps, and less of the churn
+			// that orphans entries in the first place. The two healthy
+			// components on this engine already live here —
+			// notifier's `nt-tick` is `rate(1 minute)`, observatory's
+			// `hc-tick` is `rate(5 minutes)`; backup at 30 minutes was
+			// the fleet's only ~1.2%-duty-cycle replica, and
+			// `TickNow`'s own measured table names that row as the
+			// broken one.
+			//
+			// Raising the cadence NARROWS the loss window; it does not
+			// close it. The structural fix — an acked write must not
+			// become unreadable when its writer's slot is reclaimed —
+			// is go-embedb's, tracked in
+			// `forge/docs/roadmap/items/go-embedb-reclaim-orphans-unreplayed-writes.md`.
+			//
+			// If you re-time this rule, re-read the `HeartbeatTTL`
+			// comment in `service/cmd/backup/boot_goembedb.go`: the
+			// two are related, and `Handler.TickNow` warns when the
+			// TTL drops below 2x the cadence it observes.
 			"lambdaSchedules": []any{
 				map[string]any{
 					"name":       "bk-tick",
-					"expression": "rate(30 minutes)",
+					"expression": "rate(2 minutes)",
 					"request":    schedulerTickRequest("scheduled-backup", "/api/v1/scheduler/tick"),
 				},
 			},
@@ -370,7 +425,7 @@ func schedulerTickRequest(requestID, path string) string {
 	if err != nil {
 		// Unreachable: every value above is a marshallable literal.
 		// Panic rather than ship a schedule whose input is empty — a
-		// rule that fires every 30 minutes and 400s reads as "the
+		// rule that fires every 2 minutes and 400s reads as "the
 		// backup component is broken".
 		panic("sc-component-backup: schedulerTickRequest: " + err.Error())
 	}

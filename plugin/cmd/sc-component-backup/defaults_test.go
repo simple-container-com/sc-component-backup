@@ -6,8 +6,11 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/simple-container-com/api/pkg/api/logger"
 	pApi "github.com/simple-container-com/api/pkg/clouds/pulumi/api"
@@ -186,4 +189,93 @@ func TestComponentDefaults_ScheduleNameFitsTheLimit(t *testing.T) {
 			t.Fatalf("schedule name %q is %d chars; >14 is rejected at apply, after preview passes", name, len(name))
 		}
 	}
+}
+
+// The `bk-tick` cadence is a DATA-DURABILITY constraint, not a
+// scheduling preference, and nothing else in the build would catch a
+// regression on it — a coarser rule deploys green, fires on time, and
+// loses acked writes silently.
+//
+// The tick is the only thing that calls `Handler.TickNow`, which is the
+// only thing that drives go-embedb's reader catch-up on a Lambda (a
+// frozen container does not tick). So the tick period IS the window in
+// which a peer replays another replica's log. A write that is not
+// replayed before its writer's slot is reclaimed is epoch-fenced or
+// GC'd and becomes permanently unreadable — durable in S3, acked to the
+// client, and gone.
+//
+// Live-caught 2026-11-26 at the old `rate(30 minutes)`: two
+// `tenants/register` writes lost (leaving a rotated-away Atlas password
+// in forge-baas's tenant row, so every mongodump failed
+// `AuthenticationFailed`) and four `runs/{id}/complete` callbacks lost
+// (leaving finished 1.9 GB backups on `running`). Every write that
+// landed AT a tick survived; every write between ticks did not.
+//
+// The bound is deliberately a RANGE, not equality: re-timing 2m -> 1m
+// is fine and should not fail a test, while 2m -> 15m must. 5 minutes
+// is the ceiling because that is the coarsest cadence `TickNow`'s own
+// measured table records as healthy.
+func TestComponentDefaults_TickCadenceIsFineEnoughToReplicate(t *testing.T) {
+	const maxCadence = 5 * time.Minute
+
+	extras := decodeDefaults(t)["cloudExtras"].(map[string]any)
+
+	schedules, ok := extras["lambdaSchedules"].([]any)
+	if !ok || len(schedules) != 1 {
+		t.Fatalf("want exactly one lambdaSchedule, got %#v", extras["lambdaSchedules"])
+	}
+
+	expr, _ := schedules[0].(map[string]any)["expression"].(string)
+
+	cadence, err := parseRateExpression(expr)
+	if err != nil {
+		t.Fatalf("bk-tick expression %q: %v — the cadence must stay machine-checkable, "+
+			"because it bounds how long an acked write can sit unreplayed", expr, err)
+	}
+
+	if cadence > maxCadence {
+		t.Fatalf("bk-tick fires every %s; anything over %s loses acked writes.\n"+
+			"The tick is the ONLY driver of go-embedb reader catch-up on Lambda, so this\n"+
+			"period is the window in which a peer replays another replica's log. A write\n"+
+			"not replayed before its writer's slot is reclaimed is epoch-fenced or GC'd —\n"+
+			"durable in S3, acked, unreadable. Live-caught 2026-11-26 at rate(30 minutes).",
+			cadence, maxCadence)
+	}
+}
+
+// parseRateExpression reads the `rate(N unit)` form EventBridge accepts.
+// Only what this component actually emits; a cron() expression is a
+// deliberate error rather than a silent pass, because a cron cadence
+// cannot be bounded by reading one number.
+func parseRateExpression(expr string) (time.Duration, error) {
+	inner, ok := strings.CutPrefix(strings.TrimSpace(expr), "rate(")
+	if !ok {
+		return 0, fmt.Errorf("not a rate() expression")
+	}
+
+	inner, ok = strings.CutSuffix(inner, ")")
+	if !ok {
+		return 0, fmt.Errorf("unterminated rate() expression")
+	}
+
+	fields := strings.Fields(inner)
+	if len(fields) != 2 {
+		return 0, fmt.Errorf("want `rate(N unit)`, got %q", inner)
+	}
+
+	n, err := strconv.Atoi(fields[0])
+	if err != nil {
+		return 0, fmt.Errorf("rate value %q is not an integer", fields[0])
+	}
+
+	unit, ok := map[string]time.Duration{
+		"minute": time.Minute, "minutes": time.Minute,
+		"hour": time.Hour, "hours": time.Hour,
+		"day": 24 * time.Hour, "days": 24 * time.Hour,
+	}[fields[1]]
+	if !ok {
+		return 0, fmt.Errorf("unknown rate unit %q", fields[1])
+	}
+
+	return time.Duration(n) * unit, nil
 }

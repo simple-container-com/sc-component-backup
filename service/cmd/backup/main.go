@@ -436,8 +436,9 @@ func main() {
 		// the two go through one path now. MintWorker + AgentURL are
 		// what let the Fargate worker report completion; without them
 		// no run is ever recorded succeeded, every tenant stays due
-		// forever, and a 30-minute tick dumps the whole fleet 48 times
-		// a day.
+		// forever, and the tick dumps the whole fleet on every fire —
+		// 720 times a day at the `rate(2 minutes)` cadence `bk-tick`
+		// has run at since 2026-11-26.
 		r.Post("/api/v1/scheduler/tick", api.NewSchedulerTickHandler(api.SchedulerTickConfig{
 			Tenants:      metaStore.Tenants(),
 			Runs:         metaStore.Runs(),
