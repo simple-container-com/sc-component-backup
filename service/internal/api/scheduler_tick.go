@@ -73,8 +73,12 @@ type SchedulerTickConfig struct {
 	Projects project.Store
 	// MintWorker mints the worker's callback credential. Without it the
 	// worker cannot report completion, no run is ever recorded as
-	// succeeded, and every tenant stays due forever — which at a
-	// 30-minute tick means dumping the whole fleet 48 times a day.
+	// succeeded, and every tenant stays due forever — which at the
+	// `rate(2 minutes)` cadence means dumping the whole fleet 720
+	// times a day. This is not hypothetical at a coarser setting
+	// either: four LOST completion callbacks on 2026-11-26 were
+	// enough to make forge-conductor read as never-backed-up and get
+	// dumped 8 times (1.9 GB each) in one day.
 	MintWorker MintWorkerJWTFn
 	// AgentURL is where the worker POSTs that callback.
 	AgentURL string
@@ -100,9 +104,10 @@ type SchedulerTickConfig struct {
 	// (slot heartbeat, lease renewal, reader reconcile, snapshot, GC)
 	// are wall-clock tickers, and AWS Lambda freezes the container the
 	// instant the response flushes — so a loop fires only if ONE
-	// invocation outlives its period. This service is awake ~21 s per
-	// 30-minute tick, a ~1.2% duty cycle, and the measured result was
-	// that NONE of them ever fired: all six slots sat at
+	// invocation outlives its period. Measured on 2026-11-25, when
+	// `bk-tick` still fired at `rate(30 minutes)`: this service was
+	// awake ~21 s per tick, a ~1.2% duty cycle, and NONE of them ever
+	// fired — all six slots sat at
 	// `heartbeat == joinedAt` to the nanosecond, the replica was three
 	// TTLs dead by its own record while serving traffic, and no
 	// snapshot was committed for ~6 h.

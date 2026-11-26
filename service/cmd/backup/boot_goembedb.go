@@ -128,31 +128,51 @@ func bootGoEmbedOnce(logger *slog.Logger) (*goEmbed, error) {
 		// Bug 13 right without the operator remembering it.
 		if isLambda() {
 			if rep.HeartbeatTTL == 0 {
-				// 90m, NOT the 3m this used to be, and the number is
-				// derived from this component's own tick cadence
-				// rather than picked.
+				// 90m, NOT the 3m this used to be.
 				//
 				// go-embedb's loops no longer run on their own
 				// tickers here — a frozen Lambda does not tick, so
 				// they never fired at all. They are now driven from
-				// the EventBridge `bk-tick` rule, which is
-				// `rate(30 minutes)` (the plugin's lambdaSchedules
-				// default). A heartbeat TTL must therefore outlast
-				// that cadence with margin, or the slot is renewed on
-				// every tick and still reads as EXPIRED to peers for
-				// most of the 30 minutes in between — which looks
-				// identical from the outside to never renewing at
-				// all: peers see a dead replica, LiveWriters is
-				// empty, no readers start.
+				// the EventBridge `bk-tick` rule. A heartbeat TTL
+				// must outlast that cadence with margin, or the slot
+				// is renewed on every tick and still reads as EXPIRED
+				// to peers in between — which looks identical from
+				// the outside to never renewing at all: peers see a
+				// dead replica, LiveWriters is empty, no readers
+				// start. Measured live 2026-11-25 on the smoke stack
+				// with the OLD 3m value against a ~4-min cadence:
+				// slot ages of 207s and 271s against a 180s TTL, i.e.
+				// expired.
 				//
-				// 3x the cadence is the rule of thumb (it tolerates
-				// two missed ticks). Measured live 2026-11-25 on the
-				// smoke stack with the OLD 3m value against a ~4-min
-				// cadence: slot ages of 207s and 271s against a 180s
-				// TTL, i.e. expired. go-embedb's Handler.TickNow
-				// warns when TTL < 2x the cadence it observes, so if
-				// `bk-tick` is ever re-timed and this is not, the log
-				// says so rather than the fleet silently degrading.
+				// 90m was originally 3x the `rate(30 minutes)` that
+				// `bk-tick` fired at. THAT CADENCE IS NOW
+				// `rate(2 minutes)` (2026-11-26, see the long comment
+				// on the plugin's lambdaSchedules default), so 90m is
+				// no longer 3x anything — and it is deliberately
+				// LEFT HERE rather than re-derived down to 6m:
+				//
+				//   - The TTL bounds how long a DEAD replica keeps
+				//     holding a writer slot. Shortening it reclaims
+				//     those slots sooner, and a reclaim is exactly
+				//     what orphans an unreplayed write (the epoch
+				//     bumps and peer readers refuse every entry the
+				//     old epoch wrote). A LONG TTL is protective for
+				//     the bug the cadence change exists to fix.
+				//   - The cost of a long TTL is dead weight in the
+				//     slot table, which is a separate, tracked
+				//     problem with its own headroom lever —
+				//     `GOEMBEDB_MAX_REPLICAS` went to 24 on
+				//     2026-11-26 for precisely this. See
+				//     `go-embedb-slot-table-fills-under-tick-renewal`.
+				//   - A 2-minute tick also keeps ONE container warm
+				//     continuously, so the dead-weight inflow drops
+				//     on its own: fewer cold starts, fewer claims.
+				//
+				// go-embedb's Handler.TickNow warns when TTL < 2x the
+				// cadence it observes, so a future re-timing that
+				// inverts this says so in the log rather than
+				// degrading silently. Nothing warns about a TTL that
+				// is too GENEROUS — that is what this comment is for.
 				rep.HeartbeatTTL = 90 * time.Minute
 			}
 			if rep.MaxReplicas == 0 {

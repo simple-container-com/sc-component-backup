@@ -128,7 +128,8 @@ func TestSchedulerTick_NoForce_FiresOnlyDueTenants(t *testing.T) {
 			wantFired: 1,
 		},
 		// Succeeded 1 h ago against a 4 h interval: NOT due. The whole
-		// point — a 30-minute tick must not dump every tenant every time.
+		// point — the tick fires every 2 minutes and must not dump
+		// every tenant every time.
 		"within interval": {
 			record: tenant.Record{StackName: "t", Resources: mongo, IntervalMinutes: 240},
 			history: []backup.BackupRun{
