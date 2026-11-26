@@ -22,7 +22,7 @@ go 1.27.3
 // from this repo's own SC registry (`.sc/secrets.yaml`, decrypted with
 // the single org-level SC_CONFIG) and reach the Docker build as a
 // buildx secret mount — see service/Dockerfile and README.md §Storage.
-replace github.com/FerretDB/FerretDB => github.com/simple-container-com/go-embedb v0.0.0-20261125234937-0b321839007f
+replace github.com/FerretDB/FerretDB => github.com/simple-container-com/go-embedb v0.0.0-20261126082656-97fde32404ea
 
 require (
 	cloud.google.com/go/compute/metadata v0.10.0
